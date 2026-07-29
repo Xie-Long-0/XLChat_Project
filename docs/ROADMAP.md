@@ -165,7 +165,47 @@ common/
 - [x] B 离线时 A 发送消息，B 上线后可通过 sync 同步。
 - [x] 客户端重启后仍能显示历史消息。
 
-## M4：传输层加密与会话安全（2-4 周）
+## M4：客户端 QML UI 重构（4-6 周）
+
+### 目标
+
+将客户端 UI 从 Qt Widgets 全面迁移到 QML，参照 Telegram 的界面风格与交互体验，使用 QWindowKit 实现跨平台无边框自定义窗口，打造现代化、流畅、美观的聊天客户端。
+
+### 技术选型
+
+- **UI 框架**：QML + Qt Quick Controls 2（替代 Qt Widgets）
+- **无边框窗口**：QWindowKit（`QWK::Quick` 模块），实现自定义标题栏、窗口拖拽、Snap Layout、系统阴影
+- **架构模式**：C++ 后端（NetworkManager / 业务逻辑）+ QML 前端（声明式 UI），通过 `Q_PROPERTY` / `Q_INVOKABLE` / `QQmlContext` 桥接
+- **样式方案**：自定义 Telegram 风格主题（配色、圆角、间距、动画）
+- **参考设计**：Telegram Desktop 的布局与交互
+
+### 任务
+
+- [ ] 集成 QWindowKit 第三方库（`git clone --recursive`，CMake `find_package(QWindowKit COMPONENTS Core Quick REQUIRED)`）。
+- [ ] 客户端 CMake 配置迁移：`find_package(Qt6 COMPONENTS Qml Quick REQUIRED)`，替换 `Widgets`。
+- [ ] 重构 `main.cpp`：使用 `QQmlApplicationEngine` 加载 QML，注册 QWindowKit `WindowAgent`，注册 C++ 上下文属性（NetworkManager 等）。
+- [ ] 实现自定义无边框窗口组件（`TitleBar.qml`）：自定义标题栏、拖拽区域、最小化/最大化/关闭按钮、窗口阴影。
+- [ ] 实现登录/注册页面（`LoginPage.qml`）：Telegram 风格渐变背景、圆角输入框、登录/注册切换动画。
+- [ ] 实现主界面布局（`MainPage.qml`）：左侧导航栏（头像 + 会话列表 + 搜索）+ 右侧聊天区域。
+- [ ] 实现会话列表组件（`ConversationList.qml`）：头像、名称、最后消息预览、时间、未读角标、选中高亮。
+- [ ] 实现聊天窗口组件（`ChatView.qml`）：消息气泡（自己/对方不同样式）、时间分隔线、滚动加载历史消息。
+- [ ] 实现消息输入组件（`MessageInput.qml`）：多行输入框、发送按钮、输入状态指示。
+- [ ] 实现联系人搜索与添加功能界面。
+- [ ] 建立 QML 主题系统（`Theme.qml`）：集中管理颜色、字体、间距、圆角等设计 Token，支持亮色/暗色主题切换。
+- [ ] 添加过渡动画：页面切换、消息出现、会话列表更新。
+- [ ] 将现有 `NetworkManager`（C++）适配为 QML 可用的上下文对象，保持所有信号/槽兼容。
+- [ ] 删除旧 Qt Widgets UI 文件（`ui/*.ui`、`views/LoginWindow.*`、`views/MainWindow.*`）。
+
+### 验收标准
+
+- [ ] 客户端窗口无边框，标题栏自定义样式，支持拖拽移动、缩放、Snap Layout。
+- [ ] 登录/注册流程在 QML 界面正常运行，与现有后端协议完全兼容。
+- [ ] 会话列表展示、聊天消息气泡、消息发送与接收功能完整。
+- [ ] 界面风格接近 Telegram：圆角气泡、合理间距、平滑动画。
+- [ ] 支持亮色/暗色主题切换。
+- [ ] 所有现有功能（M1-M3）在 QML 界面下正常工作。
+
+## M5：传输层加密与会话安全（2-4 周）
 
 ### 目标
 
@@ -186,7 +226,7 @@ common/
 - 证书错误时客户端明确拒绝连接或提示用户。
 - 日志中不存在明文密码、token、私钥。
 
-## M5：端到端加密一对一聊天（6-10 周）
+## M6：端到端加密一对一聊天（6-10 周）
 
 ### 目标
 
@@ -209,7 +249,7 @@ common/
 - 非收发双方设备无法解密消息。
 - 删除某设备后，该设备无法继续接收新消息。
 
-## M6：群聊与群组权限（6-8 周）
+## M7：群聊与群组权限（6-8 周）
 
 ### 目标
 
@@ -229,7 +269,7 @@ common/
 - 群成员变更后权限立即生效。
 - 离线成员上线后可同步群消息。
 
-## M7：媒体、文件与对象存储（4-8 周）
+## M8：媒体、文件与对象存储（4-8 周）
 
 ### 目标
 
@@ -250,7 +290,7 @@ common/
 - 断网后恢复可续传。
 - 客户端能清理缓存并重新下载。
 
-## M8：多端同步与离线一致性（4-8 周）
+## M9：多端同步与离线一致性（4-8 周）
 
 ### 目标
 
@@ -270,7 +310,7 @@ common/
 - 离线 24 小时后上线只增量同步缺失事件。
 - 服务端可清理过期事件但不破坏历史拉取。
 
-## M9：搜索、通知与体验完善（4-6 周）
+## M10：搜索、通知与体验完善（4-6 周）
 
 ### 目标
 
@@ -290,7 +330,7 @@ common/
 - 用户能快速找到联系人、会话和历史消息。
 - 通知行为符合系统习惯且可配置。
 
-## M10：稳定性、可观测性与运维（持续）
+## M11：稳定性、可观测性与运维（持续）
 
 ### 目标
 
@@ -314,18 +354,35 @@ common/
 ## 5. 推荐目录结构演进
 
 ```text
-XLChat_Project/
+XYChat_Project/
+  3rdparty/
+    qwindowkit/           # QWindowKit 无边框窗口框架（git submodule）
+    openssl/
   common/
     protocol/
     crypto/
     models/
   Chat-Client/
+    qml/                  # QML 界面文件
+      pages/
+        LoginPage.qml
+        MainPage.qml
+      components/
+        TitleBar.qml
+        ConversationList.qml
+        ChatView.qml
+        MessageInput.qml
+        MessageBubble.qml
+      theme/
+        Theme.qml
+        DarkTheme.qml
+        LightTheme.qml
+      main.qml            # QML 入口
     src/
-      core/
-      views/
-      models/
-      storage/
-      services/
+      core/               # C++ 后端（NetworkManager 等）
+      models/             # QML 数据模型
+    resources/            # QML 资源文件（图片、字体、图标）
+      resources.qrc
   Chat-Server/
     src/
       server/
@@ -382,7 +439,9 @@ XLChat_Project/
 5. ~~增加注册接口和安全密码存储。~~（M2 已完成）
 6. ~~新增消息表与一对一文本消息接口。~~（M3 已完成）
 7. ~~客户端实现聊天窗口的最小收发闭环。~~（M3 已完成）
-8. 改用 `QSslSocket` 或等价 TLS 通道。
+8. 集成 QWindowKit，重构客户端 UI 为 QML 实现。（M4）
+9. 实现 Telegram 风格 QML 界面：无边框窗口、会话列表、聊天气泡、主题系统。
+10. 改用 `QSslSocket` 或等价 TLS 通道。（M5）
 
 ## 9. 每个迭代的完成定义
 
@@ -412,7 +471,7 @@ XLChat_Project/
 
 - 不建议一开始就做超大规模分布式架构；先把单机可靠性做好。
 - 不建议过早引入复杂微服务；当前模块化单体更适合快速迭代。
-- 不建议在协议未稳定时做大量 UI 细节。
+- 不建议在协议未稳定时做过度复杂的 UI 动效和装饰。
 - 不建议自行发明完整端到端加密协议；应在充分调研后实现。
 - 不建议把文件传输塞进主聊天长连接；大文件应走独立上传下载通道。
 
@@ -445,7 +504,22 @@ XLChat_Project/
 - [x] 客户端新增聊天界面。
 - [x] 客户端显示消息状态。
 
-### Sprint 4：TLS 与安全加固
+### Sprint 4：QML UI 重构（Telegram 风格）
+
+- [ ] 集成 QWindowKit 第三方库（CMake 子项目或预编译）。
+- [ ] 客户端 CMake 迁移：Qt6 Qml/Quick 模块替换 Widgets。
+- [ ] 重构 `main.cpp`：`QQmlApplicationEngine` + QWindowKit `WindowAgent` 初始化。
+- [ ] 实现 `TitleBar.qml` 自定义无边框标题栏组件。
+- [ ] 实现 `LoginPage.qml` 登录/注册页面。
+- [ ] 实现 `MainPage.qml` 主界面布局（左侧导航 + 右侧聊天）。
+- [ ] 实现 `ConversationList.qml` 会话列表组件。
+- [ ] 实现 `ChatView.qml` 聊天消息气泡视图。
+- [ ] 实现 `MessageInput.qml` 消息输入组件。
+- [ ] 建立 `Theme.qml` 主题系统（亮色/暗色）。
+- [ ] 适配 `NetworkManager` C++ 对象到 QML 上下文。
+- [ ] 删除旧 Qt Widgets UI 文件。
+
+### Sprint 5：TLS 与安全加固
 
 - [ ] 改用 `QSslSocket` 或等价 TLS 通道。
 - [ ] 增加开发证书加载方式。
