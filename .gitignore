@@ -384,3 +384,4 @@ install/
 # IDE/editor local state
 .idea/
 .vscode/*.user
+/build_m4

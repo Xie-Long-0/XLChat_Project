@@ -16,50 +16,46 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(Qt6 COMPONENTS Widgets Network REQUIRED)
+# QML 模块：Qml + Quick
+find_package(Qt6 COMPONENTS Widgets Quick QuickControls2 Network REQUIRED)
 find_package(OpenSSL REQUIRED)
 
-# 源文件列表
+# QWindowKit
+find_package(QWindowKit COMPONENTS Core Quick REQUIRED)
+
+# 资源文件
+set(RESOURCES
+    resources/resources.qrc
+)
+
+# C++ 源文件
 set(SOURCES
     main.cpp
-    views/LoginWindow.cpp
-    views/MainWindow.cpp
     core/NetworkManager.cpp
 )
 
-# 头文件列表
+# C++ 头文件
 set(HEADERS
-    views/LoginWindow.h
-    views/MainWindow.h
     core/NetworkManager.h
 )
 
-# UI 文件列表
-set(UIS
-    ui/LoginWindow.ui
-    ui/MainWindow.ui
-)
-
-# 添加 ui 目录到 ui 搜索路径
-set(CMAKE_AUTOUIC_SEARCH_PATHS
-    ui/
-)
-
 # 生成可执行文件
-add_executable(Chat-Client ${SOURCES} ${HEADERS} ${UIS})
+add_executable(Chat-Client ${SOURCES} ${HEADERS} ${RESOURCES})
 
 # 包含目录
 target_include_directories(Chat-Client PRIVATE
-    views/
     core/
-    ui/
 )
 
-# 链接 Qt 和 OpenSSL 库
+# 链接 Qt、OpenSSL、QWindowKit 和公共库
 target_link_libraries(Chat-Client PUBLIC
     Qt6::Widgets
+    Qt6::Quick
+    Qt6::QuickControls2
     Qt6::Network
     OpenSSL::SSL
+    QWindowKit::Core
+    QWindowKit::Quick
     XYChatCommon
 )
 
@@ -67,4 +63,14 @@ target_link_libraries(Chat-Client PUBLIC
 target_include_directories(Chat-Client SYSTEM PUBLIC
     ${Qt6Widgets_INCLUDE_DIRS}
     ${Qt6Network_INCLUDE_DIRS}
+    ${Qt6Quick_INCLUDE_DIRS}
+)
+
+# 构建后将 QWindowKit 运行时 DLL 拷贝到输出目录
+# $<TARGET_FILE:...> 会自动根据当前构建配置选择对应的 DLL（Debug 为 QWKCored/QWKQuickd，Release 为 QWKCore/QWKQuick）
+add_custom_command(TARGET Chat-Client POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:QWindowKit::Core>
+        $<TARGET_FILE:QWindowKit::Quick>
+        $<TARGET_FILE_DIR:Chat-Client>
 )

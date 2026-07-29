@@ -4,6 +4,8 @@
 #include <QJsonObject>
 #include <QSysInfo>
 
+#include "EncryptionManager.h"
+
 using namespace XYChat::Protocol;
 
 NetworkManager::NetworkManager(QObject *parent) :
@@ -603,4 +605,19 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     if (msgId > 0) {
         ackMessage(msgId, "delivered");
     }
+}
+
+// ── QML 辅助方法 ─────────────────────────────────────────────────
+QString NetworkManager::encryptPassword(const QString &password) const
+{
+    return EncryptionManager::encryptPassword(password);
+}
+
+QVariantList NetworkManager::toVariantList(const QJsonArray &array) const
+{
+    QVariantList result;
+    for (const auto &val : array) {
+        result.append(val.toVariant());
+    }
+    return result;
 }

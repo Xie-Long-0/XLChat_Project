@@ -167,6 +167,8 @@ common/
 
 ## M4：客户端 QML UI 重构（4-6 周）
 
+**当前状态（2026-07-29）：已完成 QML UI 重构。**
+
 ### 目标
 
 将客户端 UI 从 Qt Widgets 全面迁移到 QML，参照 Telegram 的界面风格与交互体验，使用 QWindowKit 实现跨平台无边框自定义窗口，打造现代化、流畅、美观的聊天客户端。
@@ -181,29 +183,29 @@ common/
 
 ### 任务
 
-- [ ] 集成 QWindowKit 第三方库（`git clone --recursive`，CMake `find_package(QWindowKit COMPONENTS Core Quick REQUIRED)`）。
-- [ ] 客户端 CMake 配置迁移：`find_package(Qt6 COMPONENTS Qml Quick REQUIRED)`，替换 `Widgets`。
-- [ ] 重构 `main.cpp`：使用 `QQmlApplicationEngine` 加载 QML，注册 QWindowKit `WindowAgent`，注册 C++ 上下文属性（NetworkManager 等）。
-- [ ] 实现自定义无边框窗口组件（`TitleBar.qml`）：自定义标题栏、拖拽区域、最小化/最大化/关闭按钮、窗口阴影。
-- [ ] 实现登录/注册页面（`LoginPage.qml`）：Telegram 风格渐变背景、圆角输入框、登录/注册切换动画。
-- [ ] 实现主界面布局（`MainPage.qml`）：左侧导航栏（头像 + 会话列表 + 搜索）+ 右侧聊天区域。
-- [ ] 实现会话列表组件（`ConversationList.qml`）：头像、名称、最后消息预览、时间、未读角标、选中高亮。
-- [ ] 实现聊天窗口组件（`ChatView.qml`）：消息气泡（自己/对方不同样式）、时间分隔线、滚动加载历史消息。
-- [ ] 实现消息输入组件（`MessageInput.qml`）：多行输入框、发送按钮、输入状态指示。
-- [ ] 实现联系人搜索与添加功能界面。
-- [ ] 建立 QML 主题系统（`Theme.qml`）：集中管理颜色、字体、间距、圆角等设计 Token，支持亮色/暗色主题切换。
-- [ ] 添加过渡动画：页面切换、消息出现、会话列表更新。
-- [ ] 将现有 `NetworkManager`（C++）适配为 QML 可用的上下文对象，保持所有信号/槽兼容。
-- [ ] 删除旧 Qt Widgets UI 文件（`ui/*.ui`、`views/LoginWindow.*`、`views/MainWindow.*`）。
+- [x] 集成 QWindowKit 第三方库（`git clone --recursive`，CMake `find_package(QWindowKit COMPONENTS Core Quick REQUIRED)`）。
+- [x] 客户端 CMake 配置迁移：`find_package(Qt6 COMPONENTS Qml Quick REQUIRED)`，替换 `Widgets`。
+- [x] 重构 `main.cpp`：使用 `QQmlApplicationEngine` 加载 QML，注册 QWindowKit `WindowAgent`，注册 C++ 上下文属性（NetworkManager 等）。
+- [x] 实现自定义无边框窗口组件（`TitleBar.qml`）：自定义标题栏、拖拽区域、最小化/最大化/关闭按钮、窗口阴影。
+- [x] 实现登录/注册页面（`LoginPage.qml`）：Telegram 风格渐变背景、圆角输入框、登录/注册切换动画。
+- [x] 实现主界面布局（`MainPage.qml`）：左侧导航栏（头像 + 会话列表 + 搜索）+ 右侧聊天区域。
+- [x] 实现会话列表组件（`ConversationList.qml`）：头像、名称、最后消息预览、时间、未读角标、选中高亮。
+- [x] 实现聊天窗口组件（`ChatView.qml`）：消息气泡（自己/对方不同样式）、时间分隔线、滚动加载历史消息。
+- [x] 实现消息输入组件（`MessageInput.qml`）：多行输入框、发送按钮、输入状态指示。
+- [x] 实现联系人搜索与添加功能界面。
+- [x] 建立 QML 主题系统（`Theme.qml`）：集中管理颜色、字体、间距、圆角等设计 Token，支持亮色/暗色主题切换。
+- [x] 添加过渡动画：页面切换、消息出现、会话列表更新。
+- [x] 将现有 `NetworkManager`（C++）适配为 QML 可用的上下文对象，保持所有信号/槽兼容。
+- [x] 删除旧 Qt Widgets UI 文件（`ui/*.ui`、`views/LoginWindow.*`、`views/MainWindow.*`）。
 
 ### 验收标准
 
-- [ ] 客户端窗口无边框，标题栏自定义样式，支持拖拽移动、缩放、Snap Layout。
-- [ ] 登录/注册流程在 QML 界面正常运行，与现有后端协议完全兼容。
-- [ ] 会话列表展示、聊天消息气泡、消息发送与接收功能完整。
-- [ ] 界面风格接近 Telegram：圆角气泡、合理间距、平滑动画。
-- [ ] 支持亮色/暗色主题切换。
-- [ ] 所有现有功能（M1-M3）在 QML 界面下正常工作。
+- [x] 客户端窗口无边框，标题栏自定义样式，支持拖拽移动、缩放、Snap Layout。
+- [x] 登录/注册流程在 QML 界面正常运行，与现有后端协议完全兼容。
+- [x] 会话列表展示、聊天消息气泡、消息发送与接收功能完整。
+- [x] 界面风格接近 Telegram：圆角气泡、合理间距、平滑动画。
+- [x] 支持亮色/暗色主题切换。
+- [x] 所有现有功能（M1-M3）在 QML 界面下正常工作。
 
 ## M5：传输层加密与会话安全（2-4 周）
 
@@ -439,8 +441,8 @@ XYChat_Project/
 5. ~~增加注册接口和安全密码存储。~~（M2 已完成）
 6. ~~新增消息表与一对一文本消息接口。~~（M3 已完成）
 7. ~~客户端实现聊天窗口的最小收发闭环。~~（M3 已完成）
-8. 集成 QWindowKit，重构客户端 UI 为 QML 实现。（M4）
-9. 实现 Telegram 风格 QML 界面：无边框窗口、会话列表、聊天气泡、主题系统。
+8. ~~集成 QWindowKit，重构客户端 UI 为 QML 实现。~~（M4 已完成）
+9. ~~实现 Telegram 风格 QML 界面：无边框窗口、会话列表、聊天气泡、主题系统。~~（M4 已完成）
 10. 改用 `QSslSocket` 或等价 TLS 通道。（M5）
 
 ## 9. 每个迭代的完成定义
@@ -506,18 +508,18 @@ XYChat_Project/
 
 ### Sprint 4：QML UI 重构（Telegram 风格）
 
-- [ ] 集成 QWindowKit 第三方库（CMake 子项目或预编译）。
-- [ ] 客户端 CMake 迁移：Qt6 Qml/Quick 模块替换 Widgets。
-- [ ] 重构 `main.cpp`：`QQmlApplicationEngine` + QWindowKit `WindowAgent` 初始化。
-- [ ] 实现 `TitleBar.qml` 自定义无边框标题栏组件。
-- [ ] 实现 `LoginPage.qml` 登录/注册页面。
-- [ ] 实现 `MainPage.qml` 主界面布局（左侧导航 + 右侧聊天）。
-- [ ] 实现 `ConversationList.qml` 会话列表组件。
-- [ ] 实现 `ChatView.qml` 聊天消息气泡视图。
-- [ ] 实现 `MessageInput.qml` 消息输入组件。
-- [ ] 建立 `Theme.qml` 主题系统（亮色/暗色）。
-- [ ] 适配 `NetworkManager` C++ 对象到 QML 上下文。
-- [ ] 删除旧 Qt Widgets UI 文件。
+- [x] 集成 QWindowKit 第三方库（CMake 子项目或预编译）。
+- [x] 客户端 CMake 迁移：Qt6 Qml/Quick 模块替换 Widgets。
+- [x] 重构 `main.cpp`：`QQmlApplicationEngine` + QWindowKit `WindowAgent` 初始化。
+- [x] 实现 `TitleBar.qml` 自定义无边框标题栏组件。
+- [x] 实现 `LoginPage.qml` 登录/注册页面。
+- [x] 实现 `MainPage.qml` 主界面布局（左侧导航 + 右侧聊天）。
+- [x] 实现 `ConversationList.qml` 会话列表组件。
+- [x] 实现 `ChatView.qml` 聊天消息气泡视图。
+- [x] 实现 `MessageInput.qml` 消息输入组件。
+- [x] 建立 `Theme.qml` 主题系统（亮色/暗色）。
+- [x] 适配 `NetworkManager` C++ 对象到 QML 上下文。
+- [x] 删除旧 Qt Widgets UI 文件。
 
 ### Sprint 5：TLS 与安全加固
 

@@ -5,6 +5,7 @@
 #include <QTimer>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QVariant>
 
 #include "protocol/PacketCodec.h"
 
@@ -47,6 +48,10 @@ public:
     QString sessionToken() const { return m_sessionToken; }
     qint64 userId() const { return m_userId; }
     QString username() const { return m_username; }
+
+    // QML 可调用的方法
+    Q_INVOKABLE QString encryptPassword(const QString &password) const;
+    Q_INVOKABLE QVariantList toVariantList(const QJsonArray &array) const;
 
 signals:
     void loginSuccessful();
