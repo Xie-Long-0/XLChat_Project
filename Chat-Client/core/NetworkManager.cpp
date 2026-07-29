@@ -24,6 +24,7 @@ NetworkManager::NetworkManager(QObject *parent) :
     connect(m_reconnectTimer, &QTimer::timeout, this, &NetworkManager::connectToServer);
 }
 
+// ── 登录 ─────────────────────────────────────────────────────────────────────
 void NetworkManager::login(const QString &username, const QString &encryptedPassword)
 {
     m_pendingUsername = username;
@@ -41,6 +42,62 @@ void NetworkManager::login(const QString &username, const QString &encryptedPass
     }
 }
 
+// ── 注册 ─────────────────────────────────────────────────────────────────────
+void NetworkManager::registerAccount(const QString &username, const QString &password,
+                                     const QString &email, const QString &phone)
+{
+    m_pendingUsername = username;
+    m_pendingRegisterPassword = password;
+    m_pendingEmail = email;
+    m_pendingPhone = phone;
+    m_registerQueued = true;
+
+    if (m_state == ConnectionState::Connected || m_state == ConnectionState::Authenticated) {
+        sendRegisterRequest();
+        return;
+    }
+
+    if (m_state == ConnectionState::Disconnected) {
+        connectToServer();
+    }
+}
+
+// ── 登出 ─────────────────────────────────────────────────────────────────────
+void NetworkManager::logout()
+{
+    if (m_state != ConnectionState::Authenticated) {
+        return;
+    }
+
+    QJsonObject json;
+    json["type"] = "logout";
+
+    Packet packet;
+    packet.messageType = MessageType::LogoutRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    sendPacket(packet);
+}
+
+// ── Token 续期 ───────────────────────────────────────────────────────────────
+void NetworkManager::renewToken()
+{
+    if (m_state != ConnectionState::Authenticated || m_sessionToken.isEmpty()) {
+        return;
+    }
+
+    QJsonObject json;
+    json["type"] = "token_renew";
+    json["token"] = m_sessionToken;
+
+    Packet packet;
+    packet.messageType = MessageType::TokenRenewRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    sendPacket(packet);
+}
+
+// ── 连接回调 ─────────────────────────────────────────────────────────────────
 void NetworkManager::onConnected()
 {
     setState(ConnectionState::Connected);
@@ -48,6 +105,8 @@ void NetworkManager::onConnected()
 
     if (m_loginQueued) {
         sendLoginRequest();
+    } else if (m_registerQueued) {
+        sendRegisterRequest();
     }
 }
 
@@ -115,16 +174,17 @@ void NetworkManager::connectToServer()
     }
 
     setState(ConnectionState::Connecting);
-    m_tcpSocket->connectToHost(QStringLiteral("127.0.0.1"), 12345);
+    m_tcpSocket->connectToHost("127.0.0.1", 12345);
 }
 
+// ── 发送登录请求 ─────────────────────────────────────────────────────────────
 void NetworkManager::sendLoginRequest()
 {
     QJsonObject json;
-    json["type"] = QStringLiteral("login");
+    json["type"] = "login";
     json["username"] = m_pendingUsername;
     json["password"] = m_pendingEncryptedPassword;
-    json["clientVersion"] = QStringLiteral("0.1.0");
+    json["clientVersion"] = "0.2.0";
     json["platform"] = QSysInfo::productType();
     json["deviceId"] = QString::fromLatin1(QSysInfo::machineUniqueId().toHex());
 
@@ -138,21 +198,55 @@ void NetworkManager::sendLoginRequest()
     sendPacket(packet);
 }
 
+// ── 发送注册请求 ─────────────────────────────────────────────────────────────
+void NetworkManager::sendRegisterRequest()
+{
+    QJsonObject json;
+    json["type"] = "register";
+    json["username"] = m_pendingUsername;
+    json["password"] = m_pendingRegisterPassword;
+    json["email"] = m_pendingEmail;
+    json["phone"] = m_pendingPhone;
+
+    Packet packet;
+    packet.messageType = MessageType::RegisterRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+
+    m_pendingRegisterRequestId = packet.requestId;
+    setState(ConnectionState::LoggingIn);
+    sendPacket(packet);
+}
+
+// ── 包分发 ───────────────────────────────────────────────────────────────────
 void NetworkManager::handlePacket(const Packet &packet)
 {
-    if (packet.messageType == MessageType::LoginResponse) {
+    switch (packet.messageType) {
+    case MessageType::LoginResponse:
         handleLoginResponse(packet);
-        return;
-    }
-
-    if (packet.messageType == MessageType::Ping) {
+        break;
+    case MessageType::RegisterResponse:
+        handleRegisterResponse(packet);
+        break;
+    case MessageType::LogoutResponse:
+        handleLogoutResponse(packet);
+        break;
+    case MessageType::TokenRenewResponse:
+        handleTokenRenewResponse(packet);
+        break;
+    case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
         pong.requestId = packet.requestId;
         sendPacket(pong);
+        break;
+    }
+    default:
+        break;
     }
 }
 
+// ── 登录响应 ─────────────────────────────────────────────────────────────────
 void NetworkManager::handleLoginResponse(const Packet &packet)
 {
     if (packet.requestId != m_pendingLoginRequestId) {
@@ -161,10 +255,14 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
 
     const QJsonDocument responseDoc = QJsonDocument::fromJson(packet.payload);
     const QJsonObject response = responseDoc.object();
-    const int code = response.value(QStringLiteral("code")).toInt(static_cast<int>(ErrorCode::InternalError));
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
 
     m_pendingLoginRequestId = 0;
     if (code == static_cast<int>(ErrorCode::Ok)) {
+        const QJsonObject data = response.value("data").toObject();
+        m_sessionToken = data.value("token").toString();
+        m_userId = data.value("userId").toVariant().toLongLong();
+        m_username = data.value("username").toString();
         m_loginQueued = false;
         setState(ConnectionState::Authenticated);
         emit loginSuccessful();
@@ -172,15 +270,65 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
     }
 
     setState(ConnectionState::Connected);
-    const QString message = response.value(QStringLiteral("message")).toString(QStringLiteral("Unknown error"));
+    const QString message = response.value("message").toString("Unknown error");
     emit loginFailed(message);
 }
 
+// ── 注册响应 ─────────────────────────────────────────────────────────────────
+void NetworkManager::handleRegisterResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingRegisterRequestId) {
+        return;
+    }
+
+    const QJsonDocument responseDoc = QJsonDocument::fromJson(packet.payload);
+    const QJsonObject response = responseDoc.object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+
+    m_pendingRegisterRequestId = 0;
+    m_registerQueued = false;
+
+    if (code == static_cast<int>(ErrorCode::Ok)) {
+        setState(ConnectionState::Connected);
+        emit registerSuccessful();
+        return;
+    }
+
+    setState(ConnectionState::Connected);
+    const QString message = response.value("message").toString("Unknown error");
+    emit registerFailed(message);
+}
+
+// ── 登出响应 ─────────────────────────────────────────────────────────────────
+void NetworkManager::handleLogoutResponse(const Packet &packet)
+{
+    Q_UNUSED(packet);
+    resetAuthState();
+    m_reconnectEnabled = false;
+    setState(ConnectionState::Connected);
+    emit logoutFinished();
+}
+
+// ── Token 续期响应 ───────────────────────────────────────────────────────────
+void NetworkManager::handleTokenRenewResponse(const Packet &packet)
+{
+    const QJsonDocument responseDoc = QJsonDocument::fromJson(packet.payload);
+    const QJsonObject response = responseDoc.object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
+
+    if (code == static_cast<int>(ErrorCode::Ok)) {
+        const QJsonObject data = response.value("data").toObject();
+        m_sessionToken = data.value("token").toString();
+        qDebug() << "[NetMgr] Token renewed";
+    }
+}
+
+// ── 工具 ─────────────────────────────────────────────────────────────────────
 void NetworkManager::sendPacket(const Packet &packet)
 {
     const QByteArray encoded = PacketCodec::encode(packet);
     if (encoded.isEmpty()) {
-        emit loginFailed(QStringLiteral("Failed to encode request"));
+        emit loginFailed("Failed to encode request");
         return;
     }
 
@@ -200,4 +348,13 @@ void NetworkManager::setState(ConnectionState state)
 
     m_state = state;
     emit connectionStateChanged(m_state);
+}
+
+void NetworkManager::resetAuthState()
+{
+    m_sessionToken.clear();
+    m_userId = 0;
+    m_username.clear();
+    m_pendingUsername.clear();
+    m_pendingEncryptedPassword.clear();
 }

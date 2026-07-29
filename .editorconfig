@@ -1,21 +1,38 @@
+# Visual Studio 生成了具有 C++ 设置的 .editorconfig 文件。
 root = true
 
-[*.{c,cc,cpp,cppm,cxx,h,hh,hpp,hxx,inl,ipp,ixx}]
-
-end_of_line = crlf
-insert_final_newline = true
-indent_style = space
-indent_size = 4
-trim_trailing_whitespace = true
-charset = utf-8
+[*.{c,cc,cpp,cppm,cxx,h,h++,hh,hpp,hxx,inl,ipp,ixx,tlh,tli}]
 
 # Visual C++ 代码样式设置
 
 cpp_generate_documentation_comments = doxygen_slash_star
 
+# 文件编码
+charset = utf-8
+
 # Visual C++ 格式设置
 
-cpp_new_line_before_open_brace_namespace = new_line
+indent_style = spaces
+indent_size = 4
+tab_width= 4
+trim_trailing_whitespace = true
+end_of_line = crlf
+insert_final_newline = true
+
+cpp_indent_braces = false
+cpp_indent_multi_line_relative_to = innermost_parenthesis
+cpp_indent_within_parentheses = indent
+cpp_indent_preserve_within_parentheses = false
+cpp_indent_case_contents = true
+cpp_indent_case_labels = false
+cpp_indent_case_contents_when_block = false
+cpp_indent_lambda_braces_when_parameter = true
+cpp_indent_goto_labels = one_left
+cpp_indent_preprocessor = leftmost_column
+cpp_indent_access_specifiers = false
+cpp_indent_namespace_contents = true
+cpp_indent_preserve_comments = false
+cpp_new_line_before_open_brace_namespace = ignore
 cpp_new_line_before_open_brace_type = new_line
 cpp_new_line_before_open_brace_function = new_line
 cpp_new_line_before_open_brace_block = new_line
@@ -25,7 +42,6 @@ cpp_new_line_close_brace_same_line_empty_type = false
 cpp_new_line_close_brace_same_line_empty_function = false
 cpp_new_line_before_catch = true
 cpp_new_line_before_else = true
-cpp_new_line_before_while_in_do_while = true
 cpp_space_before_function_open_parenthesis = remove
 cpp_space_within_parameter_list_parentheses = false
 cpp_space_between_empty_parameter_list_parentheses = false
@@ -59,3 +75,18 @@ cpp_space_around_binary_operator = insert
 cpp_space_around_assignment_operator = insert
 cpp_space_pointer_reference_alignment = right
 cpp_space_around_ternary_operator = insert
+cpp_use_unreal_engine_macro_formatting = true
+cpp_wrap_preserve_blocks = one_liners
+
+# Visual C++ include 清理设置
+
+cpp_include_cleanup_add_missing_error_tag_type = suggestion
+cpp_include_cleanup_remove_unused_error_tag_type = dimmed
+cpp_include_cleanup_optimize_unused_error_tag_type = dimmed
+cpp_include_cleanup_sort_after_edits = false
+cpp_include_cleanup_format_after_edits = false
+cpp_sort_includes_error_tag_type = suggestion
+cpp_sort_includes_priority_case_sensitive = false
+cpp_sort_includes_priority_style = quoted
+cpp_includes_style = default
+cpp_includes_use_forward_slash = true

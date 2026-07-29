@@ -19,10 +19,16 @@ public:
 
 private slots:
     void onLoginButtonClicked();
+    void onRegisterButtonClicked();
     void onLoginSuccessful();
     void onLoginFailed(const QString &errorMessage);
+    void onRegisterSuccessful();
+    void onRegisterFailed(const QString &errorMessage);
 
 private:
+    void setRegisterMode(bool registerMode);
+
     Ui::LoginWindow *ui;
     NetworkManager *m_networkManager;
+    bool m_isRegisterMode = false;
 };
