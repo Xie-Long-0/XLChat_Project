@@ -82,6 +82,7 @@ void LoginWindow::onRegisterButtonClicked()
 void LoginWindow::onLoginSuccessful()
 {
     auto mainWindow = new MainWindow();
+    mainWindow->setNetworkManager(m_networkManager);
     mainWindow->show();
     close();
 }

@@ -28,6 +28,24 @@ enum class MessageType : quint16
     TokenRenewResponse = 15,
     ForceLogoutRequest = 16,
     ForceLogoutResponse = 17,
+    // M3 - 用户搜索与联系人
+    SearchUsersRequest = 20,
+    SearchUsersResponse = 21,
+    AddContactRequest = 22,
+    AddContactResponse = 23,
+    GetContactsRequest = 24,
+    GetContactsResponse = 25,
+    // M3 - 会话与消息
+    GetConversationsRequest = 30,
+    GetConversationsResponse = 31,
+    SendMessageRequest = 32,
+    SendMessageResponse = 33,
+    NewMessageNotification = 34,
+    AckMessageRequest = 35,
+    AckMessageResponse = 36,
+    SyncMessagesRequest = 37,
+    SyncMessagesResponse = 38,
+    MessageStatusUpdate = 39,
 };
 
 enum class ErrorCode : int
@@ -44,6 +62,12 @@ enum class ErrorCode : int
     SessionInvalid = 2005,
     LoginRateLimited = 2006,
     TooManyDevices = 2007,
+    // 3xxx: 联系人/会话相关
+    ContactAlreadyExists = 3001,
+    ContactNotFound = 3002,
+    ConversationNotFound = 3003,
+    MessageNotFound = 3004,
+    CannotSendToSelf = 3005,
     // 9xxx: 系统相关
     Timeout = 9001,
     InternalError = 9002,

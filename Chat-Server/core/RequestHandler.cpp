@@ -4,9 +4,11 @@
 
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonArray>
 #include <QJsonParseError>
 #include <QDateTime>
 #include <QUuid>
+#include <QMetaObject>
 
 using namespace XYChat::Protocol;
 
@@ -21,6 +23,18 @@ RequestHandler::~RequestHandler()
 {
     delete m_db;
     m_db = nullptr;
+}
+
+// ── M3: 跨线程发送数据到客户端 ─────────────────────────────────────────────
+void RequestHandler::sendRawData(const QByteArray &data)
+{
+    // 通过 Qt 队列连接跨线程调用
+    QMetaObject::invokeMethod(this, [this, data]() {
+        if (m_socket && m_socket->state() == QAbstractSocket::ConnectedState) {
+            m_socket->write(data);
+            m_socket->flush();
+        }
+    }, Qt::QueuedConnection);
 }
 
 // ── 线程入口 ─────────────────────────────────────────────────────────────────
@@ -148,6 +162,36 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     if (packet.messageType == MessageType::ForceLogoutRequest || type == "force_logout") {
         processForceLogoutRequest(packet, json);
+        return;
+    }
+
+    // M3 消息分发
+    if (packet.messageType == MessageType::SearchUsersRequest || type == "search_users") {
+        processSearchUsersRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::AddContactRequest || type == "add_contact") {
+        processAddContactRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::GetContactsRequest || type == "get_contacts") {
+        processGetContactsRequest(packet);
+        return;
+    }
+    if (packet.messageType == MessageType::GetConversationsRequest || type == "get_conversations") {
+        processGetConversationsRequest(packet);
+        return;
+    }
+    if (packet.messageType == MessageType::SendMessageRequest || type == "send_message") {
+        processSendMessageRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::AckMessageRequest || type == "ack_message") {
+        processAckMessageRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::SyncMessagesRequest || type == "sync_messages") {
+        processSyncMessagesRequest(packet, json);
         return;
     }
 
@@ -375,6 +419,251 @@ void RequestHandler::processForceLogoutRequest(const Packet &packet, const QJson
     sendResponse(packet.requestId, MessageType::ForceLogoutResponse, ErrorCode::Ok,
                  "User forced logout", data);
     qDebug() << "[Handler] Force logout user" << targetUserId;
+}
+
+// ── M3: 用户搜索 ───────────────────────────────────────────────────────────
+void RequestHandler::processSearchUsersRequest(const Packet &packet, const QJsonObject &request)
+{
+    const QString query = request.value("query").toString().trimmed();
+    if (query.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::SearchUsersResponse,
+                     ErrorCode::InvalidRequest, "Query is required");
+        return;
+    }
+
+    auto users = m_db->searchUsers(query);
+
+    QJsonArray userArray;
+    for (const auto &u : users) {
+        if (u.id == m_authenticatedUserId) continue; // 排除自己
+        QJsonObject obj;
+        obj["userId"] = u.id;
+        obj["username"] = u.username;
+        userArray.append(obj);
+    }
+
+    QJsonObject data;
+    data["users"] = userArray;
+    sendResponse(packet.requestId, MessageType::SearchUsersResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// ── M3: 添加联系人 ───────────────────────────────────────────────────────────
+void RequestHandler::processAddContactRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 contactUserId = request.value("userId").toVariant().toLongLong();
+    if (contactUserId <= 0 || contactUserId == m_authenticatedUserId) {
+        sendResponse(packet.requestId, MessageType::AddContactResponse,
+                     ErrorCode::CannotSendToSelf, "Invalid contact");
+        return;
+    }
+
+    // 检查是否已是联系人
+    auto contacts = m_db->getContacts(m_authenticatedUserId);
+    for (const auto &c : contacts) {
+        if (c.contactUserId == contactUserId) {
+            sendResponse(packet.requestId, MessageType::AddContactResponse,
+                         ErrorCode::ContactAlreadyExists, "Contact already exists");
+            return;
+        }
+    }
+
+    if (!m_db->addContact(m_authenticatedUserId, contactUserId)) {
+        sendResponse(packet.requestId, MessageType::AddContactResponse,
+                     ErrorCode::InternalError, "Failed to add contact");
+        return;
+    }
+
+    QJsonObject data;
+    data["contactUserId"] = contactUserId;
+    sendResponse(packet.requestId, MessageType::AddContactResponse, ErrorCode::Ok,
+                 "Contact added", data);
+}
+
+// ── M3: 获取联系人列表 ─────────────────────────────────────────────────────
+void RequestHandler::processGetContactsRequest(const Packet &packet)
+{
+    auto contacts = m_db->getContacts(m_authenticatedUserId);
+
+    QJsonArray contactArray;
+    for (const auto &c : contacts) {
+        QJsonObject obj;
+        obj["userId"] = c.contactUserId;
+        obj["username"] = c.contactUsername;
+        obj["addedAt"] = c.createdAt;
+        contactArray.append(obj);
+    }
+
+    QJsonObject data;
+    data["contacts"] = contactArray;
+    sendResponse(packet.requestId, MessageType::GetContactsResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// ── M3: 获取会话列表 ─────────────────────────────────────────────────────
+void RequestHandler::processGetConversationsRequest(const Packet &packet)
+{
+    auto conversations = m_db->getConversationsForUser(m_authenticatedUserId);
+
+    QJsonArray convArray;
+    for (const auto &c : conversations) {
+        QJsonObject obj;
+        obj["conversationId"] = c.id;
+        obj["type"] = c.type;
+        obj["peerUserId"] = c.peerUserId;
+        obj["peerUsername"] = c.peerUsername;
+        obj["lastMessage"] = c.lastMessage;
+        obj["lastMessageId"] = c.lastMessageId;
+        obj["lastMessageAt"] = c.lastMessageAt;
+        obj["unreadCount"] = c.unreadCount;
+        convArray.append(obj);
+    }
+
+    QJsonObject data;
+    data["conversations"] = convArray;
+    sendResponse(packet.requestId, MessageType::GetConversationsResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// ── M3: 发送消息 ───────────────────────────────────────────────────────────
+void RequestHandler::processSendMessageRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 targetUserId = request.value("toUserId").toVariant().toLongLong();
+    const QString content = request.value("content").toString();
+    const QString contentType = request.value("contentType").toString("text");
+
+    if (targetUserId <= 0 || targetUserId == m_authenticatedUserId) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::CannotSendToSelf, "Invalid recipient");
+        return;
+    }
+    if (content.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "Message content is empty");
+        return;
+    }
+
+    // 获取或创建会话
+    const qint64 convId = m_db->getOrCreatePrivateConversation(m_authenticatedUserId, targetUserId);
+    if (convId < 0) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InternalError, "Failed to create conversation");
+        return;
+    }
+
+    // 存储消息
+    const qint64 msgId = m_db->sendMessage(convId, m_authenticatedUserId, content, contentType);
+    if (msgId < 0) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InternalError, "Failed to send message");
+        return;
+    }
+
+    // 构造消息通知包，用于转发给在线接收方
+    QJsonObject notifyJson;
+    notifyJson["messageId"] = msgId;
+    notifyJson["conversationId"] = convId;
+    notifyJson["senderId"] = m_authenticatedUserId;
+    notifyJson["content"] = content;
+    notifyJson["contentType"] = contentType;
+    notifyJson["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::NewMessageNotification;
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = QJsonDocument(notifyJson).toJson(QJsonDocument::Compact);
+
+    // 通过信号通知 Server 转发
+    emit messageForUser(targetUserId, PacketCodec::encode(notifyPacket));
+
+    // 返回发送确认给发送方
+    QJsonObject data;
+    data["messageId"] = msgId;
+    data["conversationId"] = convId;
+    data["status"] = "sent";
+    sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
+                 "Message sent", data);
+}
+
+// ── M3: 确认消息 ───────────────────────────────────────────────────────────
+void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 messageId = request.value("messageId").toVariant().toLongLong();
+    const QString status = request.value("status").toString("delivered");
+
+    if (messageId <= 0) {
+        sendResponse(packet.requestId, MessageType::AckMessageResponse,
+                     ErrorCode::InvalidRequest, "Invalid messageId");
+        return;
+    }
+
+    auto msgOpt = m_db->getMessage(messageId);
+    if (!msgOpt.has_value()) {
+        sendResponse(packet.requestId, MessageType::AckMessageResponse,
+                     ErrorCode::MessageNotFound, "Message not found");
+        return;
+    }
+
+    m_db->updateMessageStatus(messageId, status);
+
+    // 如果是已读状态，更新整个会话的已读进度
+    if (status == "read") {
+        m_db->updateMessagesReadStatus(msgOpt->conversationId, m_authenticatedUserId);
+    }
+
+    QJsonObject data;
+    data["messageId"] = messageId;
+    data["status"] = status;
+    sendResponse(packet.requestId, MessageType::AckMessageResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// ── M3: 同步消息 ───────────────────────────────────────────────────────────
+void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 conversationId = request.value("conversationId").toVariant().toLongLong();
+    const qint64 afterId = request.value("afterId").toVariant().toLongLong();
+    const int limit = request.value("limit").toInt(100);
+
+    if (conversationId <= 0) {
+        sendResponse(packet.requestId, MessageType::SyncMessagesResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+
+    // 验证用户是该会话的成员
+    auto convOpt = m_db->getConversation(conversationId);
+    if (!convOpt.has_value()) {
+        sendResponse(packet.requestId, MessageType::SyncMessagesResponse,
+                     ErrorCode::ConversationNotFound, "Conversation not found");
+        return;
+    }
+
+    auto messages = m_db->syncMessages(conversationId, afterId, limit);
+
+    QJsonArray msgArray;
+    for (const auto &m : messages) {
+        QJsonObject obj;
+        obj["messageId"] = m.id;
+        obj["conversationId"] = m.conversationId;
+        obj["senderId"] = m.senderId;
+        obj["senderUsername"] = m.senderUsername;
+        obj["content"] = m.content;
+        obj["contentType"] = m.contentType;
+        obj["status"] = m.status;
+        obj["createdAt"] = m.createdAt;
+        msgArray.append(obj);
+    }
+
+    // 自动标记为已读
+    m_db->updateMessagesReadStatus(conversationId, m_authenticatedUserId);
+
+    QJsonObject data;
+    data["conversationId"] = conversationId;
+    data["messages"] = msgArray;
+    data["hasMore"] = (messages.size() >= limit);
+    sendResponse(packet.requestId, MessageType::SyncMessagesResponse, ErrorCode::Ok,
+                 "OK", data);
 }
 
 // ── Session 验证 ─────────────────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 # XYChat 协议文档
 
-## M2 当前协议状态
+## M3 当前协议状态
 
-M2 在 M1 长度前缀帧协议基础上，新增了账户注册、session token 认证、登出、token 续期和强制下线功能。密码存储升级为 PBKDF2-HMAC-SHA256 慢哈希。
+M3 在 M2 基础上，新增了一对一文本聊天功能：用户搜索、联系人管理、会话管理、消息发送/同步/确认。服务端支持在线消息实时转发，离线消息通过同步接口补收。
 
 ### 固定包头
 
@@ -39,6 +39,22 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `15` | `TokenRenewResponse` | Token 续期响应 |
 | `16` | `ForceLogoutRequest` | 强制下线请求 |
 | `17` | `ForceLogoutResponse` | 强制下线响应 |
+| `20` | `SearchUsersRequest` | 用户搜索请求 |
+| `21` | `SearchUsersResponse` | 用户搜索响应 |
+| `22` | `AddContactRequest` | 添加联系人请求 |
+| `23` | `AddContactResponse` | 添加联系人响应 |
+| `24` | `GetContactsRequest` | 获取联系人列表请求 |
+| `25` | `GetContactsResponse` | 获取联系人列表响应 |
+| `30` | `GetConversationsRequest` | 获取会话列表请求 |
+| `31` | `GetConversationsResponse` | 获取会话列表响应 |
+| `32` | `SendMessageRequest` | 发送消息请求 |
+| `33` | `SendMessageResponse` | 发送消息响应 |
+| `34` | `NewMessageNotification` | 新消息通知（服务端推送） |
+| `35` | `AckMessageRequest` | 消息确认请求 |
+| `36` | `AckMessageResponse` | 消息确认响应 |
+| `37` | `SyncMessagesRequest` | 同步消息请求 |
+| `38` | `SyncMessagesResponse` | 同步消息响应 |
+| `39` | `MessageStatusUpdate` | 消息状态更新 |
 
 ### 注册请求
 
@@ -159,6 +175,11 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `2005` | `SessionInvalid` | Session 无效或未认证 |
 | `2006` | `LoginRateLimited` | 登录失败次数过多，触发限流 |
 | `2007` | `TooManyDevices` | 设备数量超限 |
+| `3001` | `ContactAlreadyExists` | 联系人已存在 |
+| `3002` | `ContactNotFound` | 联系人不存在 |
+| `3003` | `ConversationNotFound` | 会话不存在 |
+| `3004` | `MessageNotFound` | 消息不存在 |
+| `3005` | `CannotSendToSelf` | 不能给自己发送消息 |
 | `9001` | `Timeout` | 连接空闲超时 |
 | `9002` | `InternalError` | 服务端内部错误 |
 
@@ -193,5 +214,86 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - `TestPacketCodec::parsesManyConsecutiveSmallPackets` 覆盖连续 1000 个小包解析。
 - `TestPacketCodec::waitsForSplitLargePacket` 覆盖单个大包拆成多次到达后的解析。
 - `TestEncryptionManager` 覆盖 PBKDF2 哈希、验证、token 生成。
-- `TestDatabaseManager` 覆盖迁移、用户注册、session 管理、登录审计、设备管理。
+- `TestDatabaseManager` 覆盖迁移、用户注册、session 管理、登录审计、设备管理、联系人、会话、消息。
 - 客户端登录响应按 `requestId` 匹配，不处理不属于当前登录请求的响应。
+
+### M3 新增接口
+
+#### 用户搜索
+
+```json
+// 请求
+{ "type": "search_users", "query": "admin" }
+// 响应 data
+{ "users": [{ "userId": 1, "username": "admin" }] }
+```
+
+#### 添加联系人
+
+```json
+// 请求
+{ "type": "add_contact", "userId": 2 }
+// 响应 data
+{ "contactUserId": 2 }
+```
+
+#### 获取联系人列表
+
+```json
+// 请求
+{ "type": "get_contacts" }
+// 响应 data
+{ "contacts": [{ "userId": 2, "username": "bob", "addedAt": "..." }] }
+```
+
+#### 获取会话列表
+
+```json
+// 请求
+{ "type": "get_conversations" }
+// 响应 data
+{ "conversations": [{ "conversationId": 1, "type": "private", "peerUserId": 2, "peerUsername": "bob", "lastMessage": "...", "unreadCount": 0 }] }
+```
+
+#### 发送消息
+
+```json
+// 请求
+{ "type": "send_message", "toUserId": 2, "content": "Hello!", "contentType": "text" }
+// 响应 data
+{ "messageId": 1, "conversationId": 1, "status": "sent" }
+```
+
+#### 新消息通知（服务端推送）
+
+```json
+{ "messageId": 1, "conversationId": 1, "senderId": 2, "content": "Hi!", "contentType": "text", "createdAt": "..." }
+```
+
+#### 消息确认
+
+```json
+// 请求
+{ "type": "ack_message", "messageId": 1, "status": "delivered" }
+// 响应 data
+{ "messageId": 1, "status": "delivered" }
+```
+
+#### 同步消息
+
+```json
+// 请求
+{ "type": "sync_messages", "conversationId": 1, "afterId": 0, "limit": 100 }
+// 响应 data
+{ "conversationId": 1, "messages": [...], "hasMore": false }
+```
+
+### 消息状态
+
+| 状态 | 含义 |
+| --- | --- |
+| `sending` | 客户端正在发送 |
+| `sent` | 服务端已接收并存储 |
+| `delivered` | 接收方已收到 |
+| `read` | 接收方已读 |
+| `failed` | 发送失败 |

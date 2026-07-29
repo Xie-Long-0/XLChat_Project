@@ -38,6 +38,8 @@ private slots:
     void onUserLoggedIn(qint64 userId, qint64 sessionId, const QString &deviceId);
     void onUserLoggedOut(qint64 userId, qint64 sessionId);
     void onHandlerFinished();
+    // M3: 消息路由
+    void onMessageForUser(qint64 targetUserId, const QByteArray &packetData);
 
 private:
     ConnectionServer *tcpServer;

@@ -21,10 +21,15 @@ public:
     qint64 authenticatedUserId() const { return m_authenticatedUserId; }
     qint64 currentSessionId() const { return m_currentSessionId; }
 
+    // M3: 供 Server 转发数据到客户端
+    void sendRawData(const QByteArray &data);
+
 signals:
     void finished();
     void userLoggedIn(qint64 userId, qint64 sessionId, const QString &deviceId);
     void userLoggedOut(qint64 userId, qint64 sessionId);
+    // M3: 消息路由信号
+    void messageForUser(qint64 targetUserId, const QByteArray &packetData);
 
 private slots:
     void onReadyRead();
@@ -41,6 +46,15 @@ private:
     void processLogoutRequest(const XYChat::Protocol::Packet &packet);
     void processTokenRenewRequest(const XYChat::Protocol::Packet &packet);
     void processForceLogoutRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+
+    // M3 处理器
+    void processSearchUsersRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processAddContactRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processGetContactsRequest(const XYChat::Protocol::Packet &packet);
+    void processGetConversationsRequest(const XYChat::Protocol::Packet &packet);
+    void processSendMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processAckMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processSyncMessagesRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
 
     // 工具方法
     void sendResponse(quint64 requestId,

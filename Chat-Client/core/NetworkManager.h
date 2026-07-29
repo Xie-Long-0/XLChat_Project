@@ -3,6 +3,8 @@
 #include <QObject>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QJsonObject>
+#include <QJsonArray>
 
 #include "protocol/PacketCodec.h"
 
@@ -29,6 +31,17 @@ public:
     void logout();
     void renewToken();
 
+    // M3: 用户搜索与联系人
+    void searchUsers(const QString &query);
+    void addContact(qint64 userId);
+    void getContacts();
+
+    // M3: 会话与消息
+    void getConversations();
+    void sendMessage(qint64 toUserId, const QString &content);
+    void ackMessage(qint64 messageId, const QString &status = "delivered");
+    void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
+
     // 状态查询
     ConnectionState state() const { return m_state; }
     QString sessionToken() const { return m_sessionToken; }
@@ -42,6 +55,15 @@ signals:
     void registerFailed(const QString &errorMessage);
     void logoutFinished();
     void connectionStateChanged(NetworkManager::ConnectionState state);
+    // M3 信号
+    void searchUsersResult(const QJsonArray &users);
+    void contactsResult(const QJsonArray &contacts);
+    void conversationsResult(const QJsonArray &conversations);
+    void messageSent(qint64 messageId, qint64 conversationId);
+    void messageSendFailed(const QString &error);
+    void newMessageReceived(const QJsonObject &message);
+    void messagesSynced(qint64 conversationId, const QJsonArray &messages, bool hasMore);
+    void messageAcked(qint64 messageId);
 
 private slots:
     void onConnected();
@@ -59,6 +81,15 @@ private:
     void handleRegisterResponse(const XYChat::Protocol::Packet &packet);
     void handleLogoutResponse(const XYChat::Protocol::Packet &packet);
     void handleTokenRenewResponse(const XYChat::Protocol::Packet &packet);
+    // M3 响应处理
+    void handleSearchUsersResponse(const XYChat::Protocol::Packet &packet);
+    void handleAddContactResponse(const XYChat::Protocol::Packet &packet);
+    void handleGetContactsResponse(const XYChat::Protocol::Packet &packet);
+    void handleGetConversationsResponse(const XYChat::Protocol::Packet &packet);
+    void handleSendMessageResponse(const XYChat::Protocol::Packet &packet);
+    void handleAckMessageResponse(const XYChat::Protocol::Packet &packet);
+    void handleSyncMessagesResponse(const XYChat::Protocol::Packet &packet);
+    void handleNewMessageNotification(const XYChat::Protocol::Packet &packet);
     void sendPacket(const XYChat::Protocol::Packet &packet);
     quint64 nextRequestId();
     void setState(ConnectionState state);
@@ -88,4 +119,13 @@ private:
     QString m_sessionToken;
     qint64 m_userId = 0;
     QString m_username;
+
+    // M3: 待处理请求 ID
+    quint64 m_pendingSearchRequestId = 0;
+    quint64 m_pendingAddContactRequestId = 0;
+    quint64 m_pendingGetContactsRequestId = 0;
+    quint64 m_pendingGetConversationsRequestId = 0;
+    quint64 m_pendingSendMessageRequestId = 0;
+    quint64 m_pendingAckMessageRequestId = 0;
+    quint64 m_pendingSyncMessagesRequestId = 0;
 };

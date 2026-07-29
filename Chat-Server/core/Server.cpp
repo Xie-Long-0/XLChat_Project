@@ -31,6 +31,8 @@ void Server::onSocketAccepted(qintptr socketDescriptor)
     connect(handler, &RequestHandler::userLoggedOut, this, &Server::onUserLoggedOut);
     connect(handler, &RequestHandler::finished, this, &Server::onHandlerFinished);
     connect(handler, &RequestHandler::finished, handler, &RequestHandler::deleteLater);
+    // M3: 消息路由
+    connect(handler, &RequestHandler::messageForUser, this, &Server::onMessageForUser);
 
     handler->start();
 }
@@ -114,4 +116,23 @@ QSet<qint64> Server::onlineUserIds() const
         result.insert(it.key());
     }
     return result;
+}
+
+// ── M3: 消息路由 ───────────────────────────────────────────────────────────
+void Server::onMessageForUser(qint64 targetUserId, const QByteArray &packetData)
+{
+    // 查找目标用户的所有在线 handler
+    auto it = m_onlineSessions.find(targetUserId);
+    if (it == m_onlineSessions.end()) {
+        // 用户不在线，消息已存储在数据库中，用户上线后可通过 sync 获取
+        return;
+    }
+
+    const QSet<qint64> sessionIds = it.value();
+    for (qint64 sessionId : sessionIds) {
+        auto handlerIt = m_sessionHandlers.find(sessionId);
+        if (handlerIt != m_sessionHandlers.end()) {
+            handlerIt.value()->sendRawData(packetData);
+        }
+    }
 }

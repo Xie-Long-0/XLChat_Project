@@ -1,6 +1,6 @@
 # XYChat 安全文档
 
-## M2 当前安全状态
+## M3 当前安全状态
 
 ### 密码存储
 
@@ -32,8 +32,9 @@
 
 - 数据库使用版本化迁移机制（`schema_version` 表），禁止隐式 schema 变更。
 - 每个线程使用独立数据库连接名，避免多线程竞争。
-- 表结构：`users`、`devices`、`sessions`、`login_audit`。
+- 表结构：`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`、`conversation_members`、`messages`。
 - Session 表存储 token 哈希而非明文。
+- 消息内容存储在 `messages` 表中，当前为明文存储（M5 将引入端到端加密）。
 
 ### 传输层
 
@@ -45,6 +46,7 @@
 - SHA-256 传输摘要仍存在重放风险，M4 将引入 TLS 和 nonce。
 - 普通 TCP 无法防止链路监听或中间人攻击。
 - Session token 当前通过 handler 内存状态验证，未在每次请求中传递。
+- 消息内容在服务端数据库为明文存储，M5 将引入端到端加密。
 
 ## 后续要求
 

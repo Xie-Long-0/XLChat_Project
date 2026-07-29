@@ -234,6 +234,31 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::TokenRenewResponse:
         handleTokenRenewResponse(packet);
         break;
+    // M3 响应分发
+    case MessageType::SearchUsersResponse:
+        handleSearchUsersResponse(packet);
+        break;
+    case MessageType::AddContactResponse:
+        handleAddContactResponse(packet);
+        break;
+    case MessageType::GetContactsResponse:
+        handleGetContactsResponse(packet);
+        break;
+    case MessageType::GetConversationsResponse:
+        handleGetConversationsResponse(packet);
+        break;
+    case MessageType::SendMessageResponse:
+        handleSendMessageResponse(packet);
+        break;
+    case MessageType::AckMessageResponse:
+        handleAckMessageResponse(packet);
+        break;
+    case MessageType::SyncMessagesResponse:
+        handleSyncMessagesResponse(packet);
+        break;
+    case MessageType::NewMessageNotification:
+        handleNewMessageNotification(packet);
+        break;
     case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
@@ -357,4 +382,225 @@ void NetworkManager::resetAuthState()
     m_username.clear();
     m_pendingUsername.clear();
     m_pendingEncryptedPassword.clear();
+}
+
+// ── M3: 用户搜索 ───────────────────────────────────────────────────────────
+void NetworkManager::searchUsers(const QString &query)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "search_users";
+    json["query"] = query;
+
+    Packet packet;
+    packet.messageType = MessageType::SearchUsersRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingSearchRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 添加联系人 ───────────────────────────────────────────────────────────
+void NetworkManager::addContact(qint64 userId)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "add_contact";
+    json["userId"] = userId;
+
+    Packet packet;
+    packet.messageType = MessageType::AddContactRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingAddContactRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 获取联系人列表 ─────────────────────────────────────────────────────
+void NetworkManager::getContacts()
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "get_contacts";
+
+    Packet packet;
+    packet.messageType = MessageType::GetContactsRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingGetContactsRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 获取会话列表 ─────────────────────────────────────────────────────
+void NetworkManager::getConversations()
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "get_conversations";
+
+    Packet packet;
+    packet.messageType = MessageType::GetConversationsRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingGetConversationsRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 发送消息 ───────────────────────────────────────────────────────────
+void NetworkManager::sendMessage(qint64 toUserId, const QString &content)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "send_message";
+    json["toUserId"] = toUserId;
+    json["content"] = content;
+    json["contentType"] = "text";
+
+    Packet packet;
+    packet.messageType = MessageType::SendMessageRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingSendMessageRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 确认消息 ───────────────────────────────────────────────────────────
+void NetworkManager::ackMessage(qint64 messageId, const QString &status)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "ack_message";
+    json["messageId"] = messageId;
+    json["status"] = status;
+
+    Packet packet;
+    packet.messageType = MessageType::AckMessageRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingAckMessageRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 同步消息 ───────────────────────────────────────────────────────────
+void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int limit)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "sync_messages";
+    json["conversationId"] = conversationId;
+    json["afterId"] = afterId;
+    json["limit"] = limit;
+
+    Packet packet;
+    packet.messageType = MessageType::SyncMessagesRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingSyncMessagesRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// ── M3: 响应处理 ───────────────────────────────────────────────────────────
+void NetworkManager::handleSearchUsersResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingSearchRequestId) return;
+    m_pendingSearchRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        emit searchUsersResult(response.value("data").toObject().value("users").toArray());
+    }
+}
+
+void NetworkManager::handleAddContactResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingAddContactRequestId) return;
+    m_pendingAddContactRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        emit messageSendFailed(response.value("message").toString("Failed to add contact"));
+    }
+}
+
+void NetworkManager::handleGetContactsResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingGetContactsRequestId) return;
+    m_pendingGetContactsRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        emit contactsResult(response.value("data").toObject().value("contacts").toArray());
+    }
+}
+
+void NetworkManager::handleGetConversationsResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingGetConversationsRequestId) return;
+    m_pendingGetConversationsRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        emit conversationsResult(response.value("data").toObject().value("conversations").toArray());
+    }
+}
+
+void NetworkManager::handleSendMessageResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingSendMessageRequestId) return;
+    m_pendingSendMessageRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt();
+    if (code == static_cast<int>(ErrorCode::Ok)) {
+        const QJsonObject data = response.value("data").toObject();
+        emit messageSent(data.value("messageId").toVariant().toLongLong(),
+                         data.value("conversationId").toVariant().toLongLong());
+    } else {
+        emit messageSendFailed(response.value("message").toString("Send failed"));
+    }
+}
+
+void NetworkManager::handleAckMessageResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingAckMessageRequestId) return;
+    m_pendingAckMessageRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        emit messageAcked(response.value("data").toObject().value("messageId").toVariant().toLongLong());
+    }
+}
+
+void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingSyncMessagesRequestId) return;
+    m_pendingSyncMessagesRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        const QJsonObject data = response.value("data").toObject();
+        emit messagesSynced(
+            data.value("conversationId").toVariant().toLongLong(),
+            data.value("messages").toArray(),
+            data.value("hasMore").toBool());
+    }
+}
+
+void NetworkManager::handleNewMessageNotification(const Packet &packet)
+{
+    const QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
+    emit newMessageReceived(msg);
+
+    // 自动发送已送达确认
+    const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
+    if (msgId > 0) {
+        ackMessage(msgId, "delivered");
+    }
 }
