@@ -1,11 +1,11 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import QWindowKit 1.0
+import QWindowKit
 
-import "qrc:/theme"
-import "qrc:/pages"
-import "qrc:/components"
+import "theme"
+import "pages"
+import "components"
 
 ApplicationWindow {
     id: root
@@ -36,6 +36,7 @@ ApplicationWindow {
         TitleBar {
             id: titleBar
             Layout.fillWidth: true
+            window: root
             windowAgent: windowAgent
             title: "XYChat"
         }

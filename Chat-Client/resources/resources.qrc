@@ -10,5 +10,11 @@
         <file>components/MessageBubble.qml</file>
         <file>theme/Theme.qml</file>
         <file>theme/qmldir</file>
+        <file>icons/close.svg</file>
+        <file>icons/minimize.svg</file>
+        <file>icons/fullscreen.svg</file>
+        <file>icons/maximize.svg</file>
+        <file>icons/restore.svg</file>
+        <file>components/QWKButton.qml</file>
     </qresource>
 </RCC>

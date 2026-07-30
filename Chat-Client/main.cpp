@@ -32,6 +32,7 @@ int main(int argc, char *argv[])
     QWK::registerTypes(&engine);
 
     // 加载 QML
+    engine.addImportPath(":/");
     engine.load(QUrl("qrc:/main.qml"));
 
     if (engine.rootObjects().isEmpty()) {

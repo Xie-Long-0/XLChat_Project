@@ -23,6 +23,8 @@ find_package(OpenSSL REQUIRED)
 # QWindowKit
 find_package(QWindowKit COMPONENTS Core Quick REQUIRED)
 
+qt_standard_project_setup(REQUIRES 6.8)
+
 # 资源文件
 set(RESOURCES
     resources/resources.qrc
@@ -40,7 +42,7 @@ set(HEADERS
 )
 
 # 生成可执行文件
-add_executable(Chat-Client ${SOURCES} ${HEADERS} ${RESOURCES})
+qt_add_executable(Chat-Client ${SOURCES} ${HEADERS} ${RESOURCES})
 
 # 包含目录
 target_include_directories(Chat-Client PRIVATE

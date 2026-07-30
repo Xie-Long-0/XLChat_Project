@@ -26,6 +26,8 @@ target_include_directories(XYChatCommon PUBLIC
 find_package(Qt6 COMPONENTS Core REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+qt_standard_project_setup(REQUIRES 6.8)
+
 target_link_libraries(XYChatCommon PUBLIC
     Qt6::Core
     OpenSSL::Crypto

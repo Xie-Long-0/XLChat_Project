@@ -19,6 +19,8 @@ endif()
 find_package(Qt6 COMPONENTS Core Network Sql REQUIRED)
 find_package(OpenSSL REQUIRED)
 
+qt_standard_project_setup(REQUIRES 6.8)
+
 # 源文件列表
 set(SOURCES
     main.cpp
@@ -35,7 +37,7 @@ set(HEADERS
 )
 
 # 生成可执行文件
-add_executable(Chat-Server ${SOURCES} ${HEADERS})
+qt_add_executable(Chat-Server ${SOURCES} ${HEADERS})
 
 # 包含目录
 target_include_directories(Chat-Server PRIVATE

@@ -44,9 +44,11 @@ QtObject {
 
     // 标题栏
     readonly property color titleBarBackground: "#FFFFFF"
-    readonly property color titleBarButtonHover: "#F0F0F0"
-    readonly property color titleBarButtonCloseHover: "#E81123"
-    readonly property color titleBarButtonCloseHoverIcon: "#FFFFFF"
+    readonly property int titleBarHeight: 36
+    readonly property color titleBarButtonBackground: "#F0F0F0"
+    readonly property color titleBarButtonHover: "#A0A0A0"
+    readonly property color titleBarButtonCloseBackground: "#E81123"
+    readonly property color titleBarButtonCloseHover: "#FA2233"
 
     // 输入框
     readonly property color inputBorderColor: "#DADCE0"
@@ -83,7 +85,6 @@ QtObject {
 
     // ── 尺寸 ──────────────────────────────────────────────────────
     readonly property int sidebarWidth: 320
-    readonly property int titleBarHeight: 36
     readonly property int avatarSize: 48
     readonly property int avatarSizeSmall: 36
     readonly property int conversationItemHeight: 72

@@ -2,8 +2,8 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-import "qrc:/theme"
-import "qrc:/components"
+import "../theme"
+import "../components"
 
 Rectangle {
     id: mainPage
