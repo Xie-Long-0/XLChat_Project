@@ -15,6 +15,7 @@ Item {
 
     property bool isRegisterMode: false
     property string errorMessage: ""
+    property string successMessage: ""
     property bool isLoading: false
 
     // 背景
@@ -170,6 +171,16 @@ Item {
                 horizontalAlignment: Text.AlignHCenter
             }
 
+            // 成功提示
+            Label {
+                Layout.fillWidth: true
+                text: successMessage
+                color: Theme.successColor
+                font.pixelSize: Theme.fontSizeSmall
+                visible: successMessage !== ""
+                horizontalAlignment: Text.AlignHCenter
+            }
+
             // 主按钮
             Button {
                 id: mainButton
@@ -200,6 +211,7 @@ Item {
 
                 onClicked: {
                     errorMessage = ""
+                    successMessage = ""
                     if (isRegisterMode) {
                         registerRequested(usernameField.text, passwordField.text,
                                           emailField.text, phoneField.text)
@@ -229,6 +241,7 @@ Item {
                 onClicked: {
                     isRegisterMode = !isRegisterMode
                     errorMessage = ""
+                    successMessage = ""
                 }
             }
         }
@@ -237,7 +250,15 @@ Item {
     // 公共方法
     function showError(msg) {
         errorMessage = msg
+        successMessage = ""
         isLoading = false
+    }
+
+    function showSuccess(msg) {
+        successMessage = msg
+        errorMessage = ""
+        isLoading = false
+        isRegisterMode = false
     }
 
     function onLoginSuccess() {

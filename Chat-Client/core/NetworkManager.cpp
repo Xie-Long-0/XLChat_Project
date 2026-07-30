@@ -27,11 +27,12 @@ NetworkManager::NetworkManager(QObject *parent) :
 }
 
 // ── 登录 ─────────────────────────────────────────────────────────────────────
-void NetworkManager::login(const QString &username, const QString &encryptedPassword)
+void NetworkManager::login(const QString &username, const QString &password)
 {
     m_pendingUsername = username;
-    m_pendingEncryptedPassword = encryptedPassword;
+    m_pendingPassword = password;
     m_loginQueued = true;
+    m_registerQueued = false;
     m_reconnectEnabled = true;
 
     if (m_state == ConnectionState::Connected || m_state == ConnectionState::Authenticated) {
@@ -53,6 +54,8 @@ void NetworkManager::registerAccount(const QString &username, const QString &pas
     m_pendingEmail = email;
     m_pendingPhone = phone;
     m_registerQueued = true;
+    m_loginQueued = false;
+    m_reconnectEnabled = false;
 
     if (m_state == ConnectionState::Connected || m_state == ConnectionState::Authenticated) {
         sendRegisterRequest();
@@ -153,7 +156,15 @@ void NetworkManager::onSocketError(QAbstractSocket::SocketError socketError)
     Q_UNUSED(socketError);
 
     if (m_state == ConnectionState::Connecting || m_state == ConnectionState::LoggingIn) {
-        emit loginFailed(m_tcpSocket->errorString());
+        const QString err = m_tcpSocket->errorString();
+        if (m_registerQueued) {
+            m_registerQueued = false;
+            emit registerFailed(err);
+        } else {
+            m_loginQueued = false;
+            emit loginFailed(err);
+        }
+        setState(ConnectionState::Disconnected);
     }
 }
 
@@ -185,7 +196,7 @@ void NetworkManager::sendLoginRequest()
     QJsonObject json;
     json["type"] = "login";
     json["username"] = m_pendingUsername;
-    json["password"] = m_pendingEncryptedPassword;
+    json["password"] = m_pendingPassword;
     json["clientVersion"] = "0.2.0";
     json["platform"] = QSysInfo::productType();
     json["deviceId"] = QString::fromLatin1(QSysInfo::machineUniqueId().toHex());
@@ -383,7 +394,7 @@ void NetworkManager::resetAuthState()
     m_userId = 0;
     m_username.clear();
     m_pendingUsername.clear();
-    m_pendingEncryptedPassword.clear();
+    m_pendingPassword.clear();
 }
 
 // ── M3: 用户搜索 ───────────────────────────────────────────────────────────

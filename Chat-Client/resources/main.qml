@@ -71,7 +71,7 @@ ApplicationWindow {
 
         onLoginRequested: function(username, password) {
             loginPage.setLoading(true)
-            networkManager.login(username, networkManager.encryptPassword(password))
+            networkManager.login(username, password)
         }
 
         onRegisterRequested: function(username, password, email, phone) {
@@ -130,9 +130,7 @@ ApplicationWindow {
         }
 
         function onRegisterSuccessful() {
-            loginPage.showError("")
-            loginPage.isRegisterMode = false
-            loginPage.setLoading(false)
+            loginPage.showSuccess("注册成功，请登录")
         }
 
         function onRegisterFailed(errorMessage) {

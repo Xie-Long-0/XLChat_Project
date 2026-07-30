@@ -26,22 +26,22 @@ public:
     explicit NetworkManager(QObject *parent = nullptr);
 
     // 认证操作
-    void login(const QString &username, const QString &encryptedPassword);
-    void registerAccount(const QString &username, const QString &password,
-                         const QString &email = {}, const QString &phone = {});
-    void logout();
-    void renewToken();
+    Q_INVOKABLE void login(const QString &username, const QString &password);
+    Q_INVOKABLE void registerAccount(const QString &username, const QString &password,
+                                     const QString &email = {}, const QString &phone = {});
+    Q_INVOKABLE void logout();
+    Q_INVOKABLE void renewToken();
 
     // M3: 用户搜索与联系人
-    void searchUsers(const QString &query);
-    void addContact(qint64 userId);
-    void getContacts();
+    Q_INVOKABLE void searchUsers(const QString &query);
+    Q_INVOKABLE void addContact(qint64 userId);
+    Q_INVOKABLE void getContacts();
 
     // M3: 会话与消息
-    void getConversations();
-    void sendMessage(qint64 toUserId, const QString &content);
-    void ackMessage(qint64 messageId, const QString &status = "delivered");
-    void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
+    Q_INVOKABLE void getConversations();
+    Q_INVOKABLE void sendMessage(qint64 toUserId, const QString &content);
+    Q_INVOKABLE void ackMessage(qint64 messageId, const QString &status = "delivered");
+    Q_INVOKABLE void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
 
     // 状态查询
     ConnectionState state() const { return m_state; }
@@ -112,7 +112,7 @@ private:
     quint64 m_pendingLoginRequestId = 0;
     quint64 m_pendingRegisterRequestId = 0;
     QString m_pendingUsername;
-    QString m_pendingEncryptedPassword;
+    QString m_pendingPassword;
     QString m_pendingRegisterPassword;
     QString m_pendingEmail;
     QString m_pendingPhone;

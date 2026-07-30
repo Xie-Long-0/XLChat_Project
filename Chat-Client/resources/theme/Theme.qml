@@ -61,6 +61,7 @@ QtObject {
     readonly property color loginButtonHover: "#229ED9"
     readonly property color loginButtonPressed: "#1B8FC4"
     readonly property color loginErrorColor: "#E53935"
+    readonly property color successColor: "#4CAF50"
 
     // ── 字体 ──────────────────────────────────────────────────────
     readonly property string fontFamily: "Segoe UI"

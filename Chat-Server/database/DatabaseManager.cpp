@@ -6,8 +6,11 @@
 #include <QVariant>
 #include <QDebug>
 #include <QDateTime>
+#include <QStandardPaths>
+#include <QDir>
 
-// ── 构造 / 析构 ──────────────────────────────────────────────────────────────
+static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/resources/db";
+
 DatabaseManager::DatabaseManager(const QString &connectionName)
     : m_connectionName(connectionName)
 {
@@ -18,7 +21,6 @@ DatabaseManager::~DatabaseManager()
     closeDatabase();
 }
 
-// ── 初始化 ───────────────────────────────────────────────────────────────────
 bool DatabaseManager::initialize()
 {
     if (!openDatabase()) {
@@ -33,8 +35,13 @@ bool DatabaseManager::openDatabase()
         return true;
     }
 
+    if (auto dir = QDir(DatabasePath); !dir.exists())
+    {
+        dir.mkpath(".");
+    }
+
     QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", m_connectionName);
-    db.setDatabaseName("resources/db/chatapp.db");
+    db.setDatabaseName(DatabasePath + "/chatapp.db");
 
     if (!db.open()) {
         qCritical() << "[DB] Failed to open:" << db.lastError().text();
