@@ -68,11 +68,16 @@ target_include_directories(Chat-Client SYSTEM PUBLIC
     ${Qt6Quick_INCLUDE_DIRS}
 )
 
-# 构建后将 QWindowKit 运行时 DLL 拷贝到输出目录
+# 构建后将运行时 DLL 拷贝到输出目录
 # $<TARGET_FILE:...> 会自动根据当前构建配置选择对应的 DLL（Debug 为 QWKCored/QWKQuickd，Release 为 QWKCore/QWKQuick）
 add_custom_command(TARGET Chat-Client POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:QWindowKit::Core>
         $<TARGET_FILE:QWindowKit::Quick>
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libcrypto-3-x64.dll
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libssl-3-x64.dll
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/legacy.dll
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
         $<TARGET_FILE_DIR:Chat-Client>
+    COMMENT "Copying runtime DLLs to output"
 )

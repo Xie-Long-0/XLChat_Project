@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QTcpServer>
+#include <QSslConfiguration>
 #include <QHash>
 #include <QSet>
 
@@ -29,6 +30,9 @@ public:
     explicit Server(QObject *parent = nullptr);
     bool start(quint16 port);
 
+    // M5: TLS 配置
+    bool initTls(const QString &certDir);
+
     // 在线用户管理
     int onlineUserCount() const;
     QSet<qint64> onlineUserIds() const;
@@ -43,6 +47,10 @@ private slots:
 
 private:
     ConnectionServer *tcpServer;
+
+    // M5: TLS 配置
+    QSslConfiguration m_sslConfig;
+    bool m_tlsEnabled = false;
 
     // userId -> set of sessionIds
     QHash<qint64, QSet<qint64>> m_onlineSessions;

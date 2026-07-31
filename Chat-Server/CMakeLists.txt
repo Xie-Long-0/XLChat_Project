@@ -60,3 +60,21 @@ target_include_directories(Chat-Server SYSTEM PUBLIC
     ${Qt6Network_INCLUDE_DIRS}
     ${Qt6Sql_INCLUDE_DIRS}
 )
+
+# 构建后将 OpenSSL 运行时 DLL 拷贝到输出目录
+add_custom_command(TARGET Chat-Server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libcrypto-3-x64.dll
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libssl-3-x64.dll
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/legacy.dll
+        ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
+        $<TARGET_FILE_DIR:Chat-Server>
+    COMMENT "Copying OpenSSL runtime DLLs to output"
+)
+
+# M5: 构建后拷贝证书生成脚本到输出目录
+add_custom_command(TARGET Chat-Server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        $<TARGET_FILE_DIR:Chat-Server>/certs
+    COMMENT "Creating certs directory for Chat-Server"
+)

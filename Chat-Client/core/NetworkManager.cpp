@@ -3,14 +3,23 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSysInfo>
+#include <QDateTime>
+#include <QUuid>
+#include <QSslConfiguration>
+#include <QFile>
+#include <QDir>
+#include <QCoreApplication>
+#include <QStandardPaths>
 
 #include "EncryptionManager.h"
+#include "TlsHelper.h"
+#include "SecureMemory.h"
 
 using namespace XYChat::Protocol;
 
 NetworkManager::NetworkManager(QObject *parent) :
     QObject(parent),
-    m_tcpSocket(new QTcpSocket(this)),
+    m_sslSocket(new QSslSocket(this)),
     m_heartbeatTimer(new QTimer(this)),
     m_reconnectTimer(new QTimer(this))
 {
@@ -18,12 +27,16 @@ NetworkManager::NetworkManager(QObject *parent) :
     m_reconnectTimer->setInterval(3000);
     m_reconnectTimer->setSingleShot(true);
 
-    connect(m_tcpSocket, &QTcpSocket::connected, this, &NetworkManager::onConnected);
-    connect(m_tcpSocket, &QTcpSocket::disconnected, this, &NetworkManager::onDisconnected);
-    connect(m_tcpSocket, &QTcpSocket::readyRead, this, &NetworkManager::onReadyRead);
-    connect(m_tcpSocket, &QTcpSocket::errorOccurred, this, &NetworkManager::onSocketError);
+    connect(m_sslSocket, &QSslSocket::connected, this, &NetworkManager::onConnected);
+    connect(m_sslSocket, &QSslSocket::disconnected, this, &NetworkManager::onDisconnected);
+    connect(m_sslSocket, &QSslSocket::readyRead, this, &NetworkManager::onReadyRead);
+    connect(m_sslSocket, &QSslSocket::errorOccurred, this, &NetworkManager::onSocketError);
+    connect(m_sslSocket, &QSslSocket::sslErrors, this, &NetworkManager::onSslErrors);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &NetworkManager::sendHeartbeat);
     connect(m_reconnectTimer, &QTimer::timeout, this, &NetworkManager::connectToServer);
+
+    // M5: 初始化 TLS
+    initTls();
 }
 
 // ── 登录 ─────────────────────────────────────────────────────────────────────
@@ -76,6 +89,7 @@ void NetworkManager::logout()
 
     QJsonObject json;
     json["type"] = "logout";
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::LogoutRequest;
@@ -94,6 +108,7 @@ void NetworkManager::renewToken()
     QJsonObject json;
     json["type"] = "token_renew";
     json["token"] = m_sessionToken;
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::TokenRenewRequest;
@@ -132,7 +147,7 @@ void NetworkManager::onDisconnected()
 
 void NetworkManager::onReadyRead()
 {
-    m_codec.appendData(m_tcpSocket->readAll());
+    m_codec.appendData(m_sslSocket->readAll());
 
     while (true) {
         Packet packet;
@@ -143,7 +158,7 @@ void NetworkManager::onReadyRead()
         }
         if (status == PacketCodec::DecodeStatus::InvalidData) {
             emit loginFailed(errorMessage);
-            m_tcpSocket->disconnectFromHost();
+            m_sslSocket->disconnectFromHost();
             return;
         }
 
@@ -156,7 +171,7 @@ void NetworkManager::onSocketError(QAbstractSocket::SocketError socketError)
     Q_UNUSED(socketError);
 
     if (m_state == ConnectionState::Connecting || m_state == ConnectionState::LoggingIn) {
-        const QString err = m_tcpSocket->errorString();
+        const QString err = m_sslSocket->errorString();
         if (m_registerQueued) {
             m_registerQueued = false;
             emit registerFailed(err);
@@ -166,6 +181,29 @@ void NetworkManager::onSocketError(QAbstractSocket::SocketError socketError)
         }
         setState(ConnectionState::Disconnected);
     }
+}
+
+// ── M5: SSL 错误处理 ───────────────────────────────────────────────────────
+void NetworkManager::onSslErrors(const QList<QSslError> &errors)
+{
+    // 证书错误时明确拒绝连接
+    QStringList errorStrings;
+    for (const auto &err : errors) {
+        errorStrings << err.errorString();
+    }
+    const QString errMsg = "TLS certificate error: " + errorStrings.join("; ");
+    qWarning() << "[NetMgr]" << errMsg;
+
+    if (m_registerQueued) {
+        m_registerQueued = false;
+        emit registerFailed(errMsg);
+    } else if (m_loginQueued) {
+        m_loginQueued = false;
+        emit loginFailed(errMsg);
+    }
+
+    m_sslSocket->disconnectFromHost();
+    setState(ConnectionState::Disconnected);
 }
 
 void NetworkManager::sendHeartbeat()
@@ -187,7 +225,54 @@ void NetworkManager::connectToServer()
     }
 
     setState(ConnectionState::Connecting);
-    m_tcpSocket->connectToHost("127.0.0.1", 12345);
+    if (m_tlsEnabled) {
+        m_sslSocket->connectToHostEncrypted("127.0.0.1", 12345);
+    } else {
+        m_sslSocket->connectToHost("127.0.0.1", 12345);
+    }
+}
+
+// ── M5: TLS 初始化 ─────────────────────────────────────────────────────────
+void NetworkManager::initTls()
+{
+    using namespace XYChat::Security;
+
+    // 查找 CA 证书：优先可执行文件同级 certs 目录，其次 AppData
+    QString caCertPath;
+    const QStringList searchDirs = {
+        QCoreApplication::applicationDirPath() + "/certs",
+        QCoreApplication::applicationDirPath() + "/../certs",
+        TlsHelper::defaultCertDir()
+    };
+
+    for (const auto &dir : searchDirs) {
+        const QString candidate = dir + "/ca.crt";
+        if (QFile::exists(candidate)) {
+            caCertPath = candidate;
+            break;
+        }
+    }
+
+    if (caCertPath.isEmpty()) {
+        qWarning() << "[NetMgr] CA certificate not found, TLS disabled";
+        return;
+    }
+
+    TlsHelper::TlsConfig config = TlsHelper::loadClientConfig(caCertPath);
+    if (!config.valid) {
+        qWarning() << "[NetMgr] Failed to load CA certificate, TLS disabled";
+        return;
+    }
+
+    // 配置 SSL：添加 CA 证书用于验证服务端
+    QSslConfiguration sslConfig = QSslConfiguration::defaultConfiguration();
+    sslConfig.addCaCertificate(config.caCertificate);
+    sslConfig.setProtocol(QSsl::TlsV1_2OrLater);
+    sslConfig.setPeerVerifyMode(QSslSocket::VerifyPeer);
+    m_sslSocket->setSslConfiguration(sslConfig);
+    m_tlsEnabled = true;
+
+    qInfo() << "[NetMgr] TLS enabled, CA:" << caCertPath;
 }
 
 // ── 发送登录请求 ─────────────────────────────────────────────────────────────
@@ -200,6 +285,7 @@ void NetworkManager::sendLoginRequest()
     json["clientVersion"] = "0.2.0";
     json["platform"] = QSysInfo::productType();
     json["deviceId"] = QString::fromLatin1(QSysInfo::machineUniqueId().toHex());
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::LoginRequest;
@@ -220,6 +306,7 @@ void NetworkManager::sendRegisterRequest()
     json["password"] = m_pendingRegisterPassword;
     json["email"] = m_pendingEmail;
     json["phone"] = m_pendingPhone;
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::RegisterRequest;
@@ -372,7 +459,7 @@ void NetworkManager::sendPacket(const Packet &packet)
         return;
     }
 
-    m_tcpSocket->write(encoded);
+    m_sslSocket->write(encoded);
 }
 
 quint64 NetworkManager::nextRequestId()
@@ -392,12 +479,21 @@ void NetworkManager::setState(ConnectionState state)
 
 void NetworkManager::resetAuthState()
 {
-    m_sessionToken.clear();
+    // M5: 安全清除敏感数据
+    XYChat::Security::SecureMemory::wipe(m_sessionToken);
+    XYChat::Security::SecureMemory::wipe(m_pendingPassword);
+    XYChat::Security::SecureMemory::wipe(m_pendingRegisterPassword);
     m_userId = 0;
     m_username.clear();
     m_pendingUsername.clear();
-    m_pendingPassword.clear();
     emit sessionChanged();
+}
+
+// ── M5: 重放保护 ───────────────────────────────────────────────────────────
+void NetworkManager::addReplayProtection(QJsonObject &json)
+{
+    json["timestamp"] = QDateTime::currentSecsSinceEpoch();
+    json["nonce"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
 // ── M3: 用户搜索 ───────────────────────────────────────────────────────────
@@ -408,6 +504,7 @@ void NetworkManager::searchUsers(const QString &query)
     QJsonObject json;
     json["type"] = "search_users";
     json["query"] = query;
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::SearchUsersRequest;
@@ -425,6 +522,7 @@ void NetworkManager::addContact(qint64 userId)
     QJsonObject json;
     json["type"] = "add_contact";
     json["userId"] = userId;
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::AddContactRequest;
@@ -441,6 +539,7 @@ void NetworkManager::getContacts()
 
     QJsonObject json;
     json["type"] = "get_contacts";
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::GetContactsRequest;
@@ -457,6 +556,7 @@ void NetworkManager::getConversations()
 
     QJsonObject json;
     json["type"] = "get_conversations";
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::GetConversationsRequest;
@@ -476,6 +576,7 @@ void NetworkManager::sendMessage(qint64 toUserId, const QString &content)
     json["toUserId"] = toUserId;
     json["content"] = content;
     json["contentType"] = "text";
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::SendMessageRequest;
@@ -494,6 +595,7 @@ void NetworkManager::ackMessage(qint64 messageId, const QString &status)
     json["type"] = "ack_message";
     json["messageId"] = messageId;
     json["status"] = status;
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::AckMessageRequest;
@@ -513,6 +615,7 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     json["conversationId"] = conversationId;
     json["afterId"] = afterId;
     json["limit"] = limit;
+    addReplayProtection(json);
 
     Packet packet;
     packet.messageType = MessageType::SyncMessagesRequest;

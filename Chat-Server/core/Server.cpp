@@ -1,5 +1,6 @@
 #include "Server.h"
 #include "RequestHandler.h"
+#include "TlsHelper.h"
 
 void ConnectionServer::incomingConnection(qintptr socketDescriptor)
 {
@@ -13,10 +14,37 @@ Server::Server(QObject *parent)
     connect(tcpServer, &ConnectionServer::socketAccepted, this, &Server::onSocketAccepted);
 }
 
+bool Server::initTls(const QString &certDir)
+{
+    using namespace XYChat::Security;
+
+    const QString certPath = certDir + "/server.crt";
+    const QString keyPath = certDir + "/server.key";
+    const QString caCertPath = certDir + "/ca.crt";
+
+    TlsHelper::TlsConfig tlsConfig = TlsHelper::loadServerConfig(
+        certPath, keyPath, caCertPath, true /* allowGenerate */);
+
+    if (!tlsConfig.valid) {
+        qCritical() << "[Server] TLS initialization failed";
+        return false;
+    }
+
+    m_sslConfig = QSslConfiguration::defaultConfiguration();
+    m_sslConfig.setLocalCertificate(tlsConfig.certificate);
+    m_sslConfig.setPrivateKey(tlsConfig.privateKey);
+    m_sslConfig.setProtocol(QSsl::TlsV1_2OrLater);
+    m_tlsEnabled = true;
+
+    qInfo() << "[Server] TLS enabled (TLS 1.2+)";
+    return true;
+}
+
 bool Server::start(quint16 port)
 {
     if (tcpServer->listen(QHostAddress::Any, port)) {
-        qDebug() << "[Server] Listening on port" << port;
+        qDebug() << "[Server] Listening on port" << port
+                 << (m_tlsEnabled ? "(TLS)" : "(plain TCP)");
         return true;
     }
     qDebug() << "[Server] Failed to listen on port" << port << tcpServer->errorString();
@@ -26,6 +54,11 @@ bool Server::start(quint16 port)
 void Server::onSocketAccepted(qintptr socketDescriptor)
 {
     RequestHandler *handler = new RequestHandler(socketDescriptor, this);
+
+    // M5: 传递 TLS 配置
+    if (m_tlsEnabled) {
+        handler->setSslConfiguration(m_sslConfig);
+    }
 
     connect(handler, &RequestHandler::userLoggedIn, this, &Server::onUserLoggedIn);
     connect(handler, &RequestHandler::userLoggedOut, this, &Server::onUserLoggedOut);

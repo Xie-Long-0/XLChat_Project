@@ -1,7 +1,8 @@
 #pragma once
 
 #include <QObject>
-#include <QTcpSocket>
+#include <QSslSocket>
+#include <QSslError>
 #include <QTimer>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -82,10 +83,12 @@ private slots:
     void onDisconnected();
     void onReadyRead();
     void onSocketError(QAbstractSocket::SocketError socketError);
+    void onSslErrors(const QList<QSslError> &errors);
     void sendHeartbeat();
 
 private:
     void connectToServer();
+    void initTls();
     void sendLoginRequest();
     void sendRegisterRequest();
     void handlePacket(const XYChat::Protocol::Packet &packet);
@@ -106,14 +109,17 @@ private:
     quint64 nextRequestId();
     void setState(ConnectionState state);
     void resetAuthState();
+    // M5: 重放保护辅助
+    void addReplayProtection(QJsonObject &json);
 
 private:
-    QTcpSocket *m_tcpSocket;
+    QSslSocket *m_sslSocket;
     QTimer *m_heartbeatTimer;
     QTimer *m_reconnectTimer;
     XYChat::Protocol::PacketCodec m_codec;
     ConnectionState m_state = ConnectionState::Disconnected;
     quint64 m_nextRequestId = 1;
+    bool m_tlsEnabled = false;
 
     // 登录/注册待处理
     quint64 m_pendingLoginRequestId = 0;

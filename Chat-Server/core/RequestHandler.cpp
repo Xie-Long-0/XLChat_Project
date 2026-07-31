@@ -1,6 +1,8 @@
 #include "RequestHandler.h"
 #include "database/DatabaseManager.h"
 #include "EncryptionManager.h"
+#include "LogSanitizer.h"
+#include "SecureMemory.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -11,6 +13,7 @@
 #include <QMetaObject>
 
 using namespace XYChat::Protocol;
+using XYChat::Security::LogSanitizer;
 
 // ── 构造 / 析构 ──────────────────────────────────────────────────────────────
 RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
@@ -37,6 +40,13 @@ void RequestHandler::sendRawData(const QByteArray &data)
     }, Qt::QueuedConnection);
 }
 
+// ── M5: 设置 TLS 配置 ───────────────────────────────────────────────────────
+void RequestHandler::setSslConfiguration(const QSslConfiguration &config)
+{
+    m_sslConfig = config;
+    m_tlsEnabled = true;
+}
+
 // ── 线程入口 ─────────────────────────────────────────────────────────────────
 void RequestHandler::run()
 {
@@ -49,7 +59,7 @@ void RequestHandler::run()
         return;
     }
 
-    m_socket = new QTcpSocket();
+    m_socket = new QSslSocket();
     if (!m_socket->setSocketDescriptor(m_socketDescriptor)) {
         qDebug() << "[Handler] Failed to set socket descriptor";
         delete m_socket;
@@ -58,12 +68,27 @@ void RequestHandler::run()
         return;
     }
 
+    // M5: 如果启用 TLS，启动服务端加密
+    if (m_tlsEnabled) {
+        m_socket->setSslConfiguration(m_sslConfig);
+        connect(m_socket, &QSslSocket::encrypted, m_socket, [this]() {
+            qDebug() << "[Handler] TLS handshake completed";
+        });
+        connect(m_socket, &QSslSocket::sslErrors, m_socket, [this](const QList<QSslError> &errors) {
+            for (const auto &err : errors) {
+                qWarning() << "[Handler] SSL error:" << err.errorString();
+            }
+            m_socket->disconnectFromHost();
+        });
+        m_socket->startServerEncryption();
+    }
+
     m_idleTimer = new QTimer();
     m_idleTimer->setInterval(90000);
     m_idleTimer->setSingleShot(true);
 
-    connect(m_socket, &QTcpSocket::readyRead, m_socket, [this]() { onReadyRead(); });
-    connect(m_socket, &QTcpSocket::disconnected, m_socket, [this]() { quit(); });
+    connect(m_socket, &QSslSocket::readyRead, m_socket, [this]() { onReadyRead(); });
+    connect(m_socket, &QSslSocket::disconnected, m_socket, [this]() { quit(); });
     connect(m_idleTimer, &QTimer::timeout, m_idleTimer, [this]() { onIdleTimeout(); });
     m_idleTimer->start();
 
@@ -131,6 +156,15 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     const QJsonObject json = jsonDoc.object();
     const QString type = json.value("type").toString();
+
+    // M5: 重放保护检查（对所有业务请求）
+    if (packet.messageType != MessageType::Ping && packet.messageType != MessageType::Pong) {
+        if (!checkReplayProtection(json)) {
+            sendResponse(packet.requestId, MessageType::Error, ErrorCode::InvalidRequest,
+                         "Replay protection check failed");
+            return;
+        }
+    }
 
     // 不需要认证的请求
     if (packet.messageType == MessageType::RegisterRequest || type == "register") {
@@ -210,7 +244,7 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
     const QString ipAddr = m_socket->peerAddress().toString();
 
     qDebug() << "[Handler] Login request" << packet.requestId << username
-             << "from" << ipAddr;
+             << "from" << LogSanitizer::maskIpAddress(ipAddr);
 
     if (username.isEmpty() || clientPassword.isEmpty()) {
         sendResponse(packet.requestId, MessageType::LoginResponse, ErrorCode::InvalidRequest,
@@ -244,7 +278,7 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
         sendResponse(packet.requestId, MessageType::LoginResponse,
                      ErrorCode::AuthenticationFailed,
                      "Invalid username or password");
-        qDebug() << "[Handler] Login failed for" << username << "wrong password";
+        qDebug() << "[Handler] Login failed for" << username << "(wrong password)";
         return;
     }
 
@@ -722,4 +756,36 @@ void RequestHandler::sendPacket(const Packet &packet)
 
     m_socket->write(encoded);
     m_socket->flush();
+}
+
+// ── M5: 重放保护 ─────────────────────────────────────────────────────────────
+bool RequestHandler::checkReplayProtection(const QJsonObject &request)
+{
+    // 检查时间戳
+    const qint64 timestamp = request.value("timestamp").toVariant().toLongLong();
+    if (timestamp > 0) {
+        const qint64 now = QDateTime::currentSecsSinceEpoch();
+        const qint64 diff = qAbs(now - timestamp);
+        if (diff > ReplayTimestampToleranceSecs) {
+            qDebug() << "[Handler] Replay protection: timestamp too old/new, diff=" << diff << "s";
+            return false;
+        }
+    }
+
+    // 检查 nonce
+    const QString nonce = request.value("nonce").toString();
+    if (!nonce.isEmpty()) {
+        if (m_seenNonces.contains(nonce)) {
+            qDebug() << "[Handler] Replay protection: duplicate nonce detected";
+            return false;
+        }
+        m_seenNonces.insert(nonce);
+
+        // 限制 nonce 缓存大小，避免内存无限增长
+        if (m_seenNonces.size() > 10000) {
+            m_seenNonces.clear();
+        }
+    }
+
+    return true;
 }

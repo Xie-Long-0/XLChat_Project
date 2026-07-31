@@ -1,6 +1,15 @@
-find_package(Qt6 COMPONENTS Test Sql REQUIRED)
+find_package(Qt6 COMPONENTS Test Sql Network REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 set(CMAKE_AUTOMOC ON)
+
+# 公共 OpenSSL 运行时 DLL 列表
+set(OPENSSL_RUNTIME_DLLS
+    ${CMAKE_SOURCE_DIR}/3rdparty/bin/libcrypto-3-x64.dll
+    ${CMAKE_SOURCE_DIR}/3rdparty/bin/libssl-3-x64.dll
+    ${CMAKE_SOURCE_DIR}/3rdparty/bin/legacy.dll
+    ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
+)
 
 # ── TestEncryptionManager ────────────────────────────────────────────────────
 add_executable(TestEncryptionManager
@@ -13,6 +22,12 @@ target_link_libraries(TestEncryptionManager PRIVATE
 )
 
 add_test(NAME TestEncryptionManager COMMAND TestEncryptionManager)
+
+add_custom_command(TARGET TestEncryptionManager POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENSSL_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:TestEncryptionManager>
+)
 
 # ── TestPacketCodec ──────────────────────────────────────────────────────────
 add_executable(TestPacketCodec
@@ -45,3 +60,28 @@ target_link_libraries(TestDatabaseManager PRIVATE
 )
 
 add_test(NAME TestDatabaseManager COMMAND TestDatabaseManager)
+
+add_custom_command(TARGET TestDatabaseManager POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENSSL_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:TestDatabaseManager>
+)
+
+# ── TestSecurity (M5) ────────────────────────────────────────────────────────────
+add_executable(TestSecurity
+    unit/TestSecurity.cpp
+)
+
+target_link_libraries(TestSecurity PRIVATE
+    Qt6::Test
+    Qt6::Network
+    XYChatCommon
+)
+
+add_test(NAME TestSecurity COMMAND TestSecurity)
+
+add_custom_command(TARGET TestSecurity POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENSSL_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:TestSecurity>
+)

@@ -16,20 +16,29 @@ add_library(XYChatCommon STATIC
     CommonModule/protocol/Packet.h
     CommonModule/protocol/PacketCodec.cpp
     CommonModule/protocol/PacketCodec.h
+    CommonModule/security/TlsHelper.cpp
+    CommonModule/security/TlsHelper.h
+    CommonModule/security/SecureMemory.cpp
+    CommonModule/security/SecureMemory.h
+    CommonModule/security/LogSanitizer.cpp
+    CommonModule/security/LogSanitizer.h
 )
 
 target_include_directories(XYChatCommon PUBLIC
     ${PROJECT_SOURCE_DIR}/CommonModule
     ${PROJECT_SOURCE_DIR}/CommonModule/encryption
+    ${PROJECT_SOURCE_DIR}/CommonModule/security
 )
 
-find_package(Qt6 COMPONENTS Core REQUIRED)
+find_package(Qt6 COMPONENTS Core Network REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
 target_link_libraries(XYChatCommon PUBLIC
     Qt6::Core
+    Qt6::Network
+    OpenSSL::SSL
     OpenSSL::Crypto
 )
 

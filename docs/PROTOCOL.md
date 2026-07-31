@@ -1,8 +1,8 @@
 # XYChat 协议文档
 
-## M3 当前协议状态
+## M5 当前协议状态
 
-M3 在 M2 基础上，新增了一对一文本聊天功能：用户搜索、联系人管理、会话管理、消息发送/同步/确认。服务端支持在线消息实时转发，离线消息通过同步接口补收。
+M5 在 M3 基础上，新增了传输层加密（TLS 1.2+）和重放保护机制。所有客户端-服务端通信均通过 TLS 加密传输，所有业务请求携带时间戳和 nonce 防止重放攻击。
 
 ### 固定包头
 
@@ -204,10 +204,39 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 
 ## 已知限制
 
-- 当前传输仍是明文 TCP，尚未启用 M4 的 TLS。
-- 当前心跳只做连接保活和空闲断开，尚未包含重放保护、nonce 或会话绑定。
 - 当前协议兼容策略只支持版本 `1`，后续版本升级需要扩展协商或降级策略。
 - Session token 当前通过 handler 内存状态验证，尚未在每次请求中传递 token。
+- 重放保护的 nonce 缓存为每连接级别，服务端重启后清空。
+
+## M5 新增：传输层加密
+
+- 服务端使用 `QSslSocket` + TLS 1.2+ 监听。
+- 客户端使用 `connectToHostEncrypted()` 建立加密连接。
+- 开发环境自动生成自签名 CA + 服务端证书（SAN: localhost, 127.0.0.1）。
+- 证书错误时客户端拒绝连接并提示用户。
+
+## M5 新增：重放保护
+
+所有业务请求（登录、注册、登出、消息等）的 JSON payload 中新增以下字段：
+
+```json
+{
+  "type": "login",
+  "timestamp": 1753977600,
+  "nonce": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  ...
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `timestamp` | int64 | Unix 秒级时间戳，服务端拒绝偏差超过 300 秒的请求 |
+| `nonce` | string | UUID v4 随机字符串，服务端拒绝重复 nonce |
+
+服务端重放保护策略：
+- 时间戳容差：±300 秒（5 分钟）
+- nonce 缓存：每连接维护，上限 10000 条
+- Ping/Pong 心跳不要求重放保护字段
 
 ## 测试覆盖
 
@@ -215,6 +244,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - `TestPacketCodec::waitsForSplitLargePacket` 覆盖单个大包拆成多次到达后的解析。
 - `TestEncryptionManager` 覆盖 PBKDF2 哈希、验证、token 生成。
 - `TestDatabaseManager` 覆盖迁移、用户注册、session 管理、登录审计、设备管理、联系人、会话、消息。
+- `TestSecurity` 覆盖日志脱敏、安全内存清零、TLS 证书生成与加载。
 - 客户端登录响应按 `requestId` 匹配，不处理不属于当前登录请求的响应。
 
 ### M3 新增接口
