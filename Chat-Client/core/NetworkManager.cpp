@@ -303,6 +303,7 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         m_username = data.value("username").toString();
         m_loginQueued = false;
         setState(ConnectionState::Authenticated);
+        emit sessionChanged();
         emit loginSuccessful();
         return;
     }
@@ -357,6 +358,7 @@ void NetworkManager::handleTokenRenewResponse(const Packet &packet)
     if (code == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
         m_sessionToken = data.value("token").toString();
+        emit sessionChanged();
         qDebug() << "[NetMgr] Token renewed";
     }
 }
@@ -395,6 +397,7 @@ void NetworkManager::resetAuthState()
     m_username.clear();
     m_pendingUsername.clear();
     m_pendingPassword.clear();
+    emit sessionChanged();
 }
 
 // ── M3: 用户搜索 ───────────────────────────────────────────────────────────

@@ -44,7 +44,7 @@ QtObject {
 
     // 标题栏
     readonly property color titleBarBackground: "#FFFFFF"
-    readonly property int titleBarHeight: 36
+    readonly property int titleBarHeight: 32
     readonly property color titleBarButtonBackground: "#F0F0F0"
     readonly property color titleBarButtonHover: "#A0A0A0"
     readonly property color titleBarButtonCloseBackground: "#E81123"

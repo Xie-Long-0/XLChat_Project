@@ -16,7 +16,6 @@ Rectangle {
     signal sendMessageRequested(int peerUserId, string content)
     signal logoutRequested()
 
-    property var networkManager: null
     property int myUserId: 0
     property string myUsername: ""
 
@@ -27,7 +26,6 @@ Rectangle {
 
     RowLayout {
         anchors.fill: parent
-        anchors.topMargin: Theme.titleBarHeight
         spacing: 0
 
         // 左侧面板

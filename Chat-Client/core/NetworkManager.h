@@ -12,6 +12,11 @@
 class NetworkManager : public QObject
 {
     Q_OBJECT
+    // 暴露给 QML 的只读属性（带 NOTIFY 以支持响应式绑定）
+    Q_PROPERTY(ConnectionState state READ state NOTIFY connectionStateChanged)
+    Q_PROPERTY(QString sessionToken READ sessionToken NOTIFY sessionChanged)
+    Q_PROPERTY(qint64 userId READ userId NOTIFY sessionChanged)
+    Q_PROPERTY(QString username READ username NOTIFY sessionChanged)
 
 public:
     enum class ConnectionState
@@ -22,6 +27,7 @@ public:
         LoggingIn,
         Authenticated
     };
+    Q_ENUM(ConnectionState)
 
     explicit NetworkManager(QObject *parent = nullptr);
 
@@ -60,6 +66,7 @@ signals:
     void registerFailed(const QString &errorMessage);
     void logoutFinished();
     void connectionStateChanged(NetworkManager::ConnectionState state);
+    void sessionChanged();
     // M3 信号
     void searchUsersResult(const QJsonArray &users);
     void contactsResult(const QJsonArray &contacts);

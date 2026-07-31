@@ -2,6 +2,7 @@
     <qresource prefix="/">
         <file>main.qml</file>
         <file>pages/LoginPage.qml</file>
+        <file>pages/MainWindow.qml</file>
         <file>pages/MainPage.qml</file>
         <file>components/TitleBar.qml</file>
         <file>components/ConversationList.qml</file>
