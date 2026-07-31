@@ -9,7 +9,7 @@
 #include <QStandardPaths>
 #include <QDir>
 
-static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/data/db";
+static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "XYChat-Server/data/db";
 
 DatabaseManager::DatabaseManager(const QString &connectionName)
     : m_connectionName(connectionName)
