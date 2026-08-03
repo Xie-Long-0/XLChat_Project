@@ -8,11 +8,11 @@ XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含�
 | --- | --- |
 | CMake | 3.21 或更高版本 |
 | C++ 编译器 | 支持 C++20；Windows 推荐 MSVC 2022，Linux/macOS 可使用 GCC/Clang |
-| Qt | Qt 6.8.3（至少需要 Widgets、Network、Sql、Test 模块） |
+| Qt | Qt 6.8.3 |
 | OpenSSL | OpenSSL 3.x |
 | 目标平台 | 当前以 Windows + MSVC 2022 为主要开发平台；CMake 工程保留跨平台构建能力 |
 
-> 仓库的 `3rdparty/` 目录包含 Windows 开发用的 OpenSSL 相关文件。其他平台建议通过系统包管理器安装 OpenSSL，并通过 `CMAKE_PREFIX_PATH` 指向 Qt 安装目录。
+> 仓库的 `3rdparty/` 目录包含 Windows 开发用的 OpenSSL 相关文件。其他平台建议通过系统包管理器安装 OpenSSL，并通过 `CMAKE_PREFIX_PATH` 指向安装目录。
 
 ## 目录说明
 
@@ -50,19 +50,14 @@ cmake --build build -j
 先启动服务端：
 
 ```bash
-./build/Chat-Server/Chat-Server
+./out/build/release/Chat-Server
 ```
 
 再启动客户端：
 
 ```bash
-./build/Chat-Client/Chat-Client
+./out/build/release/Chat-Client
 ```
-
-当前服务端会尝试使用相对路径 `resources/db/chatapp.db` 创建 SQLite 数据库，并初始化演示账号：
-
-- 用户名：`admin`
-- 密码：`passwd`
 
 ## 测试
 
