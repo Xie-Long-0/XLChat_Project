@@ -1,13 +1,12 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(Chat-Client VERSION 1.0 LANGUAGES CXX)
+project(Chat-Client VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
 
 # 向编译器添加编译选项
 if (MSVC)
@@ -17,7 +16,7 @@ else()
 endif()
 
 # QML 模块：Qml + Quick
-find_package(Qt6 COMPONENTS Widgets Quick QuickControls2 Network REQUIRED)
+find_package(Qt6 COMPONENTS Quick QuickControls2 Network REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 # QWindowKit
@@ -51,7 +50,6 @@ target_include_directories(Chat-Client PRIVATE
 
 # 链接 Qt、OpenSSL、QWindowKit 和公共库
 target_link_libraries(Chat-Client PUBLIC
-    Qt6::Widgets
     Qt6::Quick
     Qt6::QuickControls2
     Qt6::Network
@@ -63,7 +61,6 @@ target_link_libraries(Chat-Client PUBLIC
 
 # 添加Widgets, Network 模块的头文件路径
 target_include_directories(Chat-Client SYSTEM PUBLIC
-    ${Qt6Widgets_INCLUDE_DIRS}
     ${Qt6Network_INCLUDE_DIRS}
     ${Qt6Quick_INCLUDE_DIRS}
 )

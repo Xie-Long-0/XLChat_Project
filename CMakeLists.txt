@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(XYChat-Project VERSION 0.1.0 LANGUAGES CXX)
+project(XYChat-Project VERSION 0.1.1 LANGUAGES CXX)
 
 option(XYCHAT_BUILD_TESTS "Build XYChat unit tests" ON)
 
