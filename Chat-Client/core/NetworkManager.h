@@ -47,7 +47,8 @@ public:
 
     // M3: 会话与消息
     Q_INVOKABLE void getConversations();
-    Q_INVOKABLE void sendMessage(qint64 toUserId, const QString &content);
+    // M4.5: 返回客户端幂等键 clientMessageId，供 QML 跟踪乐观消息状态
+    Q_INVOKABLE QString sendMessage(qint64 toUserId, const QString &content);
     Q_INVOKABLE void ackMessage(qint64 messageId, const QString &status = "delivered");
     Q_INVOKABLE void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
     // M5.5: 账号级增量同步
@@ -75,7 +76,7 @@ signals:
     void searchUsersResult(const QJsonArray &users);
     void contactsResult(const QJsonArray &contacts);
     void conversationsResult(const QJsonArray &conversations);
-    void messageSent(qint64 messageId, qint64 conversationId);
+    void messageSent(qint64 messageId, qint64 conversationId, const QString &clientMessageId);
     void messageSendFailed(const QString &error);
     void newMessageReceived(const QJsonObject &message);
     void messagesSynced(qint64 conversationId, const QJsonArray &messages, bool hasMore);

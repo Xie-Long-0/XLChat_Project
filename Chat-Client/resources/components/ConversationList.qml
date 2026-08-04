@@ -12,6 +12,9 @@ Rectangle {
     signal searchClicked()
     signal refreshClicked()
 
+    // M4.5: 当前选中会话索引（修复原先错误的判断条件）
+    property int selectedIndex: -1
+
     // 顶部工具栏
     Rectangle {
         id: toolbar
@@ -136,9 +139,10 @@ Rectangle {
             id: delegateItem
             width: listView.width
             height: Theme.conversationItemHeight
-            color: delegateMouse.pressed ? Theme.pressedColor
-                 : (delegateMouse.containsMouse ? Theme.hoverColor
-                    : (index === conversationList.parent ? Theme.primaryLightColor : "transparent"))
+            property bool isSelected: index === conversationList.selectedIndex
+            color: isSelected ? Theme.selectedConversationColor
+                 : (delegateMouse.pressed ? Theme.pressedColor
+                    : (delegateMouse.containsMouse ? Theme.hoverColor : "transparent"))
 
             Behavior on color { ColorAnimation { duration: Theme.animationFast } }
 
@@ -167,14 +171,16 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Theme.spacingSmall
 
-                // 头像
+                // 头像（按用户 ID 取色，同一用户颜色稳定；避免 delegate 移除时
+                // index 为 undefined 导致 "Unable to assign [undefined] to QColor"）
                 Rectangle {
                     width: Theme.avatarSize
                     height: Theme.avatarSize
                     radius: Theme.avatarSize / 2
                     color: {
                         var colors = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7", "#DDA0DD", "#98D8C8"]
-                        return colors[index % colors.length]
+                        var id = model.peerUserId || 0
+                        return colors[id % colors.length]
                     }
 
                     Label {
@@ -202,14 +208,16 @@ Rectangle {
                             text: model.peerUsername
                             font.pixelSize: Theme.fontSizeMedium
                             font.weight: Font.DemiBold
-                            color: Theme.textPrimary
+                            color: delegateItem.isSelected ? Theme.selectedConversationTextColor : Theme.textPrimary
                             elide: Text.ElideRight
                         }
 
                         Label {
                             text: model.lastMessageTime || ""
                             font.pixelSize: Theme.fontSizeSmall - 1
-                            color: model.unreadCount > 0 ? Theme.primaryColor : Theme.textTertiary
+                            color: delegateItem.isSelected
+                                 ? Theme.selectedConversationSecondaryColor
+                                 : (model.unreadCount > 0 ? Theme.primaryColor : Theme.textTertiary)
                         }
                     }
 
@@ -222,7 +230,7 @@ Rectangle {
                             Layout.fillWidth: true
                             text: model.lastMessage || ""
                             font.pixelSize: Theme.fontSizeSmall
-                            color: Theme.textSecondary
+                            color: delegateItem.isSelected ? Theme.selectedConversationSecondaryColor : Theme.textSecondary
                             elide: Text.ElideRight
                             maximumLineCount: 1
                         }
@@ -261,6 +269,20 @@ Rectangle {
     }
 
     // 公共方法
+    // M4.5: 会话时间格式化（服务端字段为 ISO 时间 lastMessageAt）
+    function formatConvTime(isoStr) {
+        if (!isoStr || isoStr.length === 0) return ""
+        var d = new Date(isoStr)
+        if (isNaN(d.getTime())) return ""
+        var now = new Date()
+        if (d.toDateString() === now.toDateString()) {
+            var hh = d.getHours()
+            var mm = d.getMinutes()
+            return (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm
+        }
+        return d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate()
+    }
+
     function updateConversations(conversations) {
         convModel.clear()
         for (var i = 0; i < conversations.length; i++) {
@@ -270,7 +292,7 @@ Rectangle {
                 peerUserId: conv.peerUserId || 0,
                 peerUsername: conv.peerUsername || "",
                 lastMessage: conv.lastMessage || "",
-                lastMessageTime: conv.lastMessageTime || "",
+                lastMessageTime: formatConvTime(conv.lastMessageAt || ""),
                 unreadCount: conv.unreadCount || 0
             })
         }
@@ -281,5 +303,46 @@ Rectangle {
             return convModel.get(index)
         }
         return null
+    }
+
+    // M4.5: 按会话 ID 选中（会话刷新后恢复高亮）
+    function setSelectedByConversationId(conversationId) {
+        selectedIndex = -1
+        for (var i = 0; i < convModel.count; i++) {
+            if (convModel.get(i).conversationId === conversationId) {
+                selectedIndex = i
+                return
+            }
+        }
+    }
+
+    // M4.5: 按对方用户 ID 查找既有会话（搜索发起对话时复用）
+    function findConversationByPeerId(peerUserId) {
+        for (var i = 0; i < convModel.count; i++) {
+            if (convModel.get(i).peerUserId === peerUserId) {
+                return convModel.get(i)
+            }
+        }
+        return null
+    }
+
+    // M4.5: 新消息到达时本地更新预览与未读角标（当前打开的会话不计未读）
+    function updateForNewMessage(conversationId, preview, timeStr, incrementUnread) {
+        for (var i = 0; i < convModel.count; i++) {
+            if (convModel.get(i).conversationId === conversationId) {
+                convModel.setProperty(i, "lastMessage", preview)
+                convModel.setProperty(i, "lastMessageTime", timeStr)
+                if (incrementUnread) {
+                    convModel.setProperty(i, "unreadCount", convModel.get(i).unreadCount + 1)
+                }
+                return
+            }
+        }
+    }
+
+    // M4.5: 清空选中与列表（登出时）
+    function reset() {
+        convModel.clear()
+        selectedIndex = -1
     }
 }

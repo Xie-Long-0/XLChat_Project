@@ -99,6 +99,9 @@ Item {
                 Layout.preferredHeight: Theme.inputHeight
                 placeholderText: "用户名"
                 font.pixelSize: Theme.fontSizeMedium
+                color: Theme.textPrimary
+                placeholderTextColor: Theme.inputPlaceholderColor
+                selectByMouse: true
                 background: Rectangle {
                     radius: Theme.radiusSmall
                     color: Theme.inputBackground
@@ -115,6 +118,9 @@ Item {
                 placeholderText: "密码"
                 echoMode: TextField.Password
                 font.pixelSize: Theme.fontSizeMedium
+                color: Theme.textPrimary
+                placeholderTextColor: Theme.inputPlaceholderColor
+                selectByMouse: true
                 background: Rectangle {
                     radius: Theme.radiusSmall
                     color: Theme.inputBackground
@@ -138,6 +144,9 @@ Item {
                     Layout.preferredHeight: Theme.inputHeight
                     placeholderText: "邮箱（可选）"
                     font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.textPrimary
+                    placeholderTextColor: Theme.inputPlaceholderColor
+                    selectByMouse: true
                     background: Rectangle {
                         radius: Theme.radiusSmall
                         color: Theme.inputBackground
@@ -152,6 +161,9 @@ Item {
                     Layout.preferredHeight: Theme.inputHeight
                     placeholderText: "手机号（可选）"
                     font.pixelSize: Theme.fontSizeMedium
+                    color: Theme.textPrimary
+                    placeholderTextColor: Theme.inputPlaceholderColor
+                    selectByMouse: true
                     background: Rectangle {
                         radius: Theme.radiusSmall
                         color: Theme.inputBackground

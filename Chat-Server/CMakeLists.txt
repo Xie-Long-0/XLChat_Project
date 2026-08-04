@@ -56,9 +56,8 @@ target_link_libraries(Chat-Server PUBLIC
     XYChatCommon
 )
 
-# 添加Widgets, Network 模块的头文件路径
+# 添加 Network/Sql 模块的头文件路径
 target_include_directories(Chat-Server SYSTEM PUBLIC
-    ${Qt6Widgets_INCLUDE_DIRS}
     ${Qt6Network_INCLUDE_DIRS}
     ${Qt6Sql_INCLUDE_DIRS}
 )

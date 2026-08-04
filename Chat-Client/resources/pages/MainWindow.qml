@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
 import QWindowKit
@@ -6,8 +7,10 @@ import QWindowKit
 import "../theme"
 import "../components"
 
-ApplicationWindow {
+Window {
     id: mainWindow
+    // M4.5 修复：作为独立根窗口由 main.cpp 加载，供其按 objectName 查找并注入登录窗口
+    objectName: "mainWindow"
     width: 1000
     height: 650
     minimumWidth: 700
@@ -74,10 +77,13 @@ ApplicationWindow {
             }
 
             onSendMessageRequested: function(peerUserId, content) {
-                networkManager.sendMessage(peerUserId, content)
+                // M4.5: 发送后以返回的幂等键跟踪乐观消息气泡
+                var clientMessageId = networkManager.sendMessage(peerUserId, content)
+                mainPage.trackOutgoingMessage(clientMessageId, content)
             }
 
             onLogoutRequested: {
+                mainPage.resetUi()
                 mainWindow.logoutRequested()
             }
         }
@@ -103,6 +109,8 @@ ApplicationWindow {
                     msgs.push(messages[i])
                 }
                 mainPage.updateMessages(msgs)
+                // M4.5: 打开会话时对最后一条对方消息发送已读回执
+                sendReadAck()
             }
         }
 
@@ -110,20 +118,33 @@ ApplicationWindow {
             var convId = message.conversationId
             if (convId === mainPage.currentConversationId) {
                 mainPage.appendMessage(message)
+                // M4.5: 会话打开期间收到新消息，发送已读回执
+                var msgId = message.messageId || 0
+                if (msgId > 0) {
+                    networkManager.ackMessage(msgId, "read")
+                }
+            } else {
+                // M4.5: 未打开的会话本地更新预览与未读角标
+                mainPage.updateConversationPreview(message)
             }
-            // 刷新会话列表
+            // 以服务端为准刷新会话列表（含未读计数）
             networkManager.getConversations()
         }
 
-        function onMessageSent(messageId, conversationId) {
-            if (conversationId === mainPage.currentConversationId) {
-                networkManager.syncMessages(conversationId, 0)
-            }
+        function onMessageSent(messageId, conversationId, clientMessageId) {
+            // M4.5: 首条消息成功后绑定服务端会话 ID，并确认乐观消息
+            mainPage.bindNewConversation(conversationId)
+            mainPage.confirmMessage(clientMessageId, messageId)
             networkManager.getConversations()
         }
 
         function onMessageSendFailed(error) {
             console.log("Send failed:", error)
+        }
+
+        // M4.5: 消息状态推送（已送达/已读）实时更新气泡状态
+        function onMessageStatusChanged(messageId, status) {
+            mainPage.updateMessageStatus(messageId, status)
         }
 
         function onSearchUsersResult(users) {
@@ -132,6 +153,14 @@ ApplicationWindow {
                 userList.push(users[i])
             }
             mainPage.showSearchResults(userList)
+        }
+    }
+
+    // M4.5: 对当前会话中最后一条对方消息发送已读回执
+    function sendReadAck() {
+        var lastIncomingId = mainPage.lastIncomingMessageId()
+        if (lastIncomingId > 0) {
+            networkManager.ackMessage(lastIncomingId, "read")
         }
     }
 

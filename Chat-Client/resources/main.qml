@@ -9,6 +9,7 @@ import "components"
 
 ApplicationWindow {
     id: root
+    objectName: "loginRoot"
     width: 480
     height: 640
     minimumWidth: 420
@@ -17,9 +18,20 @@ ApplicationWindow {
     color: "transparent"
     title: "XYChat"
 
+    // M4.5 修复：主窗口改为独立根窗口（由 main.cpp 加载后注入），
+    // 不再是登录窗口的声明式子窗口，避免被当作 transient 子窗口而不在任务栏显示
+    property var mainWindow
+
     // QWindowKit WindowAgent
     WindowAgent {
         id: windowAgent
+    }
+
+    // M4.5: 主题模式绑定（Theme 为全局单例，绑定一次即可作用于所有窗口）
+    Binding {
+        target: Theme
+        property: "darkMode"
+        value: themeSettings.darkMode
     }
 
     Component.onCompleted: {
@@ -27,8 +39,16 @@ ApplicationWindow {
         root.visible = true
     }
 
-    // 关闭登录窗口即退出应用
-    onClosing: Qt.quit()
+    // 关闭登录窗口：若主窗口已打开则仅隐藏登录窗口，否则退出应用
+    // （主窗口作为独立根窗口由 main.cpp 加载，关闭主窗口才退出）
+    onClosing: {
+        if (mainWindow !== undefined && mainWindow !== null && mainWindow.visible) {
+            root.hide()
+            close.accepted = false
+        } else {
+            Qt.quit()
+        }
+    }
 
     // 主布局
     ColumnLayout {
@@ -65,29 +85,35 @@ ApplicationWindow {
         }
     }
 
-    // ── 主窗口（登录成功后显示） ────────────────────────────────
-    MainWindow {
-        id: mainWindow
+    // 主窗口登出信号（mainWindow 为 main.cpp 注入的独立根窗口；
+    // 初始为 undefined，延迟到注入后再创建 Connections，避免初始化期 QML 报错）
+    Loader {
+        active: mainWindow !== undefined && mainWindow !== null
+        sourceComponent: Connections {
+            target: mainWindow
 
-        onLogoutRequested: {
-            networkManager.logout()
-            mainWindow.hide()
-            loginPage.setLoading(false)
-            root.show()
+            function onLogoutRequested() {
+                networkManager.logout()
+                mainWindow.hide()
+                loginPage.setLoading(false)
+                root.show()
+            }
         }
     }
 
-    // ── NetworkManager 认证信号连接 ──────────────────────────────
+    // NetworkManager 认证信号连接
     Connections {
         target: networkManager
 
         function onLoginSuccessful() {
             loginPage.onLoginSuccess()
-            mainWindow.myUserId = networkManager.userId
-            mainWindow.myUsername = networkManager.username
-            root.hide()
-            mainWindow.show()
-            mainWindow.loadConversations()
+            if (mainWindow !== undefined && mainWindow !== null) {
+                mainWindow.myUserId = networkManager.userId
+                mainWindow.myUsername = networkManager.username
+                root.hide()
+                mainWindow.show()
+                mainWindow.loadConversations()
+            }
         }
 
         function onLoginFailed(errorMessage) {

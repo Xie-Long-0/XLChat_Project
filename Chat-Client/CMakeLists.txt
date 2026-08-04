@@ -38,6 +38,7 @@ set(SOURCES
 # C++ 头文件
 set(HEADERS
     core/NetworkManager.h
+    core/ThemeSettings.h
 )
 
 # 生成可执行文件
@@ -59,7 +60,7 @@ target_link_libraries(Chat-Client PUBLIC
     XYChatCommon
 )
 
-# 添加Widgets, Network 模块的头文件路径
+# 添加 Network/Quick 模块的头文件路径
 target_include_directories(Chat-Client SYSTEM PUBLIC
     ${Qt6Network_INCLUDE_DIRS}
     ${Qt6Quick_INCLUDE_DIRS}

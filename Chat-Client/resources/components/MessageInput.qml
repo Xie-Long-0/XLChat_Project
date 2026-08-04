@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-import "qrc:/theme"
+import "../theme"
 
 Rectangle {
     id: messageInput
@@ -34,7 +34,7 @@ Rectangle {
             id: inputField
             Layout.fillWidth: true
             Layout.preferredHeight: Theme.inputHeight
-            placeholderText: "输入消息..."
+            placeholderText: qsTr("输入消息...")
             font.pixelSize: Theme.fontSizeMedium
             wrapMode: TextEdit.Wrap
             leftPadding: Theme.spacingMedium

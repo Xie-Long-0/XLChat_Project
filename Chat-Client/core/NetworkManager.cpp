@@ -605,18 +605,21 @@ void NetworkManager::getConversations()
 }
 
 // ── M3: 发送消息 ───────────────────────────────────────────────────────────
-void NetworkManager::sendMessage(qint64 toUserId, const QString &content)
+QString NetworkManager::sendMessage(qint64 toUserId, const QString &content)
 {
+    // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
+    // M4.5: 返回幂等键供 QML 跟踪乐观消息气泡状态
+    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
     if (m_state != ConnectionState::Authenticated) {
         // M5.5: 未认证时进入 outbox，登录成功后自动重发
-        m_outbox.append({QUuid::createUuid().toString(QUuid::WithoutBraces), toUserId, content});
-        return;
+        m_outbox.append({clientMessageId, toUserId, content});
+        return clientMessageId;
     }
 
-    // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
-    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_outbox.append({clientMessageId, toUserId, content});
     flushOutbox();
+    return clientMessageId;
 }
 
 // M5.5: 将 outbox 中未确认的消息逐条发送（同一 clientMessageId 只保留一份）
@@ -759,7 +762,8 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
             }
         }
         emit messageSent(data.value("messageId").toVariant().toLongLong(),
-                         data.value("conversationId").toVariant().toLongLong());
+                         data.value("conversationId").toVariant().toLongLong(),
+                         ackedId);
     } else {
         emit messageSendFailed(response.value("message").toString("Send failed"));
     }

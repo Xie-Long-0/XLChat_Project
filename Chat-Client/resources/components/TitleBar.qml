@@ -23,7 +23,7 @@ Rectangle {
             verticalCenter: parent.verticalCenter
             left: parent.left
             leftMargin: 10
-            right: captionButtonRow.left
+            right: toolButtonRow.left
             rightMargin: 10
         }
         verticalAlignment: Text.AlignVCenter
@@ -32,6 +32,40 @@ Rectangle {
         font.pixelSize: Theme.fontSizeMedium
         font.weight: Font.DemiBold
         color: Theme.textPrimary
+    }
+
+    // 工具按钮栏
+    Row {
+        id: toolButtonRow
+        anchors.right: captionButtonRow.left
+        anchors.top: parent.top
+        height: parent.height
+        spacing: 2
+        rightPadding: 6
+
+        // M4.5: 亮/暗主题切换按钮
+        Button {
+            id: themeToggleBtn
+            height: parent.height
+            width: height * 1.5
+            text: Theme.darkMode ? "\u2600\uFE0F" : "🌑"
+            font.pixelSize: 16
+            padding: 0
+            background: Rectangle {
+                color: {
+                    if (!minimizeBtn.enabled)
+                        return "gray";
+                    if (themeToggleBtn.hovered)
+                        return Theme.titleBarButtonHover
+                    return "transparent"
+                }
+            }
+
+            onClicked: themeSettings.darkMode = !themeSettings.darkMode
+
+            // 注册为命中测试可见，避免被 QWindowKit 当作标题栏拖拽区
+            Component.onCompleted: windowAgent.setHitTestVisible(themeToggleBtn)
+        }
     }
 
     // 窗口控制按钮

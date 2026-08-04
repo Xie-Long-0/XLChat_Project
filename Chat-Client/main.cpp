@@ -6,6 +6,7 @@
 #include <QWKQuick/qwkquickglobal.h>
 
 #include "core/NetworkManager.h"
+#include "core/ThemeSettings.h"
 
 int main(int argc, char *argv[])
 {
@@ -22,11 +23,15 @@ int main(int argc, char *argv[])
     // 创建 NetworkManager
     NetworkManager networkManager;
 
+    // M4.5: 主题偏好持久化
+    ThemeSettings themeSettings;
+
     // 创建 QML 引擎
     QQmlApplicationEngine engine;
 
     // 暴露 C++ 对象到 QML
     engine.rootContext()->setContextProperty("networkManager", &networkManager);
+    engine.rootContext()->setContextProperty("themeSettings", &themeSettings);
 
     // 注册 QWindowKit QML 类型
     QWK::registerTypes(&engine);
@@ -36,6 +41,27 @@ int main(int argc, char *argv[])
     engine.load(QUrl("qrc:/main.qml"));
 
     if (engine.rootObjects().isEmpty()) {
+        return -1;
+    }
+
+    // M4.5 修复：主窗口作为独立根窗口加载（不再声明在 main.qml 内），
+    // 避免被当作登录窗口的 transient 子窗口而不在系统任务栏显示
+    engine.load(QUrl("qrc:/pages/MainWindow.qml"));
+
+    QObject *loginRoot = nullptr;
+    QObject *mainWindow = nullptr;
+    for (QObject *obj : engine.rootObjects()) {
+        if (obj->objectName() == QLatin1String("mainWindow")) {
+            mainWindow = obj;
+        } else if (obj->objectName() == QLatin1String("loginRoot")) {
+            loginRoot = obj;
+        }
+    }
+    if (mainWindow != nullptr && loginRoot != nullptr) {
+        loginRoot->setProperty("mainWindow", QVariant::fromValue(mainWindow));
+    } else {
+        qCritical() << "[Main] Failed to locate login/main root windows"
+                    << "loginRoot:" << loginRoot << "mainWindow:" << mainWindow;
         return -1;
     }
 

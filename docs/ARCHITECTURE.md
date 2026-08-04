@@ -1,6 +1,6 @@
 # XYChat 架构概览
 
-> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新（各项 P0/P1 修复均已落地并通过测试）。
+> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新。
 
 ## 当前组件（M5.5 完成后）
 
@@ -12,7 +12,7 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
-- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成），通过 `QWindowKit::Quick` 实现无边框窗口；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS）与 `models/User`。
+- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
 - `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息请求，管理 session 路由与在线状态，访问 SQLite。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；
@@ -61,6 +61,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 消息表（messages），服务端递增 ID；送达/已读权威记录在 `message_receipts`（按接收者/设备维度，M5.5），`messages.status` 为回执聚合出的展示值。
 - 服务端实现 send_message（`clientMessageId` 幂等去重）/ ack_message（先授权再写回执）/ sync_messages（先授权再查询）/ sync_events（账号级游标同步）。
 - 客户端实现会话列表、聊天窗口、消息气泡、内存 outbox（未确认消息登录成功后自动重发，幂等键保证不重复）。
+- M4.5 客户端体验完善：搜索用户直接发起对话（虚拟会话 + 首条消息 ACK 后绑定 conversationId）、发送乐观显示（发送中→已发送→已送达→已读实时流转）、显式已读回执、日期分隔线、会话选中高亮与未读角标本地实时更新、侧边栏用户信息栏与登出入口、亮/暗主题切换（`Theme.qml` darkMode 驱动 + `ThemeSettings` QSettings 持久化）。
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
 - **限制**：客户端仍无本地持久化缓存（outbox 仅在内存），重启后历史依赖重新拉取；消息撤回/删除未实现。
@@ -89,24 +90,32 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 
 messages 表幂等唯一约束：`UNIQUE(sender_id, sender_device_id, client_message_id)`（部分索引，仅对非空幂等键生效，存量旧数据不受影响）。
 
-## 客户端架构（M4 已落地）
+## 客户端架构（M4 已落地，M4.5 完善）
 
 ```text
 Chat-Client
   ├── QML UI 层（resources/）
-  │     ├── main.qml（入口）
-  │     ├── pages/（LoginPage.qml, MainPage.qml, MainWindow.qml）
+  │     ├── main.qml（登录窗口根，objectName=loginRoot）
+  │     ├── pages/（LoginPage.qml, MainPage.qml, MainWindow.qml 主窗口根，objectName=mainWindow）
   │     ├── components/（TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton）
-  │     └── theme/（Theme.qml 单例，qmldir 注册）
+  │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册）
   ├── C++ 后端层
-  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象）
+  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪）
+  │     ├── core/ThemeSettings（QSettings 主题持久化，注册为 QML 上下文对象）
   │     └── models/User
-  └── QWindowKit（QWK::Quick WindowAgent：无边框、拖拽、Snap Layout）
+  └── QWindowKit（QWK::Quick WindowAgent：无边框、拖拽、Snap Layout；标题栏自定义按钮需 setHitTestVisible 注册）
 ```
+
+窗口组织（M4.5 调整）：
+
+- `main.cpp` 依次 `engine.load()` 加载 `main.qml`（登录窗口）与 `pages/MainWindow.qml`（主窗口），两者均为独立根窗口；主窗口按 `objectName` 查找后注入登录窗口的 `mainWindow` 属性。**不能把主窗口声明在登录窗口 QML 内部**，否则会成为 transient 子窗口而不在 Windows 任务栏显示。
+- 窗口流转：启动→登录窗口→（登录成功）隐藏登录窗口并显示主窗口；登出→隐藏主窗口并重新显示登录窗口；关闭主窗口退出应用，主窗口打开时关闭登录窗口仅隐藏。
+- 主题：`Theme.qml` 全部颜色属性为 `darkMode ? 暗色 : 亮色` 绑定表达式，`main.qml` 用 `Binding` 将 `Theme.darkMode` 绑定到 `themeSettings.darkMode`，标题栏切换按钮写入 `themeSettings` 即全局生效并持久化。
+- 聊天区：`ChatView` 消息列表直接用 `ListView`（不用外层 ScrollView 包 `height: contentHeight` 的 ListView，否则不可滚动）；自动贴底由 50ms Timer + `stayAtBottom`/`programmaticScroll` 标志实现（用户手动上滚时暂停贴底）。
 
 与旧文档的差异说明：
 
-- 主题目前**只有 `Theme.qml` 单一主题**，`DarkTheme.qml`/`LightTheme.qml` 与亮暗切换尚未实现（ROADMAP M4 验收项"支持亮色/暗色主题切换"实际未达成，已在路线图更正）。
+- 亮/暗主题切换已于 M4.5 实现（单一 `Theme.qml` 双配色 + `ThemeSettings` 持久化），不再需要独立的 `DarkTheme.qml`/`LightTheme.qml`。
 
 - 客户端尚无独立模型层/本地数据库；`models/User` 仅是登录态数据对象。
 
@@ -139,6 +148,6 @@ Chat-Client
 ## 下一步演进
 
 1. **M5.5 已完成**：上表 P0 全部修复、P1 大部分修复，并通过自动化测试（授权拒绝、nonce 拒绝/过期、幂等去重、回执聚合、读游标单调等）。
-2. **M4 遗留清理**：亮/暗主题切换、移除 CMake 中 `Qt6::Widgets` 链接。
+2. **M4.5 已完成**：亮/暗主题切换、CMake Widgets 残留清理、搜索发起对话、乐观发送与状态流转、已读回执、会话列表/聊天对话框交互完善，并经 E2E 验证。
 3. **M6**：端到端加密一对一聊天（设备身份密钥、预密钥、消息 MAC）。
 4. **M7+**：群聊、媒体、客户端本地持久化缓存与持久化 outbox、搜索与通知。
