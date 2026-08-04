@@ -64,6 +64,17 @@ struct MessageInfo
     QString contentType; // "text"
     QString status;      // "sending", "sent", "delivered", "read", "failed"
     QString createdAt;
+    QString clientMessageId; // M5.5: 客户端幂等键
+};
+
+// M5.5: 账号级同步事件
+struct SyncEventInfo
+{
+    qint64 seq = 0;
+    qint64 userId = 0;
+    QString eventType; // "message", "contact_added", "receipt"
+    QString payload;   // JSON
+    QString createdAt;
 };
 
 // ── DatabaseManager ──────────────────────────────────────────────────────────
@@ -91,6 +102,7 @@ public:
                          const QString &loginIp,
                          int ttlSeconds = 86400 * 7); // 7 天
     std::optional<SessionInfo> getSessionByTokenHash(const QString &tokenHash);
+    std::optional<SessionInfo> getSessionById(qint64 sessionId); // M5.5: 续期时校验 token
     bool updateSessionLastActive(qint64 sessionId);
     bool deleteSession(qint64 sessionId);
     bool deleteSessionsByUserId(qint64 userId);
@@ -125,16 +137,35 @@ public:
     qint64 getOrCreatePrivateConversation(qint64 userId1, qint64 userId2);
     QList<ConversationInfo> getConversationsForUser(qint64 userId);
     std::optional<ConversationInfo> getConversation(qint64 conversationId);
+    // M5.5: 授权检查（先授权再查询）
+    bool isConversationMember(qint64 conversationId, qint64 userId);
+    bool canAccessMessage(qint64 messageId, qint64 userId);
 
     // ── 消息管理 ─────────────────────────────────────────────────────────────
     qint64 sendMessage(qint64 conversationId, qint64 senderId,
-                       const QString &content, const QString &contentType = "text");
+                       const QString &content, const QString &contentType = "text",
+                       const QString &clientMessageId = {},
+                       const QString &senderDeviceId = {});
     std::optional<MessageInfo> getMessage(qint64 messageId);
+    // M5.5: 客户端幂等键去重
+    std::optional<MessageInfo> getMessageByClientKey(qint64 senderId,
+                                                     const QString &senderDeviceId,
+                                                     const QString &clientMessageId);
     QList<MessageInfo> getMessages(qint64 conversationId, qint64 beforeId = 0, int limit = 50);
     QList<MessageInfo> syncMessages(qint64 conversationId, qint64 afterId, int limit = 100);
     bool updateMessageStatus(qint64 messageId, const QString &status);
     bool updateMessagesReadStatus(qint64 conversationId, qint64 readerId);
     int getUnreadCount(qint64 conversationId, qint64 userId);
+
+    // M5.5: 消息回执（per-recipient，替代全局状态聚合）
+    bool recordMessageReceipt(qint64 messageId, qint64 userId,
+                              const QString &deviceId, const QString &status);
+    int receiptCount(qint64 messageId, const QString &status); // "delivered" / "read"
+    bool updateMemberReadCursor(qint64 conversationId, qint64 userId, qint64 messageId);
+
+    // M5.5: 同步事件流
+    qint64 appendSyncEvent(qint64 userId, const QString &eventType, const QString &payloadJson);
+    QList<SyncEventInfo> getSyncEvents(qint64 userId, qint64 afterSeq, int limit = 200);
 
 private:
     bool openDatabase();
@@ -143,6 +174,7 @@ private:
     bool migrateToV1();
     bool migrateToV2();
     bool migrateToV3();
+    bool migrateToV4();
 
     QString m_connectionName;
 };

@@ -40,11 +40,22 @@ bool Server::initTls(const QString &certDir)
     return true;
 }
 
-bool Server::start(quint16 port)
+bool Server::start(quint16 port, bool allowPlaintext)
 {
+    // M5.5: fail-closed —— TLS 不可用时拒绝启动，
+    // 除非显式开启开发明文模式（默认关闭）
+    if (!m_tlsEnabled && !allowPlaintext) {
+        qCritical() << "[Server] TLS is not available; refusing to start in plaintext."
+                    << "Fix TLS configuration or pass --allow-plaintext for development only.";
+        return false;
+    }
+    if (!m_tlsEnabled && allowPlaintext) {
+        qWarning() << "[Server] Starting in PLAINTEXT development mode. Do not use in production.";
+    }
+
     if (tcpServer->listen(QHostAddress::Any, port)) {
         qDebug() << "[Server] Listening on port" << port
-                 << (m_tlsEnabled ? "(TLS)" : "(plain TCP)");
+                 << (m_tlsEnabled ? "(TLS)" : "(plain TCP, dev mode)");
         return true;
     }
     qDebug() << "[Server] Failed to listen on port" << port << tcpServer->errorString();
@@ -59,6 +70,8 @@ void Server::onSocketAccepted(qintptr socketDescriptor)
     if (m_tlsEnabled) {
         handler->setSslConfiguration(m_sslConfig);
     }
+    // M5.5: 传递全局 nonce 缓存
+    handler->setNonceCache(&m_nonceCache);
 
     connect(handler, &RequestHandler::userLoggedIn, this, &Server::onUserLoggedIn);
     connect(handler, &RequestHandler::userLoggedOut, this, &Server::onUserLoggedOut);
@@ -66,6 +79,8 @@ void Server::onSocketAccepted(qintptr socketDescriptor)
     connect(handler, &RequestHandler::finished, handler, &RequestHandler::deleteLater);
     // M3: 消息路由
     connect(handler, &RequestHandler::messageForUser, this, &Server::onMessageForUser);
+    // M5.5: 会话终止路由
+    connect(handler, &RequestHandler::sessionTerminated, this, &Server::onSessionTerminated);
 
     handler->start();
 }
@@ -167,5 +182,15 @@ void Server::onMessageForUser(qint64 targetUserId, const QByteArray &packetData)
         if (handlerIt != m_sessionHandlers.end()) {
             handlerIt.value()->sendRawData(packetData);
         }
+    }
+}
+
+// M5.5: 本人其他会话被 terminate_session 终止时，断开对应连接
+void Server::onSessionTerminated(qint64 sessionId)
+{
+    auto handlerIt = m_sessionHandlers.find(sessionId);
+    if (handlerIt != m_sessionHandlers.end()) {
+        handlerIt.value()->disconnectClient();
+        qDebug() << "[Server] Session" << sessionId << "terminated, disconnecting client.";
     }
 }

@@ -9,7 +9,7 @@
 #include <QStandardPaths>
 #include <QDir>
 
-static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "XYChat-Server/data/db";
+static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/XYChat-Server/data/db";
 
 DatabaseManager::DatabaseManager(const QString &connectionName)
     : m_connectionName(connectionName)
@@ -99,6 +99,9 @@ bool DatabaseManager::runMigrations()
     }
     if (currentVersion < 3) {
         if (!migrateToV3()) return false;
+    }
+    if (currentVersion < 4) {
+        if (!migrateToV4()) return false;
     }
 
     return true;
@@ -323,6 +326,77 @@ bool DatabaseManager::migrateToV3()
     return true;
 }
 
+// V4（M5.5）：消息幂等键、回执表、同步事件表
+bool DatabaseManager::migrateToV4()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V4...";
+
+    // messages 表新增客户端幂等键与发送设备列
+    if (!q.exec("ALTER TABLE messages ADD COLUMN client_message_id TEXT")) {
+        qCritical() << "[DB] V4: Failed to add messages.client_message_id:" << q.lastError().text();
+        return false;
+    }
+    if (!q.exec("ALTER TABLE messages ADD COLUMN sender_device_id TEXT")) {
+        qCritical() << "[DB] V4: Failed to add messages.sender_device_id:" << q.lastError().text();
+        return false;
+    }
+    // 幂等唯一约束：同一设备重复提交同一 client_message_id 时返回已有消息
+    // （SQLite 唯一索引中 NULL 互不相等，存量旧数据不受影响）
+    if (!q.exec(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_key "
+            "ON messages(sender_id, sender_device_id, client_message_id) "
+            "WHERE client_message_id IS NOT NULL AND client_message_id != ''")) {
+        qCritical() << "[DB] V4: Failed to create message idempotency index:" << q.lastError().text();
+        return false;
+    }
+
+    // message_receipts 表：按接收者/设备维度的送达与已读回执
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS message_receipts ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  message_id INTEGER NOT NULL,"
+            "  user_id INTEGER NOT NULL,"
+            "  device_id TEXT,"
+            "  delivered_at TEXT,"
+            "  read_at TEXT,"
+            "  FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,"
+            "  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,"
+            "  UNIQUE(message_id, user_id, device_id)"
+            ")")) {
+        qCritical() << "[DB] V4: Failed to create message_receipts table:" << q.lastError().text();
+        return false;
+    }
+    q.exec("CREATE INDEX IF NOT EXISTS idx_receipts_message ON message_receipts(message_id)");
+
+    // sync_events 表：账号级增量同步事件流（消息/联系人/回执等）
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS sync_events ("
+            "  seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  user_id INTEGER NOT NULL,"
+            "  event_type TEXT NOT NULL,"
+            "  payload TEXT NOT NULL DEFAULT '{}',"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
+            ")")) {
+        qCritical() << "[DB] V4: Failed to create sync_events table:" << q.lastError().text();
+        return false;
+    }
+    q.exec("CREATE INDEX IF NOT EXISTS idx_sync_events_user ON sync_events(user_id, seq)");
+
+    // 记录版本
+    q.prepare("INSERT INTO schema_version (version) VALUES (4)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V4: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V4 complete";
+    return true;
+}
+
 // ── 用户管理 ─────────────────────────────────────────────────────────────────
 bool DatabaseManager::userExists(const QString &username)
 {
@@ -435,6 +509,30 @@ bool DatabaseManager::updateSessionLastActive(qint64 sessionId)
         "UPDATE sessions SET last_active_at = datetime('now') WHERE id = ?");
     q.addBindValue(sessionId);
     return q.exec();
+}
+
+// M5.5: 按 ID 查询 session（含 token_hash，用于续期时校验客户端携带的 token）
+std::optional<SessionInfo> DatabaseManager::getSessionById(qint64 sessionId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT id, user_id, device_id, token_hash, login_ip, created_at, last_active_at, expires_at "
+        "FROM sessions WHERE id = ?");
+    q.addBindValue(sessionId);
+    if (q.exec() && q.next()) {
+        SessionInfo s;
+        s.id = q.value(0).toLongLong();
+        s.userId = q.value(1).toLongLong();
+        s.deviceId = q.value(2).toString();
+        s.tokenHash = q.value(3).toString();
+        s.loginIp = q.value(4).toString();
+        s.createdAt = q.value(5).toString();
+        s.lastActiveAt = q.value(6).toString();
+        s.expiresAt = q.value(7).toString();
+        return s;
+    }
+    return std::nullopt;
 }
 
 bool DatabaseManager::deleteSession(qint64 sessionId)
@@ -811,20 +909,75 @@ std::optional<ConversationInfo> DatabaseManager::getConversation(qint64 conversa
     return std::nullopt;
 }
 
-// ── 消息管理 ─────────────────────────────────────────────────────────────────
-qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
-                                    const QString &content, const QString &contentType)
+// M5.5: 会话成员授权检查
+bool DatabaseManager::isConversationMember(qint64 conversationId, qint64 userId)
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
     QSqlQuery q(db);
     q.prepare(
-        "INSERT INTO messages (conversation_id, sender_id, content, content_type, status) "
-        "VALUES (?, ?, ?, ?, 'sent')");
+        "SELECT COUNT(*) FROM conversation_members "
+        "WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt() > 0;
+    }
+    return false;
+}
+
+// M5.5: 消息访问授权：请求者必须是该消息所属会话的成员
+bool DatabaseManager::canAccessMessage(qint64 messageId, qint64 userId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT COUNT(*) FROM messages m "
+        "JOIN conversation_members cm ON cm.conversation_id = m.conversation_id "
+        "WHERE m.id = ? AND cm.user_id = ?");
+    q.addBindValue(messageId);
+    q.addBindValue(userId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt() > 0;
+    }
+    return false;
+}
+
+// ── 消息管理 ─────────────────────────────────────────────────────────────────
+qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
+                                    const QString &content, const QString &contentType,
+                                    const QString &clientMessageId,
+                                    const QString &senderDeviceId)
+{
+    // M5.5: 幂等去重 —— 同一设备重复提交同一 client_message_id 时返回已有消息
+    if (!clientMessageId.isEmpty()) {
+        auto existing = getMessageByClientKey(senderId, senderDeviceId, clientMessageId);
+        if (existing.has_value()) {
+            return existing->id;
+        }
+    }
+
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "INSERT INTO messages "
+        "  (conversation_id, sender_id, content, content_type, status, client_message_id, sender_device_id) "
+        "VALUES (?, ?, ?, ?, 'sent', ?, ?)");
     q.addBindValue(conversationId);
     q.addBindValue(senderId);
     q.addBindValue(content);
     q.addBindValue(contentType);
+    q.addBindValue(clientMessageId.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
+                                             : QVariant(clientMessageId));
+    q.addBindValue(senderDeviceId.isEmpty() ? QVariant(QMetaType(QMetaType::QString))
+                                            : QVariant(senderDeviceId));
     if (!q.exec()) {
+        // 并发重试可能命中唯一索引：再查一次幂等键
+        if (!clientMessageId.isEmpty()) {
+            auto existing = getMessageByClientKey(senderId, senderDeviceId, clientMessageId);
+            if (existing.has_value()) {
+                return existing->id;
+            }
+        }
         qWarning() << "[DB] sendMessage failed:" << q.lastError().text();
         return -1;
     }
@@ -837,6 +990,38 @@ qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
     q.exec();
 
     return msgId;
+}
+
+// M5.5: 按客户端幂等键查找已存储消息
+std::optional<MessageInfo> DatabaseManager::getMessageByClientKey(qint64 senderId,
+                                                                  const QString &senderDeviceId,
+                                                                  const QString &clientMessageId)
+{
+    if (clientMessageId.isEmpty()) {
+        return std::nullopt;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT id, conversation_id, content, content_type, status, created_at "
+        "FROM messages "
+        "WHERE sender_id = ? AND sender_device_id = ? AND client_message_id = ?");
+    q.addBindValue(senderId);
+    q.addBindValue(senderDeviceId);
+    q.addBindValue(clientMessageId);
+    if (q.exec() && q.next()) {
+        MessageInfo mi;
+        mi.id = q.value(0).toLongLong();
+        mi.conversationId = q.value(1).toLongLong();
+        mi.senderId = senderId;
+        mi.content = q.value(2).toString();
+        mi.contentType = q.value(3).toString();
+        mi.status = q.value(4).toString();
+        mi.createdAt = q.value(5).toString();
+        mi.clientMessageId = clientMessageId;
+        return mi;
+    }
+    return std::nullopt;
 }
 
 std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
@@ -994,4 +1179,117 @@ int DatabaseManager::getUnreadCount(qint64 conversationId, qint64 userId)
         return q.value(0).toInt();
     }
     return 0;
+}
+
+// ── M5.5: 消息回执 ─────────────────────────────────────────────────────────
+bool DatabaseManager::recordMessageReceipt(qint64 messageId, qint64 userId,
+                                           const QString &deviceId, const QString &status)
+{
+    if (status != "delivered" && status != "read") {
+        return false;
+    }
+
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    if (status == "delivered") {
+        // 仅在尚无送达记录时写入，已读记录不回退
+        q.prepare(
+            "INSERT INTO message_receipts (message_id, user_id, device_id, delivered_at) "
+            "VALUES (?, ?, ?, datetime('now')) "
+            "ON CONFLICT(message_id, user_id, device_id) DO UPDATE SET "
+            "  delivered_at = COALESCE(message_receipts.delivered_at, datetime('now'))");
+    } else {
+        q.prepare(
+            "INSERT INTO message_receipts (message_id, user_id, device_id, delivered_at, read_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now')) "
+            "ON CONFLICT(message_id, user_id, device_id) DO UPDATE SET "
+            "  delivered_at = COALESCE(message_receipts.delivered_at, datetime('now')),"
+            "  read_at = COALESCE(message_receipts.read_at, datetime('now'))");
+    }
+    q.addBindValue(messageId);
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    if (!q.exec()) {
+        qWarning() << "[DB] recordMessageReceipt failed:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+int DatabaseManager::receiptCount(qint64 messageId, const QString &status)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    if (status == "read") {
+        q.prepare("SELECT COUNT(*) FROM message_receipts WHERE message_id = ? AND read_at IS NOT NULL");
+    } else {
+        q.prepare(
+            "SELECT COUNT(*) FROM message_receipts "
+            "WHERE message_id = ? AND (delivered_at IS NOT NULL OR read_at IS NOT NULL)");
+    }
+    q.addBindValue(messageId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt();
+    }
+    return 0;
+}
+
+bool DatabaseManager::updateMemberReadCursor(qint64 conversationId, qint64 userId, qint64 messageId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // 读游标只允许前进
+    q.prepare(
+        "UPDATE conversation_members SET last_read_message_id = ? "
+        "WHERE conversation_id = ? AND user_id = ? AND last_read_message_id < ?");
+    q.addBindValue(messageId);
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    q.addBindValue(messageId);
+    return q.exec();
+}
+
+// ── M5.5: 同步事件流 ─────────────────────────────────────────────────────
+qint64 DatabaseManager::appendSyncEvent(qint64 userId, const QString &eventType,
+                                        const QString &payloadJson)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "INSERT INTO sync_events (user_id, event_type, payload) VALUES (?, ?, ?)");
+    q.addBindValue(userId);
+    q.addBindValue(eventType);
+    q.addBindValue(payloadJson.isEmpty() ? QStringLiteral("{}") : payloadJson);
+    if (!q.exec()) {
+        qWarning() << "[DB] appendSyncEvent failed:" << q.lastError().text();
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+QList<SyncEventInfo> DatabaseManager::getSyncEvents(qint64 userId, qint64 afterSeq, int limit)
+{
+    QList<SyncEventInfo> result;
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT seq, user_id, event_type, payload, created_at "
+        "FROM sync_events WHERE user_id = ? AND seq > ? "
+        "ORDER BY seq ASC LIMIT ?");
+    q.addBindValue(userId);
+    q.addBindValue(afterSeq);
+    q.addBindValue(limit);
+    if (q.exec()) {
+        while (q.next()) {
+            SyncEventInfo ev;
+            ev.seq = q.value(0).toLongLong();
+            ev.userId = q.value(1).toLongLong();
+            ev.eventType = q.value(2).toString();
+            ev.payload = q.value(3).toString();
+            ev.createdAt = q.value(4).toString();
+            result.append(ev);
+        }
+    }
+    return result;
 }

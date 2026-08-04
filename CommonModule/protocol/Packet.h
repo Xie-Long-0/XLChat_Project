@@ -46,6 +46,9 @@ enum class MessageType : quint16
     SyncMessagesRequest = 37,
     SyncMessagesResponse = 38,
     MessageStatusUpdate = 39,
+    // M5.5 - 账号级增量同步
+    SyncEventsRequest = 40,
+    SyncEventsResponse = 41,
 };
 
 enum class ErrorCode : int
@@ -54,6 +57,7 @@ enum class ErrorCode : int
     // 1xxx: 请求相关
     InvalidRequest = 1000,
     UnsupportedVersion = 1001,
+    ReplayRejected = 1002,
     // 2xxx: 认证相关
     AuthenticationFailed = 2001,
     AccountAlreadyExists = 2002,
@@ -68,6 +72,7 @@ enum class ErrorCode : int
     ConversationNotFound = 3003,
     MessageNotFound = 3004,
     CannotSendToSelf = 3005,
+    PermissionDenied = 3006,
     // 9xxx: 系统相关
     Timeout = 9001,
     InternalError = 9002,

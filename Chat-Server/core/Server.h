@@ -6,6 +6,8 @@
 #include <QHash>
 #include <QSet>
 
+#include "NonceCache.h"
+
 class RequestHandler;
 
 class ConnectionServer : public QTcpServer
@@ -28,10 +30,14 @@ class Server : public QObject
 
 public:
     explicit Server(QObject *parent = nullptr);
-    bool start(quint16 port);
+    // M5.5: fail-closed —— 若 TLS 未启用且未显式允许明文，start() 拒绝启动
+    bool start(quint16 port, bool allowPlaintext = false);
 
     // M5: TLS 配置
     bool initTls(const QString &certDir);
+
+    // M5.5: 是否处于 TLS 保护状态（供测试与监控）
+    bool tlsEnabled() const { return m_tlsEnabled; }
 
     // 在线用户管理
     int onlineUserCount() const;
@@ -44,6 +50,8 @@ private slots:
     void onHandlerFinished();
     // M3: 消息路由
     void onMessageForUser(qint64 targetUserId, const QByteArray &packetData);
+    // M5.5: 本人会话被终止时断开对应连接
+    void onSessionTerminated(qint64 sessionId);
 
 private:
     ConnectionServer *tcpServer;
@@ -51,6 +59,9 @@ private:
     // M5: TLS 配置
     QSslConfiguration m_sslConfig;
     bool m_tlsEnabled = false;
+
+    // M5.5: 全局 nonce 缓存（跨连接共享，TTL 去重）
+    NonceCache m_nonceCache;
 
     // userId -> set of sessionIds
     QHash<qint64, QSet<qint64>> m_onlineSessions;

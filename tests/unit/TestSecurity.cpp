@@ -7,6 +7,7 @@
 #include "LogSanitizer.h"
 #include "SecureMemory.h"
 #include "TlsHelper.h"
+#include "NonceCache.h"
 
 using namespace XYChat::Security;
 
@@ -31,6 +32,11 @@ private slots:
     void testGenerateDevCertificates();
     void testLoadServerConfig();
     void testLoadClientConfig();
+
+    // M5.5: NonceCache 重放保护测试
+    void testNonceAcceptsFreshAndRejectsDuplicate();
+    void testNonceRejectsEmpty();
+    void testNonceExpiresAfterTtl();
 };
 
 // ── LogSanitizer ─────────────────────────────────────────────────────────────
@@ -179,6 +185,37 @@ void TestSecurity::testLoadClientConfig()
     // 不存在的 CA 文件应返回无效
     auto invalidConfig = TlsHelper::loadClientConfig("/nonexistent/ca.crt");
     QVERIFY(!invalidConfig.valid);
+}
+
+// M5.5: NonceCache 重放保护
+void TestSecurity::testNonceAcceptsFreshAndRejectsDuplicate()
+{
+    NonceCache cache(600);
+    QVERIFY(cache.checkAndInsert("nonce-1"));
+    // 重复 nonce 必须拒绝（防重放）
+    QVERIFY(!cache.checkAndInsert("nonce-1"));
+    // 不同 nonce 正常接受
+    QVERIFY(cache.checkAndInsert("nonce-2"));
+    QCOMPARE(cache.size(), 2);
+}
+
+void TestSecurity::testNonceRejectsEmpty()
+{
+    NonceCache cache(600);
+    // 缺失/空 nonce 一律拒绝（必填语义）
+    QVERIFY(!cache.checkAndInsert(QString()));
+    QCOMPARE(cache.size(), 0);
+}
+
+void TestSecurity::testNonceExpiresAfterTtl()
+{
+    // TTL=0：下一秒即可重新使用同一 nonce
+    NonceCache cache(0);
+    QVERIFY(cache.checkAndInsert("nonce-ttl"));
+    QVERIFY(!cache.checkAndInsert("nonce-ttl"));
+    QTest::qWait(1100);
+    cache.purgeExpired();
+    QVERIFY(cache.checkAndInsert("nonce-ttl"));
 }
 
 QTEST_MAIN(TestSecurity)

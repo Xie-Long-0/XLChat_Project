@@ -70,6 +70,13 @@ add_custom_command(TARGET TestDatabaseManager POST_BUILD
 # ── TestSecurity (M5) ────────────────────────────────────────────────────────────
 add_executable(TestSecurity
     unit/TestSecurity.cpp
+    # M5.5: NonceCache 重放保护组件（服务端 core）
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/NonceCache.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core/NonceCache.h
+)
+
+target_include_directories(TestSecurity PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Server/core
 )
 
 target_link_libraries(TestSecurity PRIVATE

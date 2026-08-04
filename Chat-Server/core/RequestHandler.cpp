@@ -1,4 +1,5 @@
 #include "RequestHandler.h"
+#include "NonceCache.h"
 #include "database/DatabaseManager.h"
 #include "EncryptionManager.h"
 #include "LogSanitizer.h"
@@ -31,11 +32,30 @@ RequestHandler::~RequestHandler()
 // ── M3: 跨线程发送数据到客户端 ─────────────────────────────────────────────
 void RequestHandler::sendRawData(const QByteArray &data)
 {
-    // 通过 Qt 队列连接跨线程调用
-    QMetaObject::invokeMethod(this, [this, data]() {
+    // M5.5: 投递到线程亲和于 handler 线程的发送代理对象，
+    // 确保 QSslSocket 只在其所属线程被访问
+    QObject *worker = m_sendWorker.load(std::memory_order_acquire);
+    if (!worker) {
+        return;
+    }
+    QMetaObject::invokeMethod(worker, [this, data]() {
         if (m_socket && m_socket->state() == QAbstractSocket::ConnectedState) {
             m_socket->write(data);
             m_socket->flush();
+        }
+    }, Qt::QueuedConnection);
+}
+
+// M5.5: 请求断开客户端连接（在被终止会话时由 Server 调用）
+void RequestHandler::disconnectClient()
+{
+    QObject *worker = m_sendWorker.load(std::memory_order_acquire);
+    if (!worker) {
+        return;
+    }
+    QMetaObject::invokeMethod(worker, [this]() {
+        if (m_socket) {
+            m_socket->disconnectFromHost();
         }
     }, Qt::QueuedConnection);
 }
@@ -45,6 +65,12 @@ void RequestHandler::setSslConfiguration(const QSslConfiguration &config)
 {
     m_sslConfig = config;
     m_tlsEnabled = true;
+}
+
+// M5.5: 设置全局 nonce 缓存
+void RequestHandler::setNonceCache(NonceCache *cache)
+{
+    m_nonceCache = cache;
 }
 
 // ── 线程入口 ─────────────────────────────────────────────────────────────────
@@ -92,6 +118,10 @@ void RequestHandler::run()
     connect(m_idleTimer, &QTimer::timeout, m_idleTimer, [this]() { onIdleTimeout(); });
     m_idleTimer->start();
 
+    // M5.5: 发送代理对象在当前（handler）线程创建，获得正确的线程亲和性
+    QObject *worker = new QObject();
+    m_sendWorker.store(worker, std::memory_order_release);
+
     exec();
 
     // 连接断开时，清理 session
@@ -99,6 +129,7 @@ void RequestHandler::run()
         emit userLoggedOut(m_authenticatedUserId, m_currentSessionId);
     }
 
+    delete m_sendWorker.exchange(nullptr);
     delete m_idleTimer;
     m_idleTimer = nullptr;
     delete m_socket;
@@ -160,7 +191,7 @@ void RequestHandler::processPacket(const Packet &packet)
     // M5: 重放保护检查（对所有业务请求）
     if (packet.messageType != MessageType::Ping && packet.messageType != MessageType::Pong) {
         if (!checkReplayProtection(json)) {
-            sendResponse(packet.requestId, MessageType::Error, ErrorCode::InvalidRequest,
+            sendResponse(packet.requestId, MessageType::Error, ErrorCode::ReplayRejected,
                          "Replay protection check failed");
             return;
         }
@@ -191,11 +222,14 @@ void RequestHandler::processPacket(const Packet &packet)
         return;
     }
     if (packet.messageType == MessageType::TokenRenewRequest || type == "token_renew") {
-        processTokenRenewRequest(packet);
+        processTokenRenewRequest(packet, json);
         return;
     }
-    if (packet.messageType == MessageType::ForceLogoutRequest || type == "force_logout") {
-        processForceLogoutRequest(packet, json);
+    // M5.5: 兼容旧字段名 force_logout 与新语义 terminate_session，
+    // 均仅允许终止本人其他会话
+    if (packet.messageType == MessageType::ForceLogoutRequest
+        || type == "force_logout" || type == "terminate_session") {
+        processTerminateSessionRequest(packet, json);
         return;
     }
 
@@ -226,6 +260,11 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     if (packet.messageType == MessageType::SyncMessagesRequest || type == "sync_messages") {
         processSyncMessagesRequest(packet, json);
+        return;
+    }
+    // M5.5: 账号级增量同步
+    if (packet.messageType == MessageType::SyncEventsRequest || type == "sync_events") {
+        processSyncEventsRequest(packet, json);
         return;
     }
 
@@ -399,10 +438,33 @@ void RequestHandler::processLogoutRequest(const Packet &packet)
 }
 
 // ── Token 续期 ───────────────────────────────────────────────────────────────
-void RequestHandler::processTokenRenewRequest(const Packet &packet)
+void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 oldSessionId = m_currentSessionId;
     const qint64 userId = m_authenticatedUserId;
+
+    // M5.5: 真正校验客户端携带的 token，而不是仅依赖连接内存状态
+    const QString suppliedToken = request.value("token").toString();
+    if (suppliedToken.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::TokenRenewResponse,
+                     ErrorCode::InvalidRequest, "Token is required");
+        return;
+    }
+
+    auto sessionOpt = m_db->getSessionById(oldSessionId);
+    if (!sessionOpt.has_value()) {
+        sendResponse(packet.requestId, MessageType::TokenRenewResponse,
+                     ErrorCode::SessionExpired, "Session no longer exists");
+        return;
+    }
+
+    const QString suppliedHash = EncryptionManager::hashToken(suppliedToken);
+    if (suppliedHash != sessionOpt->tokenHash) {
+        qWarning() << "[Handler] Token renew rejected: token mismatch for user" << userId;
+        sendResponse(packet.requestId, MessageType::TokenRenewResponse,
+                     ErrorCode::SessionInvalid, "Supplied token does not match session");
+        return;
+    }
 
     // 生成新 token
     const QString newToken = EncryptionManager::generateToken();
@@ -433,26 +495,63 @@ void RequestHandler::processTokenRenewRequest(const Packet &packet)
 }
 
 // ── 强制下线 ─────────────────────────────────────────────────────────────────
-void RequestHandler::processForceLogoutRequest(const Packet &packet, const QJsonObject &request)
+void RequestHandler::processTerminateSessionRequest(const Packet &packet, const QJsonObject &request)
 {
-    const qint64 targetUserId = request.value("userId").toVariant().toLongLong();
+    // M5.5: 拒绝旧版越权用法 —— 不允许指定任意 userId
+    if (request.contains("userId")) {
+        const qint64 requestedUserId = request.value("userId").toVariant().toLongLong();
+        if (requestedUserId != m_authenticatedUserId) {
+            sendResponse(packet.requestId, MessageType::ForceLogoutResponse,
+                         ErrorCode::PermissionDenied,
+                         "Cannot terminate sessions of another user");
+            return;
+        }
+    }
 
-    if (targetUserId <= 0) {
+    const qint64 targetSessionId = request.value("sessionId").toVariant().toLongLong();
+    const QString targetDeviceId = request.value("deviceId").toString();
+
+    if (targetSessionId <= 0 && targetDeviceId.isEmpty()) {
         sendResponse(packet.requestId, MessageType::ForceLogoutResponse,
-                     ErrorCode::InvalidRequest, "Invalid userId");
+                     ErrorCode::InvalidRequest,
+                     "sessionId or deviceId is required");
+        return;
+    }
+    if (targetSessionId == m_currentSessionId) {
+        sendResponse(packet.requestId, MessageType::ForceLogoutResponse,
+                     ErrorCode::InvalidRequest,
+                     "Cannot terminate current session, use logout instead");
         return;
     }
 
-    // 删除目标用户所有 session
-    m_db->deleteSessionsByUserId(targetUserId);
-    emit userLoggedOut(targetUserId, 0); // sessionId=0 表示全部清除
+    // 只能在本人会话列表中查找目标
+    qint64 resolvedSessionId = 0;
+    const auto sessions = m_db->getSessionsByUserId(m_authenticatedUserId);
+    for (const auto &s : sessions) {
+        if ((targetSessionId > 0 && s.id == targetSessionId)
+            || (!targetDeviceId.isEmpty() && s.deviceId == targetDeviceId)) {
+            resolvedSessionId = s.id;
+            break;
+        }
+    }
+
+    if (resolvedSessionId <= 0) {
+        sendResponse(packet.requestId, MessageType::ForceLogoutResponse,
+                     ErrorCode::PermissionDenied,
+                     "Target session not found among your own sessions");
+        return;
+    }
+
+    m_db->deleteSession(resolvedSessionId);
+    emit userLoggedOut(m_authenticatedUserId, resolvedSessionId);
+    emit sessionTerminated(resolvedSessionId);
 
     QJsonObject data;
-    data["affectedUserId"] = targetUserId;
-
+    data["terminatedSessionId"] = resolvedSessionId;
     sendResponse(packet.requestId, MessageType::ForceLogoutResponse, ErrorCode::Ok,
-                 "User forced logout", data);
-    qDebug() << "[Handler] Force logout user" << targetUserId;
+                 "Session terminated", data);
+    qDebug() << "[Handler] User" << m_authenticatedUserId
+             << "terminated own session" << resolvedSessionId;
 }
 
 // ── M3: 用户搜索 ───────────────────────────────────────────────────────────
@@ -506,6 +605,18 @@ void RequestHandler::processAddContactRequest(const Packet &packet, const QJsonO
         sendResponse(packet.requestId, MessageType::AddContactResponse,
                      ErrorCode::InternalError, "Failed to add contact");
         return;
+    }
+
+    // M5.5: 联系人变更写入双方同步事件流
+    {
+        QJsonObject ev;
+        ev["contactUserId"] = contactUserId;
+        m_db->appendSyncEvent(m_authenticatedUserId, "contact_added",
+                              QJsonDocument(ev).toJson(QJsonDocument::Compact));
+        QJsonObject evPeer;
+        evPeer["contactUserId"] = m_authenticatedUserId;
+        m_db->appendSyncEvent(contactUserId, "contact_added",
+                              QJsonDocument(evPeer).toJson(QJsonDocument::Compact));
     }
 
     QJsonObject data;
@@ -565,6 +676,8 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     const qint64 targetUserId = request.value("toUserId").toVariant().toLongLong();
     const QString content = request.value("content").toString();
     const QString contentType = request.value("contentType").toString("text");
+    // M5.5: 客户端幂等键必填，重试不重复写消息
+    const QString clientMessageId = request.value("clientMessageId").toString().trimmed();
 
     if (targetUserId <= 0 || targetUserId == m_authenticatedUserId) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
@@ -576,6 +689,11 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
                      ErrorCode::InvalidRequest, "Message content is empty");
         return;
     }
+    if (clientMessageId.isEmpty() || clientMessageId.size() > 128) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "clientMessageId is required");
+        return;
+    }
 
     // 获取或创建会话
     const qint64 convId = m_db->getOrCreatePrivateConversation(m_authenticatedUserId, targetUserId);
@@ -585,12 +703,30 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         return;
     }
 
-    // 存储消息
-    const qint64 msgId = m_db->sendMessage(convId, m_authenticatedUserId, content, contentType);
+    // 存储消息（幂等：重复的 clientMessageId 返回已有消息）
+    const qint64 msgId = m_db->sendMessage(convId, m_authenticatedUserId, content,
+                                           contentType, clientMessageId, m_currentDeviceId);
     if (msgId < 0) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      ErrorCode::InternalError, "Failed to send message");
         return;
+    }
+
+    const QString createdAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    // M5.5: 写入接收方同步事件流（发送方其他设备同样可同步）
+    {
+        QJsonObject ev;
+        ev["messageId"] = msgId;
+        ev["conversationId"] = convId;
+        ev["senderId"] = m_authenticatedUserId;
+        ev["content"] = content;
+        ev["contentType"] = contentType;
+        ev["clientMessageId"] = clientMessageId;
+        ev["createdAt"] = createdAt;
+        const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
+        m_db->appendSyncEvent(targetUserId, "message", evJson);
+        m_db->appendSyncEvent(m_authenticatedUserId, "message", evJson);
     }
 
     // 构造消息通知包，用于转发给在线接收方
@@ -600,7 +736,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     notifyJson["senderId"] = m_authenticatedUserId;
     notifyJson["content"] = content;
     notifyJson["contentType"] = contentType;
-    notifyJson["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    notifyJson["createdAt"] = createdAt;
 
     Packet notifyPacket;
     notifyPacket.messageType = MessageType::NewMessageNotification;
@@ -610,10 +746,11 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     // 通过信号通知 Server 转发
     emit messageForUser(targetUserId, PacketCodec::encode(notifyPacket));
 
-    // 返回发送确认给发送方
+    // 返回发送确认给发送方（回传幂等键便于客户端匹配）
     QJsonObject data;
     data["messageId"] = msgId;
     data["conversationId"] = convId;
+    data["clientMessageId"] = clientMessageId;
     data["status"] = "sent";
     sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                  "Message sent", data);
@@ -630,6 +767,11 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
                      ErrorCode::InvalidRequest, "Invalid messageId");
         return;
     }
+    if (status != "delivered" && status != "read") {
+        sendResponse(packet.requestId, MessageType::AckMessageResponse,
+                     ErrorCode::InvalidRequest, "Status must be 'delivered' or 'read'");
+        return;
+    }
 
     auto msgOpt = m_db->getMessage(messageId);
     if (!msgOpt.has_value()) {
@@ -638,11 +780,49 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
         return;
     }
 
-    m_db->updateMessageStatus(messageId, status);
+    // M5.5: 先授权再更新 —— 请求者必须是消息所属会话的成员
+    if (!m_db->isConversationMember(msgOpt->conversationId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::AckMessageResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this conversation");
+        return;
+    }
 
-    // 如果是已读状态，更新整个会话的已读进度
+    // M5.5: 按接收者/设备维度记录回执，替代全局单值状态
+    m_db->recordMessageReceipt(messageId, m_authenticatedUserId, m_currentDeviceId, status);
+
     if (status == "read") {
-        m_db->updateMessagesReadStatus(msgOpt->conversationId, m_authenticatedUserId);
+        m_db->updateMemberReadCursor(msgOpt->conversationId, m_authenticatedUserId, messageId);
+    }
+
+    // 根据回执聚合全局展示状态（私聊中回执数 > 0 即达成）
+    QString aggregatedStatus;
+    if (m_db->receiptCount(messageId, "read") > 0) {
+        aggregatedStatus = "read";
+    } else if (m_db->receiptCount(messageId, "delivered") > 0) {
+        aggregatedStatus = "delivered";
+    }
+    if (!aggregatedStatus.isEmpty() && aggregatedStatus != msgOpt->status) {
+        m_db->updateMessageStatus(messageId, aggregatedStatus);
+
+        // 推送状态更新给发送方（多设备可经 sync_events 同步）
+        QJsonObject statusJson;
+        statusJson["messageId"] = messageId;
+        statusJson["conversationId"] = msgOpt->conversationId;
+        statusJson["status"] = aggregatedStatus;
+        Packet statusPacket;
+        statusPacket.messageType = MessageType::MessageStatusUpdate;
+        statusPacket.requestId = 0;
+        statusPacket.payload = QJsonDocument(statusJson).toJson(QJsonDocument::Compact);
+        emit messageForUser(msgOpt->senderId, PacketCodec::encode(statusPacket));
+
+        // 回执写入发送方同步事件流
+        QJsonObject ev;
+        ev["messageId"] = messageId;
+        ev["conversationId"] = msgOpt->conversationId;
+        ev["status"] = aggregatedStatus;
+        ev["byUserId"] = m_authenticatedUserId;
+        m_db->appendSyncEvent(msgOpt->senderId, "receipt",
+                              QJsonDocument(ev).toJson(QJsonDocument::Compact));
     }
 
     QJsonObject data;
@@ -665,11 +845,10 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
         return;
     }
 
-    // 验证用户是该会话的成员
-    auto convOpt = m_db->getConversation(conversationId);
-    if (!convOpt.has_value()) {
+    // M5.5: 先授权再查询 —— 验证用户是该会话的成员
+    if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
         sendResponse(packet.requestId, MessageType::SyncMessagesResponse,
-                     ErrorCode::ConversationNotFound, "Conversation not found");
+                     ErrorCode::PermissionDenied, "Not a member of this conversation");
         return;
     }
 
@@ -689,14 +868,53 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
         msgArray.append(obj);
     }
 
-    // 自动标记为已读
-    m_db->updateMessagesReadStatus(conversationId, m_authenticatedUserId);
+    // M5.5: 拉取同步时仅前进读游标，不再修改全局消息状态；
+    // 已读回执由客户端显式 ack_message 产生
+    if (!messages.isEmpty()) {
+        m_db->updateMemberReadCursor(conversationId, m_authenticatedUserId,
+                                     messages.last().id);
+    }
 
     QJsonObject data;
     data["conversationId"] = conversationId;
     data["messages"] = msgArray;
     data["hasMore"] = (messages.size() >= limit);
     sendResponse(packet.requestId, MessageType::SyncMessagesResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// ── M5.5: 账号级增量同步 ───────────────────────────────────────────
+void RequestHandler::processSyncEventsRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 afterSeq = request.value("afterSeq").toVariant().toLongLong();
+    int limit = request.value("limit").toInt(200);
+    if (afterSeq < 0) {
+        sendResponse(packet.requestId, MessageType::SyncEventsResponse,
+                     ErrorCode::InvalidRequest, "Invalid afterSeq");
+        return;
+    }
+    if (limit <= 0 || limit > 1000) {
+        limit = 200;
+    }
+
+    // 仅返回本人事件流，无越权面
+    const auto events = m_db->getSyncEvents(m_authenticatedUserId, afterSeq, limit);
+
+    QJsonArray eventArray;
+    for (const auto &ev : events) {
+        QJsonObject obj;
+        obj["seq"] = ev.seq;
+        obj["type"] = ev.eventType;
+        obj["payload"] = QJsonDocument::fromJson(ev.payload.toUtf8()).object();
+        obj["createdAt"] = ev.createdAt;
+        eventArray.append(obj);
+    }
+
+    QJsonObject data;
+    data["events"] = eventArray;
+    data["lastSeq"] = events.isEmpty() ? afterSeq : events.last().seq;
+    data["hasMore"] = (events.size() >= limit);
+    sendResponse(packet.requestId, MessageType::SyncEventsResponse, ErrorCode::Ok,
                  "OK", data);
 }
 
@@ -758,33 +976,41 @@ void RequestHandler::sendPacket(const Packet &packet)
     m_socket->flush();
 }
 
-// ── M5: 重放保护 ─────────────────────────────────────────────────────────────
+// ── M5.5: 重放保护（timestamp/nonce 强制必填） ───────────────────────
 bool RequestHandler::checkReplayProtection(const QJsonObject &request)
 {
-    // 检查时间戳
+    // timestamp 必填且为合法整数
+    if (!request.contains("timestamp") || !request.value("timestamp").isDouble()) {
+        qDebug() << "[Handler] Replay protection: missing or invalid timestamp";
+        return false;
+    }
     const qint64 timestamp = request.value("timestamp").toVariant().toLongLong();
-    if (timestamp > 0) {
-        const qint64 now = QDateTime::currentSecsSinceEpoch();
-        const qint64 diff = qAbs(now - timestamp);
-        if (diff > ReplayTimestampToleranceSecs) {
-            qDebug() << "[Handler] Replay protection: timestamp too old/new, diff=" << diff << "s";
-            return false;
-        }
+    if (timestamp <= 0) {
+        qDebug() << "[Handler] Replay protection: non-positive timestamp";
+        return false;
+    }
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const qint64 diff = qAbs(now - timestamp);
+    if (diff > ReplayTimestampToleranceSecs) {
+        qDebug() << "[Handler] Replay protection: timestamp out of window, diff=" << diff << "s";
+        return false;
     }
 
-    // 检查 nonce
-    const QString nonce = request.value("nonce").toString();
-    if (!nonce.isEmpty()) {
-        if (m_seenNonces.contains(nonce)) {
-            qDebug() << "[Handler] Replay protection: duplicate nonce detected";
-            return false;
-        }
-        m_seenNonces.insert(nonce);
+    // nonce 必填：非空、长度受限
+    const QString nonce = request.value("nonce").toString().trimmed();
+    if (nonce.isEmpty() || nonce.size() > 128) {
+        qDebug() << "[Handler] Replay protection: missing or oversized nonce";
+        return false;
+    }
 
-        // 限制 nonce 缓存大小，避免内存无限增长
-        if (m_seenNonces.size() > 10000) {
-            m_seenNonces.clear();
-        }
+    // 全局 TTL 缓存去重（跨连接生效）；未配置时退回拒绝，fail-closed
+    if (!m_nonceCache) {
+        qWarning() << "[Handler] Replay protection: nonce cache unavailable, rejecting";
+        return false;
+    }
+    if (!m_nonceCache->checkAndInsert(nonce)) {
+        qDebug() << "[Handler] Replay protection: duplicate nonce detected";
+        return false;
     }
 
     return true;

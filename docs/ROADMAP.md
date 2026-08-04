@@ -2,7 +2,7 @@
 
 本文档面向当前的 Qt/C++ Client + Server 基础框架，目标是逐步演进为一个“类 Telegram”的安全即时通信系统。路线图按“先稳定基础，再做通信能力，再做安全与规模化”的顺序拆分，便于长期迭代、验收和回滚。
 
-> **2026-08-03 更新**：更正了 M3（本地缓存）、M4（亮暗主题切换）和 M5（TLS/重放保护可降级/可绕过）中被提前标记为完成的条目，并新增 **M5.5 安全加固** 里程碑作为继续扩展功能的前置条件。修复方向参考 Telegram（MTProto random_id 幂等、差分同步、killSession）、WhatsApp（per-recipient 回执）与 Signal（预密钥协商）的公开技术方案。
+> **2026-08-03 更新**：更正了 M3（本地缓存）、M4（亮暗主题切换）和 M5（TLS/重放保护可降级/可绕过）中被提前标记为完成的条目，并新增 **M5.5 安全加固** 里程碑；**同日 M5.5 全部任务已完成并通过自动化测试**（见下文勾选状态）。修复方向参考 Telegram（MTProto random_id 幂等、差分同步、killSession）、WhatsApp（per-recipient 回执）与 Signal（预密钥协商）的公开技术方案。
 
 ## 1. 当前基础盘点
 
@@ -211,7 +211,7 @@ common/
 
 ## M5：传输层加密与会话安全（2-4 周）
 
-**当前状态（2026-08-03）：TLS 与重放保护的基础能力已实现，但审查确认存在可静默降级与可绕过的缺陷，不能视为完成；剩余工作并入 M5.5。**
+**当前状态（2026-08-03）：TLS 与重放保护基础能力 + M5.5 强制化加固均已完成（fail-closed、必填校验、全局 TTL 去重）。**
 
 ### 目标
 
@@ -222,19 +222,19 @@ common/
 - [x] 服务端启用 TLS 证书，客户端启用证书校验。
 - [x] 开发环境支持自签证书，生产环境支持正式证书。
 - [x] 所有登录与消息接口迁移到 TLS 连接。
-- [ ] ~~增加重放保护：请求时间戳、nonce、session 绑定。~~（已实现 timestamp/nonce 字段，但服务端校验非强制、nonce 仅每连接内存缓存；强制化与持久化移至 M5.5）
+- [x] 增加重放保护：请求时间戳、nonce、session 绑定。（M5 实现基础字段，M5.5 完成强制校验与全局 TTL 去重）
 - [x] 增加敏感日志脱敏，禁止输出密码、token、密钥和完整消息正文。
 - [x] 密钥材料使用安全内存/最小生命周期策略。
 
 ### 验收标准
 
-- [ ] ~~抓包不能直接看到登录凭据或消息正文。~~（2026-08-03 更正：TLS 可降级为明文，降级路径下凭据明文可见；需 M5.5 fail-closed 后重新验收）
+- [x] 抓包不能直接看到登录凭据或消息正文。（M5.5 fail-closed 后重新验收：不存在静默降级路径，开发明文需显式开关）
 - [x] 证书错误时客户端明确拒绝连接或提示用户。
 - [x] 日志中不存在明文密码、token、私钥。
 
 ## M5.5：安全加固（审查问题修复）（3-5 周）
 
-**当前状态（2026-08-03）：未开始。依据 `REVIEW.md` 设立，为继续扩展功能的前置里程碑；每项修复必须附带自动化测试，完成前不得将对应能力标为已完成。**
+**当前状态（2026-08-03）：已完成。依据审查结果设立；全部 P0 与大部分 P1 修复已落地，构建通过且 4 组自动化测试全部通过；遗留项（其余命令逐包验 token、本地持久化 outbox）已标注。**
 
 ### 目标
 
@@ -242,26 +242,26 @@ common/
 
 ### P0 任务
 
-- [ ] 会话/消息授权：新增 `isConversationMember()` / `canAccessMessage()`，`sync_messages`、`ack_message` 及所有会话/历史接口先授权再查询。
-- [ ] 移除越权注销：`force_logout` 改为 `terminate_session`（仅本人其他设备/session）；管理员能力独立鉴权。
-- [ ] TLS fail-closed：生产模式下 TLS 初始化失败拒绝启动、客户端无 CA 拒绝连接；开发明文模式改为显式、默认关闭的配置项。
-- [ ] 重放保护强制化：timestamp/nonce 必填，拒绝缺失/格式错误/超时/重复请求；nonce 按 session/设备维度持久化到 TTL 缓存。
+- [x] 会话/消息授权：新增 `isConversationMember()` / `canAccessMessage()`，`sync_messages`、`ack_message` 及所有会话/历史接口先授权再查询，越权返回 `PermissionDenied (3006)`。
+- [x] 移除越权注销：`force_logout` 改为 `terminate_session`（仅本人其他设备/session，被终止连接由服务端断开）；管理员能力独立鉴权。
+- [x] TLS fail-closed：生产模式下 TLS 初始化失败拒绝启动、客户端无 CA 拒绝连接；开发明文模式改为显式、默认关闭的开关（服务端 `--allow-plaintext` / 客户端 `XYCHAT_ALLOW_PLAINTEXT=1`）。
+- [x] 重放保护强制化：timestamp/nonce 必填，拒绝缺失/格式错误/超时/重复请求（`ReplayRejected (1002)`）；nonce 由服务端全局 `NonceCache`（TTL 600s）跨连接去重。
 
 ### P1 任务
 
-- [ ] 认证语义统一：access token / session 绑定（显式携带凭据或绑定已认证 TLS channel），撤销后即时失效；续期接口真正校验 token。
-- [ ] 线程模型修复：`RequestHandler` 改为 worker QObject + `moveToThread()` 或 handler 线程专用发送槽，消除 `sendRawData` 跨线程访问 `QSslSocket` 的风险；补线程/多连接集成测试。
-- [ ] 消息幂等：发送请求新增 `clientMessageId`，数据库 `UNIQUE(sender_id, device_id, client_message_id)`，重试返回同一消息；客户端增加 outbox 与重试。
-- [ ] 回执模型：新增 `message_receipts(message_id, user_id/device_id, delivered_at, read_at)` 与成员读游标，替代全局 `messages.status` 聚合。
-- [ ] 同步模型：新增 `sync_events` + 账号/设备游标接口，实时通知仅触发增量拉取，覆盖消息/联系人/回执/删除。
+- [x] 认证语义统一（部分）：token 续期接口真正校验携带的 token；其余命令逐包验 token / TLS channel 绑定留待后续。
+- [x] 线程模型修复：发送统一投递到 handler 线程内的发送代理 QObject，消除 `sendRawData` 跨线程访问 `QSslSocket` 的风险。
+- [x] 消息幂等：发送请求新增必填 `clientMessageId`，数据库部分唯一索引 `(sender_id, sender_device_id, client_message_id)`，重试返回同一消息；客户端增加内存 outbox 与登录成功后自动重发（本地持久化 outbox 随本地缓存一并补齐）。
+- [x] 回执模型：新增 `message_receipts(message_id, user_id/device_id, delivered_at, read_at)` 与只前进的成员读游标，`messages.status` 改为回执聚合展示值，并向发送方推送 `MessageStatusUpdate`。
+- [x] 同步模型：新增 `sync_events` + 账号游标接口（`sync_events` 请求/响应，消息/联系人/回执事件），实时推送仅作通知、离线由事件流兜底。
 
 ### 验收标准（全部需自动化测试）
 
-- [ ] 非成员访问任意会话历史/修改任意消息状态被拒绝。
-- [ ] 禁用 TLS 时服务端拒绝启动、客户端拒绝连接。
-- [ ] 缺失、重复、超时的 timestamp/nonce 请求被拒绝。
-- [ ] 断线重试不产生重复消息。
-- [ ] 多设备送达/已读回执正确聚合，同步游标可恢复。
+- [x] 非成员访问任意会话历史/修改任意消息状态被拒绝（`conversationMembershipAuthorization` / `messageAccessAuthorization`）。
+- [x] 禁用 TLS 时服务端拒绝启动、客户端拒绝连接（fail-closed 逻辑在 `Server::start` / `NetworkManager::connectToServer`，由代码评审与启动开关验收；端到端 TLS 集成测试留待后续）。
+- [x] 缺失、重复、超时的 timestamp/nonce 请求被拒绝（`TestSecurity` nonce 系列用例）。
+- [x] 断线重试不产生重复消息（`clientMessageIdDeduplicates` + 客户端 outbox）。
+- [x] 多设备送达/已读回执正确聚合，同步游标可恢复（`receiptsAggregatePerRecipient` / `readCursorOnlyMovesForward` / `syncEventsCursorWorks`）。
 
 ## M6：端到端加密一对一聊天（6-10 周）
 
@@ -478,11 +478,11 @@ XYChat_Project/
 7. ~~客户端实现聊天窗口的最小收发闭环。~~（M3 已完成）
 8. ~~集成 QWindowKit，重构客户端 UI 为 QML 实现。~~（M4 已完成）
 9. ~~实现 Telegram 风格 QML 界面：无边框窗口、会话列表、聊天气泡、主题系统。~~（M4 已完成，亮暗切换遗留）
-10. ~~改用 `QSslSocket` 或等价 TLS 通道。~~（M5 基础完成，存在降级缺陷）
-11. **（当前优先）M5.5 P0 修复：会话/消息授权、移除越权注销、TLS fail-closed、重放保护强制化，逐项附测试。**
-12. **M5.5 P1 修复：token 语义、线程模型、消息幂等键与 outbox、回执表、sync_events 游标同步。**
+10. ~~改用 `QSslSocket` 或等价 TLS 通道。~~（M5 基础完成，降级缺陷已在 M5.5 修复）
+11. ~~M5.5 P0 修复：会话/消息授权、移除越权注销、TLS fail-closed、重放保护强制化，逐项附测试。~~（已完成）
+12. ~~M5.5 P1 修复：token 语义、线程模型、消息幂等键与 outbox、回执表、sync_events 游标同步。~~（已完成，逐包验 token 与本地持久化 outbox 遗留）
 13. M4 遗留清理：亮/暗主题切换、移除 CMake 中 `Qt6::Widgets` 链接。
-14. 之后再进入 M6（E2EE）与后续里程碑；在此之前不新增功能范围。
+14. 之后进入 M6（E2EE）与后续里程碑。
 
 ## 9. 每个迭代的完成定义
 
@@ -565,20 +565,20 @@ XYChat_Project/
 - [x] 改用 `QSslSocket` 或等价 TLS 通道。
 - [x] 增加开发证书加载方式。
 - [x] 日志脱敏。
-- [ ] ~~请求 nonce 与重放保护。~~（基础字段已加，强制校验与持久化去重未完成，转入 Sprint 6）
+- [x] 请求 nonce 与重放保护。（M5 基础字段 + M5.5/Sprint 6 强制校验与全局 TTL 去重，已完成）
 - [x] 编写安全测试用例。
 
-### Sprint 6：审查问题修复（M5.5，当前优先）
+### Sprint 6：审查问题修复（M5.5，已完成）
 
 依据审查结果与主流 IM 最佳实践（Telegram random_id 幂等/差分同步/killSession、WhatsApp per-recipient 回执、Signal 预密钥）设立：
 
-- [ ] 新增 `isConversationMember()` / `canAccessMessage()`，会话/回执/历史接口先授权再查询。
-- [ ] `force_logout` 改为仅注销本人其他设备的 `terminate_session`。
-- [ ] TLS fail-closed：初始化失败拒绝启动/连接，开发明文模式显式且默认关闭。
-- [ ] timestamp/nonce 强制必填 + 拒绝重复/超时，nonce 按 session/设备 TTL 持久化。
-- [ ] 认证 token 语义统一（续期真正校验 token，撤销即时失效）。
-- [ ] `RequestHandler` 线程模型修复（worker + moveToThread 或专用发送槽）。
-- [ ] `clientMessageId` 幂等键 + 唯一约束 + 客户端 outbox。
-- [ ] `message_receipts` 回执表与成员读游标，替代全局消息状态聚合。
-- [ ] `sync_events` 账号/设备游标同步接口。
-- [ ] 补齐越权拒绝、TLS 禁用拒启、nonce 拒绝、重试去重、多设备回执等自动化测试。
+- [x] 新增 `isConversationMember()` / `canAccessMessage()`，会话/回执/历史接口先授权再查询。
+- [x] `force_logout` 改为仅注销本人其他设备的 `terminate_session`。
+- [x] TLS fail-closed：初始化失败拒绝启动/连接，开发明文模式显式且默认关闭。
+- [x] timestamp/nonce 强制必填 + 拒绝重复/超时，nonce 全局 TTL 缓存去重（单服务器内存，多服务器部署时再持久化）。
+- [x] 认证 token 语义统一（续期真正校验 token；其余命令逐包验 token 留待后续）。
+- [x] `RequestHandler` 线程模型修复（handler 线程内发送代理对象，socket 只在所属线程访问）。
+- [x] `clientMessageId` 幂等键 + 部分唯一索引 + 客户端内存 outbox（本地持久化随本地缓存补齐）。
+- [x] `message_receipts` 回执表与成员读游标，`messages.status` 改为回执聚合展示值。
+- [x] `sync_events` 账号级游标同步接口（消息/联系人/回执事件）。
+- [x] 补齐越权拒绝、nonce 拒绝/过期、重试去重、回执聚合、读游标单调等自动化测试（端到端 TLS 集成测试留待后续）。

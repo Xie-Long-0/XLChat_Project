@@ -42,6 +42,16 @@ private slots:
     void unreadCountWorks();
     void markMessagesAsRead();
 
+    // M5.5 安全加固测试
+    void v4TablesExist();
+    void sessionByIdContainsTokenHash();
+    void conversationMembershipAuthorization();
+    void messageAccessAuthorization();
+    void clientMessageIdDeduplicates();
+    void receiptsAggregatePerRecipient();
+    void readCursorOnlyMovesForward();
+    void syncEventsCursorWorks();
+
 private:
     DatabaseManager *m_db = nullptr;
     QString m_connectionName;
@@ -94,6 +104,188 @@ void TestDatabaseManager::migrationCreatesAllTables()
     QVERIFY(tables.contains("conversation_members"));
     QVERIFY(tables.contains("messages"));
     QVERIFY(tables.contains("schema_version"));
+}
+
+// ── M5.5 ────────────────────────────────────────────────────────────────
+void TestDatabaseManager::v4TablesExist()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    QVERIFY(q.exec("SELECT name FROM sqlite_master WHERE type='table'"));
+    QStringList tables;
+    while (q.next()) {
+        tables << q.value(0).toString();
+    }
+    QVERIFY(tables.contains("message_receipts"));
+    QVERIFY(tables.contains("sync_events"));
+}
+
+void TestDatabaseManager::sessionByIdContainsTokenHash()
+{
+    auto user = m_db->getUserByUsername("testuser");
+    QVERIFY(user.has_value());
+
+    const qint64 sid = m_db->createSession(user->id, "dev-renew",
+                                           "tokenhash-renew", "127.0.0.1");
+    QVERIFY(sid > 0);
+
+    auto session = m_db->getSessionById(sid);
+    QVERIFY(session.has_value());
+    QCOMPARE(session->tokenHash, QString("tokenhash-renew"));
+    QCOMPARE(session->deviceId, QString("dev-renew"));
+}
+
+void TestDatabaseManager::conversationMembershipAuthorization()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    // 局外用户
+    const qint64 outsiderId = m_db->registerUser("outsider", "", "", "hash3");
+    QVERIFY(outsiderId > 0);
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    QVERIFY(convId > 0);
+
+    // 成员可访问，非成员被拒绝
+    QVERIFY(m_db->isConversationMember(convId, user1->id));
+    QVERIFY(m_db->isConversationMember(convId, user2->id));
+    QVERIFY(!m_db->isConversationMember(convId, outsiderId));
+}
+
+void TestDatabaseManager::messageAccessAuthorization()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 msgId = m_db->sendMessage(convId, user1->id, "auth check msg");
+    QVERIFY(msgId > 0);
+
+    QVERIFY(m_db->canAccessMessage(msgId, user1->id));
+    QVERIFY(m_db->canAccessMessage(msgId, user2->id));
+    QVERIFY(!m_db->canAccessMessage(msgId, outsider->id));
+}
+
+void TestDatabaseManager::clientMessageIdDeduplicates()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+
+    // 首次发送
+    const qint64 first = m_db->sendMessage(convId, user1->id, "retry-safe",
+                                           "text", "client-key-1", "deviceA");
+    QVERIFY(first > 0);
+
+    // 同一设备重试相同幂等键：返回同一消息，不重复写入
+    const qint64 retry = m_db->sendMessage(convId, user1->id, "retry-safe",
+                                           "text", "client-key-1", "deviceA");
+    QCOMPARE(retry, first);
+
+    // 不同设备相同幂等键视为不同消息
+    const qint64 otherDevice = m_db->sendMessage(convId, user1->id, "other device",
+                                                 "text", "client-key-1", "deviceB");
+    QVERIFY(otherDevice > 0);
+    QVERIFY(otherDevice != first);
+
+    auto byKey = m_db->getMessageByClientKey(user1->id, "deviceA", "client-key-1");
+    QVERIFY(byKey.has_value());
+    QCOMPARE(byKey->id, first);
+}
+
+void TestDatabaseManager::receiptsAggregatePerRecipient()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 msgId = m_db->sendMessage(convId, user1->id, "receipt test");
+    QVERIFY(msgId > 0);
+
+    QCOMPARE(m_db->receiptCount(msgId, "delivered"), 0);
+    QCOMPARE(m_db->receiptCount(msgId, "read"), 0);
+
+    // user2 的两台设备先后送达
+    QVERIFY(m_db->recordMessageReceipt(msgId, user2->id, "dev1", "delivered"));
+    QVERIFY(m_db->recordMessageReceipt(msgId, user2->id, "dev2", "delivered"));
+    QCOMPARE(m_db->receiptCount(msgId, "delivered"), 2);
+    QCOMPARE(m_db->receiptCount(msgId, "read"), 0);
+
+    // 其中一台已读
+    QVERIFY(m_db->recordMessageReceipt(msgId, user2->id, "dev1", "read"));
+    QCOMPARE(m_db->receiptCount(msgId, "read"), 1);
+
+    // 重复回执不重复计数
+    QVERIFY(m_db->recordMessageReceipt(msgId, user2->id, "dev1", "read"));
+    QCOMPARE(m_db->receiptCount(msgId, "read"), 1);
+
+    // 非法状态被拒绝
+    QVERIFY(!m_db->recordMessageReceipt(msgId, user2->id, "dev1", "bogus"));
+}
+
+void TestDatabaseManager::readCursorOnlyMovesForward()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 m1 = m_db->sendMessage(convId, user1->id, "cursor msg 1");
+    const qint64 m2 = m_db->sendMessage(convId, user1->id, "cursor msg 2");
+    QVERIFY(m2 > m1);
+
+    QVERIFY(m_db->updateMemberReadCursor(convId, user2->id, m2));
+    // 回退到更早的消息不应生效
+    QVERIFY(m_db->updateMemberReadCursor(convId, user2->id, m1));
+
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT last_read_message_id FROM conversation_members "
+              "WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(convId);
+    q.addBindValue(user2->id);
+    QVERIFY(q.exec() && q.next());
+    QCOMPARE(q.value(0).toLongLong(), m2);
+}
+
+void TestDatabaseManager::syncEventsCursorWorks()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    QVERIFY(m_db->appendSyncEvent(user1->id, "message", "{\"a\":1}") > 0);
+    QVERIFY(m_db->appendSyncEvent(user1->id, "receipt", "{\"b\":2}") > 0);
+    // 他人事件不可见
+    QVERIFY(m_db->appendSyncEvent(user2->id, "message", "{\"c\":3}") > 0);
+
+    auto all = m_db->getSyncEvents(user1->id, 0);
+    QCOMPARE(all.size(), 2);
+    QCOMPARE(all[0].eventType, QString("message"));
+    QCOMPARE(all[1].eventType, QString("receipt"));
+    QVERIFY(all[1].seq > all[0].seq);
+
+    // 游标之后无新事件
+    auto none = m_db->getSyncEvents(user1->id, all.last().seq);
+    QCOMPARE(none.size(), 0);
+
+    // limit 生效
+    auto limited = m_db->getSyncEvents(user1->id, 0, 1);
+    QCOMPARE(limited.size(), 1);
 }
 
 // ── 用户管理 ─────────────────────────────────────────────────────────────────

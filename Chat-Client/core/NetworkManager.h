@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QVariant>
+#include <QHash>
 
 #include "protocol/PacketCodec.h"
 
@@ -49,6 +50,8 @@ public:
     Q_INVOKABLE void sendMessage(qint64 toUserId, const QString &content);
     Q_INVOKABLE void ackMessage(qint64 messageId, const QString &status = "delivered");
     Q_INVOKABLE void syncMessages(qint64 conversationId, qint64 afterId = 0, int limit = 100);
+    // M5.5: 账号级增量同步
+    Q_INVOKABLE void syncEvents(qint64 afterSeq = 0, int limit = 200);
 
     // 状态查询
     ConnectionState state() const { return m_state; }
@@ -77,6 +80,9 @@ signals:
     void newMessageReceived(const QJsonObject &message);
     void messagesSynced(qint64 conversationId, const QJsonArray &messages, bool hasMore);
     void messageAcked(qint64 messageId);
+    // M5.5
+    void messageStatusChanged(qint64 messageId, const QString &status);
+    void eventsSynced(const QJsonArray &events, qint64 lastSeq, bool hasMore);
 
 private slots:
     void onConnected();
@@ -105,12 +111,17 @@ private:
     void handleAckMessageResponse(const XYChat::Protocol::Packet &packet);
     void handleSyncMessagesResponse(const XYChat::Protocol::Packet &packet);
     void handleNewMessageNotification(const XYChat::Protocol::Packet &packet);
+    // M5.5
+    void handleMessageStatusUpdate(const XYChat::Protocol::Packet &packet);
+    void handleSyncEventsResponse(const XYChat::Protocol::Packet &packet);
     void sendPacket(const XYChat::Protocol::Packet &packet);
     quint64 nextRequestId();
     void setState(ConnectionState state);
     void resetAuthState();
     // M5: 重放保护辅助
     void addReplayProtection(QJsonObject &json);
+    // M5.5: outbox 重发
+    void flushOutbox();
 
 private:
     QSslSocket *m_sslSocket;
@@ -143,7 +154,20 @@ private:
     quint64 m_pendingAddContactRequestId = 0;
     quint64 m_pendingGetContactsRequestId = 0;
     quint64 m_pendingGetConversationsRequestId = 0;
-    quint64 m_pendingSendMessageRequestId = 0;
     quint64 m_pendingAckMessageRequestId = 0;
     quint64 m_pendingSyncMessagesRequestId = 0;
+
+    // M5.5: TLS fail-closed 标记（CA 缺失且未显式允许明文时拒绝连接）
+    bool m_tlsUnavailable = false;
+    quint64 m_pendingSyncEventsRequestId = 0;
+
+    // M5.5: 发送幂等与离线 outbox
+    struct OutboxItem
+    {
+        QString clientMessageId;
+        qint64 toUserId = 0;
+        QString content;
+    };
+    QList<OutboxItem> m_outbox;
+    QHash<quint64, QString> m_pendingSendByRequestId; // requestId -> clientMessageId
 };

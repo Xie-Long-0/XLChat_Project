@@ -8,6 +8,7 @@
 #include <QSslConfiguration>
 #include <QFile>
 #include <QDir>
+#include <QSet>
 #include <QCoreApplication>
 #include <QStandardPaths>
 
@@ -137,6 +138,9 @@ void NetworkManager::onDisconnected()
     m_heartbeatTimer->stop();
     m_codec.reset();
     m_pendingLoginRequestId = 0;
+    // M5.5: 在途发送请求随连接丢失，清除映射，
+    // 重新登录后由 outbox 以相同幂等键重发（服务端去重）
+    m_pendingSendByRequestId.clear();
     setState(ConnectionState::Disconnected);
 
     if (shouldRelogin) {
@@ -224,6 +228,29 @@ void NetworkManager::connectToServer()
         return;
     }
 
+    // M5.5: fail-closed —— TLS 不可用时拒绝连接，
+    // 除非显式设置环境变量 XYCHAT_ALLOW_PLAINTEXT=1（仅限开发）
+    if (!m_tlsEnabled) {
+        if (qEnvironmentVariable("XYCHAT_ALLOW_PLAINTEXT") == "1") {
+            qWarning() << "[NetMgr] Connecting in PLAINTEXT development mode."
+                       << "Do not use in production.";
+        } else {
+            const QString err = QStringLiteral(
+                "TLS unavailable: CA certificate not found. "
+                "Refusing plaintext connection (set XYCHAT_ALLOW_PLAINTEXT=1 for development only).");
+            qCritical() << "[NetMgr]" << err;
+            m_reconnectEnabled = false;
+            if (m_loginQueued) {
+                m_loginQueued = false;
+                emit loginFailed(err);
+            } else if (m_registerQueued) {
+                m_registerQueued = false;
+                emit registerFailed(err);
+            }
+            return;
+        }
+    }
+
     setState(ConnectionState::Connecting);
     if (m_tlsEnabled) {
         m_sslSocket->connectToHostEncrypted("127.0.0.1", 12345);
@@ -254,13 +281,15 @@ void NetworkManager::initTls()
     }
 
     if (caCertPath.isEmpty()) {
-        qWarning() << "[NetMgr] CA certificate not found, TLS disabled";
+        qWarning() << "[NetMgr] CA certificate not found, TLS disabled (fail-closed on connect)";
+        m_tlsUnavailable = true;
         return;
     }
 
     TlsHelper::TlsConfig config = TlsHelper::loadClientConfig(caCertPath);
     if (!config.valid) {
-        qWarning() << "[NetMgr] Failed to load CA certificate, TLS disabled";
+        qWarning() << "[NetMgr] Failed to load CA certificate, TLS disabled (fail-closed on connect)";
+        m_tlsUnavailable = true;
         return;
     }
 
@@ -359,6 +388,13 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::NewMessageNotification:
         handleNewMessageNotification(packet);
         break;
+    // M5.5
+    case MessageType::MessageStatusUpdate:
+        handleMessageStatusUpdate(packet);
+        break;
+    case MessageType::SyncEventsResponse:
+        handleSyncEventsResponse(packet);
+        break;
     case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
@@ -392,6 +428,8 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         setState(ConnectionState::Authenticated);
         emit sessionChanged();
         emit loginSuccessful();
+        // M5.5: 登录成功后重发 outbox 中未确认的消息（幂等键保证不重复）
+        flushOutbox();
         return;
     }
 
@@ -569,21 +607,52 @@ void NetworkManager::getConversations()
 // ── M3: 发送消息 ───────────────────────────────────────────────────────────
 void NetworkManager::sendMessage(qint64 toUserId, const QString &content)
 {
-    if (m_state != ConnectionState::Authenticated) return;
+    if (m_state != ConnectionState::Authenticated) {
+        // M5.5: 未认证时进入 outbox，登录成功后自动重发
+        m_outbox.append({QUuid::createUuid().toString(QUuid::WithoutBraces), toUserId, content});
+        return;
+    }
 
-    QJsonObject json;
-    json["type"] = "send_message";
-    json["toUserId"] = toUserId;
-    json["content"] = content;
-    json["contentType"] = "text";
-    addReplayProtection(json);
+    // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
+    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_outbox.append({clientMessageId, toUserId, content});
+    flushOutbox();
+}
 
-    Packet packet;
-    packet.messageType = MessageType::SendMessageRequest;
-    packet.requestId = nextRequestId();
-    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    m_pendingSendMessageRequestId = packet.requestId;
-    sendPacket(packet);
+// M5.5: 将 outbox 中未确认的消息逐条发送（同一 clientMessageId 只保留一份）
+void NetworkManager::flushOutbox()
+{
+    if (m_state != ConnectionState::Authenticated) {
+        return;
+    }
+
+    // 已在途的 clientMessageId 不重复发
+    QSet<QString> inFlight;
+    for (auto it = m_pendingSendByRequestId.constBegin();
+         it != m_pendingSendByRequestId.constEnd(); ++it) {
+        inFlight.insert(it.value());
+    }
+
+    for (const OutboxItem &item : std::as_const(m_outbox)) {
+        if (inFlight.contains(item.clientMessageId)) {
+            continue;
+        }
+
+        QJsonObject json;
+        json["type"] = "send_message";
+        json["toUserId"] = item.toUserId;
+        json["content"] = item.content;
+        json["contentType"] = "text";
+        json["clientMessageId"] = item.clientMessageId;
+        addReplayProtection(json);
+
+        Packet packet;
+        packet.messageType = MessageType::SendMessageRequest;
+        packet.requestId = nextRequestId();
+        packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+        m_pendingSendByRequestId.insert(packet.requestId, item.clientMessageId);
+        sendPacket(packet);
+    }
 }
 
 // ── M3: 确认消息 ───────────────────────────────────────────────────────────
@@ -672,13 +741,23 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
 
 void NetworkManager::handleSendMessageResponse(const Packet &packet)
 {
-    if (packet.requestId != m_pendingSendMessageRequestId) return;
-    m_pendingSendMessageRequestId = 0;
+    auto it = m_pendingSendByRequestId.constFind(packet.requestId);
+    if (it == m_pendingSendByRequestId.constEnd()) return;
+    const QString clientMessageId = it.value();
+    m_pendingSendByRequestId.erase(it);
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     const int code = response.value("code").toInt();
     if (code == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
+        // 确认后从 outbox 移除（以服务端回传的幂等键为准）
+        const QString ackedId = data.value("clientMessageId").toString(clientMessageId);
+        for (int i = 0; i < m_outbox.size(); ++i) {
+            if (m_outbox.at(i).clientMessageId == ackedId) {
+                m_outbox.removeAt(i);
+                break;
+            }
+        }
         emit messageSent(data.value("messageId").toVariant().toLongLong(),
                          data.value("conversationId").toVariant().toLongLong());
     } else {
@@ -721,6 +800,51 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
     if (msgId > 0) {
         ackMessage(msgId, "delivered");
+    }
+}
+
+// ── M5.5: 消息状态更新推送 ─────────────────────────────────────
+void NetworkManager::handleMessageStatusUpdate(const Packet &packet)
+{
+    const QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
+    const QString status = msg.value("status").toString();
+    if (msgId > 0 && !status.isEmpty()) {
+        emit messageStatusChanged(msgId, status);
+    }
+}
+
+// ── M5.5: 账号级增量同步 ───────────────────────────────────────
+void NetworkManager::syncEvents(qint64 afterSeq, int limit)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "sync_events";
+    json["afterSeq"] = afterSeq;
+    json["limit"] = limit;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::SyncEventsRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingSyncEventsRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::handleSyncEventsResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingSyncEventsRequestId) return;
+    m_pendingSyncEventsRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        const QJsonObject data = response.value("data").toObject();
+        emit eventsSynced(
+            data.value("events").toArray(),
+            data.value("lastSeq").toVariant().toLongLong(),
+            data.value("hasMore").toBool());
     }
 }
 

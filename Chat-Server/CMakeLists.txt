@@ -26,6 +26,7 @@ set(SOURCES
     main.cpp
     core/Server.cpp
     core/RequestHandler.cpp
+    core/NonceCache.cpp
     database/DatabaseManager.cpp
 )
 
@@ -33,6 +34,7 @@ set(SOURCES
 set(HEADERS
     core/Server.h
     core/RequestHandler.h
+    core/NonceCache.h
     database/DatabaseManager.h
 )
 
