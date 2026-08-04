@@ -352,7 +352,7 @@ Rectangle {
         }
     }
 
-    // ── 会话操作 ───────────────────────────────────────────────────
+    // ── 会话操作 ──
     // 打开一个既有会话
     function openConversation(conv) {
         currentConversationId = conv.conversationId

@@ -48,7 +48,7 @@ Rectangle {
             id: themeToggleBtn
             height: parent.height
             width: height * 1.5
-            text: Theme.darkMode ? "\u2600\uFE0F" : "🌑"
+            text: Theme.darkMode ? "☀️" : "🌑"
             font.pixelSize: 16
             padding: 0
             background: Rectangle {

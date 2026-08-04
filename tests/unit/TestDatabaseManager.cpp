@@ -82,7 +82,7 @@ void TestDatabaseManager::cleanupTestCase()
     QSqlDatabase::removeDatabase(m_connectionName);
 }
 
-// ── 迁移 ─────────────────────────────────────────────────────────────────────
+// ── 迁移 ──
 void TestDatabaseManager::migrationCreatesAllTables()
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -106,7 +106,6 @@ void TestDatabaseManager::migrationCreatesAllTables()
     QVERIFY(tables.contains("schema_version"));
 }
 
-// ── M5.5 ────────────────────────────────────────────────────────────────
 void TestDatabaseManager::v4TablesExist()
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -288,7 +287,7 @@ void TestDatabaseManager::syncEventsCursorWorks()
     QCOMPARE(limited.size(), 1);
 }
 
-// ── 用户管理 ─────────────────────────────────────────────────────────────────
+// ── 用户管理 ──
 void TestDatabaseManager::registerAndRetrieveUser()
 {
     const qint64 id = m_db->registerUser(
@@ -319,7 +318,7 @@ void TestDatabaseManager::userExistsReturnsCorrectly()
     QVERIFY(!m_db->userExists("nonexistent"));
 }
 
-// ── Session ──────────────────────────────────────────────────────────────────
+// ── Session ──
 void TestDatabaseManager::createAndRetrieveSession()
 {
     auto user = m_db->getUserByUsername("testuser");
@@ -367,7 +366,7 @@ void TestDatabaseManager::sessionExpiryIsSet()
     QVERIFY(!session->expiresAt.isEmpty());
 }
 
-// ── 登录审计 ─────────────────────────────────────────────────────────────────
+// ── 登录审计 ──
 void TestDatabaseManager::recordAndCountFailedLogins()
 {
     auto user = m_db->getUserByUsername("testuser");
@@ -390,7 +389,7 @@ void TestDatabaseManager::recordAndCountFailedLogins()
     QCOMPARE(m_db->recentFailedLoginCount("192.168.1.1"), 3);
 }
 
-// ── 设备管理 ─────────────────────────────────────────────────────────────────
+// ── 设备管理 ──
 void TestDatabaseManager::registerAndListDevices()
 {
     auto user = m_db->getUserByUsername("testuser");
@@ -411,7 +410,7 @@ void TestDatabaseManager::registerAndListDevices()
     QCOMPARE(devices.size(), 1);
 }
 
-// ── M3 联系人 ─────────────────────────────────────────────────────────────────
+// ── 联系人 ──
 void TestDatabaseManager::addAndListContacts()
 {
     // 注册第二个用户
@@ -446,7 +445,7 @@ void TestDatabaseManager::contactIsBidirectional()
     QVERIFY(m_db->isContact(user2->id, user1->id));
 }
 
-// ── M3 会话与消息 ───────────────────────────────────────────────────────────
+// ── M3 会话与消息 ──
 void TestDatabaseManager::createPrivateConversation()
 {
     auto user1 = m_db->getUserByUsername("testuser");

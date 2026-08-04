@@ -25,7 +25,7 @@ private slots:
     void hashTokenIsDeterministic();
 };
 
-// ── M1 兼容 ──────────────────────────────────────────────────────────────────
+// ── M1 兼容 ──
 void TestEncryptionManager::sha256DigestIsStable()
 {
     QCOMPARE(EncryptionManager::encryptPassword("passwd"),
@@ -39,7 +39,7 @@ void TestEncryptionManager::sha256DigestLengthIsHexEncoded()
     QVERIFY(digest.contains(QRegularExpression("^[0-9a-f]{64}$")));
 }
 
-// ── M2 PBKDF2 ────────────────────────────────────────────────────────────────
+// ── PBKDF2 ──
 void TestEncryptionManager::pbkdf2HashProducesValidFormat()
 {
     const QString hash = EncryptionManager::hashPasswordWithSalt("test-password");
@@ -84,7 +84,7 @@ void TestEncryptionManager::pbkdf2RejectInvalidStoredHash()
     QVERIFY(!EncryptionManager::verifyPassword("password", "v1:0:aa:bb"));
 }
 
-// ── M2 Token ─────────────────────────────────────────────────────────────────
+// ── Token ──
 void TestEncryptionManager::generateTokenReturnsHex()
 {
     const QString token = EncryptionManager::generateToken();

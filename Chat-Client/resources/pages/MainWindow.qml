@@ -89,7 +89,7 @@ Window {
         }
     }
 
-    // ── NetworkManager 聊天信号连接 ──────────────────────────────
+    // ── NetworkManager 聊天信号连接 ──
     Connections {
         target: networkManager
 

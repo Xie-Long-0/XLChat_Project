@@ -67,8 +67,6 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-当前至少包含公共密码摘要模块的 Qt Test 单元测试，用作 M0 阶段的基础测试安全网。
-
 ## 开发约定
 
 - C++ 标准统一为 C++20。

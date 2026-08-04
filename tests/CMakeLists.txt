@@ -11,7 +11,7 @@ set(OPENSSL_RUNTIME_DLLS
     ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
 )
 
-# ── TestEncryptionManager ────────────────────────────────────────────────────
+# ── TestEncryptionManager ──
 add_executable(TestEncryptionManager
     unit/TestEncryptionManager.cpp
 )
@@ -29,7 +29,7 @@ add_custom_command(TARGET TestEncryptionManager POST_BUILD
         $<TARGET_FILE_DIR:TestEncryptionManager>
 )
 
-# ── TestPacketCodec ──────────────────────────────────────────────────────────
+# ── TestPacketCodec ──
 add_executable(TestPacketCodec
     unit/TestPacketCodec.cpp
 )
@@ -41,7 +41,7 @@ target_link_libraries(TestPacketCodec PRIVATE
 
 add_test(NAME TestPacketCodec COMMAND TestPacketCodec)
 
-# ── TestDatabaseManager ──────────────────────────────────────────────────────
+# ── TestDatabaseManager ──
 add_executable(TestDatabaseManager
     unit/TestDatabaseManager.cpp
     ${CMAKE_SOURCE_DIR}/Chat-Server/database/DatabaseManager.cpp
@@ -67,7 +67,7 @@ add_custom_command(TARGET TestDatabaseManager POST_BUILD
         $<TARGET_FILE_DIR:TestDatabaseManager>
 )
 
-# ── TestSecurity (M5) ────────────────────────────────────────────────────────────
+# ── TestSecurity (M5) ──
 add_executable(TestSecurity
     unit/TestSecurity.cpp
     # M5.5: NonceCache 重放保护组件（服务端 core）
