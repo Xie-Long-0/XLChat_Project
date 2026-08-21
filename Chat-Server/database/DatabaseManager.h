@@ -43,7 +43,7 @@ struct ContactInfo
 struct ConversationInfo
 {
     qint64 id = 0;
-    QString type; // "private"
+    QString type; // "private" / "group"
     QString createdAt;
     QString updatedAt;
     // 对于一对一会话，记录对方信息
@@ -53,6 +53,9 @@ struct ConversationInfo
     qint64 lastMessageId = 0;
     QString lastMessageAt;
     int unreadCount = 0;
+    // M7a: 群聊会话信息（private 会话 name 为空、memberCount 为 0）
+    QString name;
+    int memberCount = 0;
 };
 
 struct MessageInfo
@@ -201,6 +204,23 @@ public:
     // 删除设备全部密钥材料（身份密钥 + 预密钥）
     bool removeDeviceKeys(qint64 userId, const QString &deviceId);
 
+    // M7a: 群组管理（仅数据访问，成员存在性与权限校验由调用方负责）
+    // 事务内创建 group 会话：写入创建者（role=owner）与初始成员（role=member，
+    // 自动去重、剔除创建者自身、按成员上限截断）；失败返回 -1
+    qint64 createGroup(qint64 ownerId, const QString &name, const QList<qint64> &memberIds);
+    // 批量加入成员，已在群中的用户跳过；数据库错误返回 false
+    bool addGroupMembers(qint64 conversationId, const QList<qint64> &userIds);
+    bool removeGroupMember(qint64 conversationId, qint64 userId);
+    bool updateMemberRole(qint64 conversationId, qint64 userId, const QString &role);
+    // 成员角色："owner" / "admin" / "member"，非成员返回空串
+    QString groupRole(qint64 conversationId, qint64 userId);
+    QList<QJsonObject> getGroupMembers(qint64 conversationId);
+    bool setGroupName(qint64 conversationId, const QString &name);
+
+    // M7a: 群组规模约束（供数据层与业务层统一引用）
+    static constexpr int MaxGroupMembers = 200;  // 单群成员上限
+    static constexpr int MaxInviteBatch = 100;   // 单次邀请批量上限
+
     // 手动事务包装（供调用方将多个写操作绑定为原子单元）
     bool beginTransaction();
     bool commitTransaction();
@@ -216,6 +236,10 @@ private:
     bool migrateToV4();
     bool migrateToV5();
     bool migrateToV6();
+    bool migrateToV7();
+
+    // M7a: 插入单个会话成员（供 createGroup/addGroupMembers 复用）
+    bool insertMember(qint64 conversationId, qint64 userId, const QString &role);
 
     QString m_connectionName;
 };

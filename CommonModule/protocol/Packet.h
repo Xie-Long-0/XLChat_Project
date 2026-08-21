@@ -54,6 +54,18 @@ enum class MessageType : quint16
     RegisterKeysResponse = 51,
     FetchKeysRequest = 52,
     FetchKeysResponse = 53,
+    // M7a - 明文群聊
+    CreateGroupRequest = 60,
+    CreateGroupResponse = 61,
+    InviteGroupMembersRequest = 62,
+    InviteGroupMembersResponse = 63,
+    LeaveGroupRequest = 64,
+    LeaveGroupResponse = 65,
+    KickGroupMemberRequest = 66,
+    KickGroupMemberResponse = 67,
+    GetGroupInfoRequest = 68,
+    GetGroupInfoResponse = 69,
+    GroupChangedNotification = 70, // 服务端推送：群成员变更/系统消息通知
 };
 
 enum class ErrorCode : int
@@ -81,6 +93,11 @@ enum class ErrorCode : int
     // M6: 端到端加密相关
     KeyBundleUnavailable = 3007,   // 对方无可用设备或预密钥耗尽
     E2eeInvalidEnvelope = 3008,    // 消息密文 envelope 非法
+    // M7a: 群组相关
+    GroupLimitExceeded = 3009,     // 群数量或成员数超限
+    MemberAlreadyExists = 3010,    // 被邀请者已在群中
+    MemberNotFound = 3011,         // 目标不是群成员
+    NotGroupOwner = 3012,          // 仅群主可执行的管理操作
     // 9xxx: 系统相关
     Timeout = 9001,
     InternalError = 9002,

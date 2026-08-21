@@ -1,6 +1,6 @@
 # XYChat 安全文档
 
-## 当前安全状态（M6.5 完成后）
+## 当前安全状态（M7a 子任务一完成后）
 
 ### 端到端加密（M6）
 
@@ -84,7 +84,7 @@
 
 ### 数据库安全
 
-- 数据库使用版本化迁移机制（`schema_version` 表，当前 V6），禁止隐式 schema 变更。
+- 数据库使用版本化迁移机制（`schema_version` 表，当前 V7），禁止隐式 schema 变更；V7（M7a）仅新增 `conversations.name` 与 `conversation_members.role` 两列，存量数据不受影响。
 - 每个线程使用独立数据库连接名，避免多线程竞争；写并发启用 5 秒 busy timeout。
 - 表结构：`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`、`conversation_members`、`messages`、`message_receipts`、`sync_events`；M6 新增 `device_identity_keys`（仅存身份公钥）、`prekeys`（仅存预密钥公钥，服务端不接触任何私钥）。
 - Session 表存储 token 哈希而非明文。
@@ -101,7 +101,7 @@
 
 - 开发环境使用自签证书，生产环境必须替换为正式 CA 证书。
 - Session token 当前通过 handler 内存状态验证，除续期外未逐包校验。
-- 群聊与媒体消息尚未 E2EE（M7/M8），服务端仍可见其明文。
+- 群聊与媒体消息尚未 E2EE（M7b/M8），服务端仍可见其明文；M7a 明文群聊当前仅完成协议定义与服务端数据模型（子任务一），业务功能未上线。
 - 设备信任为 TOFU，首次通信无法抵抗服务端中间人；需后续引入安全码带外验证。
 - 客户端私钥文件在非 Windows 平台为明文存储（仅 Windows 有 DPAPI 保护）；LocalStore 存储密钥与解密缓存同受此限制。
 - 本地缓存（M6.5）含经存储密钥加密的消息明文，拥有本机用户权限者可经 DPAPI 还原后读取，与主流 IM 本地存储模型一致。

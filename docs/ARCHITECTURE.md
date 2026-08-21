@@ -1,6 +1,6 @@
 # XYChat 架构概览
 
-> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新；2026-08-21 完成 M6.5（本地持久化缓存与持久化 outbox，含代码审查修复）后再次更新。
+> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新；2026-08-21 完成 M6.5（本地持久化缓存与持久化 outbox，含代码审查修复）后再次更新；同日完成 M7a 子任务一（群聊协议定义与服务端数据模型，数据库迁移至 V7）后再次更新。
 
 ## 当前组件（M6.5 完成后）
 
@@ -19,7 +19,7 @@ TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书
   - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）；
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）。
 - `docs`：路线图、协议、安全和架构说明。
-- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager、Security、LocalStore）。
+- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层与 V7 迁移）、Security、LocalStore）。
 
 ## 服务端运行模型
 
@@ -94,7 +94,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 日志脱敏；敏感内存清零。
 - **限制**：nonce 缓存为单服务器内存（重启清空）；群聊/媒体消息尚未 E2EE（M7/M8）。
 
-## 数据库 Schema（V6，M6 迁移）
+## 数据库 Schema（V7，M7a 迁移）
 
 - `schema_version`：数据库迁移版本控制
 - `users`：用户基础信息（username, email, phone, password_hash）
@@ -102,8 +102,8 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - `sessions`：登录会话（token_hash, login_ip, expires_at, last_active_at）
 - `login_audit`：登录审计日志（ip_address, success, failure_reason）
 - `contacts`：联系人关系（双向记录）
-- `conversations`：会话信息（type, updated_at）
-- `conversation_members`：会话成员（conversation_id, user_id, last_read_message_id，读游标只前进）
+- `conversations`：会话信息（type, updated_at；M7a 新增 `name` 群名列，private 会话为 NULL）
+- `conversation_members`：会话成员（conversation_id, user_id, last_read_message_id，读游标只前进；M7a 新增 `role` 成员角色列，取值 owner/admin/member，存量行默认 member）
 - `messages`：消息主体（conversation_id, sender_id, content, status, created_at, client_message_id, sender_device_id）——M6 起新消息正文为 E2EE envelope 密文，存量旧消息为明文
 - `message_receipts`（V4 新增）：送达/已读回执（message_id, user_id, device_id, delivered_at, read_at，UNIQUE(message_id, user_id, device_id)）
 - `sync_events`（V4 新增）：账号级同步事件流（seq 自增, user_id, event_type, payload），索引 (user_id, seq)
@@ -223,4 +223,4 @@ M6 首次实现后经代码审查发现并修复：
 2. **M4.5 已完成**：亮/暗主题切换、CMake Widgets 残留清理、搜索发起对话、乐观发送与状态流转、已读回执、会话列表/聊天对话框交互完善，并经 E2E 验证。
 3. **M6 已完成**：端到端加密一对一聊天（X25519 身份密钥/预密钥、每消息临时密钥、AES-GCM 认证加密、envelope fail-closed、TOFU、历史消息不可恢复），含审查后修复（见上表）。
 4. **M6.5 已完成**：客户端本地加密持久化缓存与持久化 outbox（`LocalStore`），重启后历史消息即刻可见、未发送消息不丢失，登出清除本地数据，含审查后修复（见上表）。
-5. **M7+**：群聊（M7a 明文群聊 → M7b Sender Keys 群 E2EE）、媒体、搜索与通知、设备信任带外验证与密钥备份策略。
+5. **M7+**：群聊（M7a 明文群聊拆三期：子任务一协议/数据模型已完成，子任务二业务处理器与 fan-out、子任务三客户端 UI；随后 M7b Sender Keys 群 E2EE）、媒体、搜索与通知、设备信任带外验证与密钥备份策略。

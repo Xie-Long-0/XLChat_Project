@@ -62,6 +62,14 @@ private slots:
     void removeDeviceClearsKeyMaterial();
     void identityKeyChangePurgesStalePrekeys();
 
+    // M7a 群聊数据层测试
+    void groupMigrationAddsNameAndRoleColumns();
+    void createGroupInsertsOwnerAndMembers();
+    void addGroupMembersSkipsDuplicates();
+    void removeGroupMemberDeletesRow();
+    void groupRoleReportsOwnershipAndNonMember();
+    void getConversationsForUserIncludesGroupWithNameAndMemberCount();
+
 private:
     DatabaseManager *m_db = nullptr;
     QString m_connectionName;
@@ -711,6 +719,216 @@ void TestDatabaseManager::identityKeyChangePurgesStalePrekeys()
     // 新世代预密钥正常工作
     QCOMPARE(m_db->uploadPrekeys(userId, "dev-r", {"gen2-pk1"}), 1);
     QCOMPARE(m_db->claimPrekeys(userId).size(), 1);
+}
+
+// M7a: 群聊数据层
+void TestDatabaseManager::groupMigrationAddsNameAndRoleColumns()
+{
+    // 主库：V7 列已存在
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    QVERIFY(q.exec("PRAGMA table_info(conversations)"));
+    QStringList convCols;
+    while (q.next()) {
+        convCols << q.value(1).toString();
+    }
+    QVERIFY(convCols.contains("name"));
+
+    QVERIFY(q.exec("PRAGMA table_info(conversation_members)"));
+    QStringList memberCols;
+    while (q.next()) {
+        memberCols << q.value(1).toString();
+    }
+    QVERIFY(memberCols.contains("role"));
+
+    // 模拟 V6 旧库：迁移后补齐列且存量数据完好
+    const QString legacyConn = QString("test_v7_%1").arg(QDateTime::currentMSecsSinceEpoch());
+    {
+        QSqlDatabase legacy = QSqlDatabase::addDatabase("QSQLITE", legacyConn);
+        legacy.setDatabaseName(":memory:");
+        QVERIFY(legacy.open());
+        QSqlQuery lq(legacy);
+        QVERIFY(lq.exec(
+            "CREATE TABLE schema_version ("
+            "  version INTEGER PRIMARY KEY,"
+            "  applied_at TEXT NOT NULL DEFAULT (datetime('now')))"));
+        QVERIFY(lq.exec("INSERT INTO schema_version (version) VALUES (6)"));
+        QVERIFY(lq.exec(
+            "CREATE TABLE conversations ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  type TEXT NOT NULL DEFAULT 'private',"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  updated_at TEXT NOT NULL DEFAULT (datetime('now')))"));
+        QVERIFY(lq.exec(
+            "CREATE TABLE conversation_members ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  conversation_id INTEGER NOT NULL,"
+            "  user_id INTEGER NOT NULL,"
+            "  joined_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  last_read_message_id INTEGER DEFAULT 0,"
+            "  UNIQUE(conversation_id, user_id))"));
+        QVERIFY(lq.exec("INSERT INTO conversations (type) VALUES ('private')"));
+        QVERIFY(lq.exec("INSERT INTO conversation_members (conversation_id, user_id) VALUES (1, 1)"));
+    }
+
+    DatabaseManager legacyDb(legacyConn);
+    QVERIFY(legacyDb.initialize());
+
+    QSqlDatabase legacy = QSqlDatabase::database(legacyConn);
+    QSqlQuery check(legacy);
+    QVERIFY(check.exec("PRAGMA table_info(conversations)"));
+    QStringList legacyConvCols;
+    while (check.next()) {
+        legacyConvCols << check.value(1).toString();
+    }
+    QVERIFY(legacyConvCols.contains("name"));
+
+    QVERIFY(check.exec("PRAGMA table_info(conversation_members)"));
+    QStringList legacyMemberCols;
+    while (check.next()) {
+        legacyMemberCols << check.value(1).toString();
+    }
+    QVERIFY(legacyMemberCols.contains("role"));
+
+    // 存量成员数据完好，role 默认 member
+    QVERIFY(check.exec("SELECT role, conversation_id, user_id FROM conversation_members"));
+    QVERIFY(check.next());
+    QCOMPARE(check.value(0).toString(), QString("member"));
+    QCOMPARE(check.value(1).toLongLong(), 1LL);
+    QCOMPARE(check.value(2).toLongLong(), 1LL);
+
+    // 版本号推进到 7
+    QVERIFY(check.exec("SELECT MAX(version) FROM schema_version"));
+    QVERIFY(check.next());
+    QCOMPARE(check.value(0).toInt(), 7);
+}
+
+void TestDatabaseManager::createGroupInsertsOwnerAndMembers()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto member = m_db->getUserByUsername("user2");
+    QVERIFY(owner.has_value());
+    QVERIFY(member.has_value());
+
+    // 重复、创建者自身与非法 ID 被自动过滤
+    const qint64 convId = m_db->createGroup(owner->id, "项目群",
+                                            {member->id, member->id, owner->id, -5});
+    QVERIFY(convId > 0);
+
+    auto conv = m_db->getConversation(convId);
+    QVERIFY(conv.has_value());
+    QCOMPARE(conv->type, QString("group"));
+    QCOMPARE(conv->name, QString("项目群"));
+    QCOMPARE(conv->memberCount, 2);
+
+    QCOMPARE(m_db->getGroupMembers(convId).size(), 2);
+    QCOMPARE(m_db->groupRole(convId, owner->id), QString("owner"));
+    QCOMPARE(m_db->groupRole(convId, member->id), QString("member"));
+
+    // 群名空白、创建者非法被拒绝
+    QCOMPARE(m_db->createGroup(owner->id, "", {}), -1LL);
+    QCOMPARE(m_db->createGroup(owner->id, "   ", {}), -1LL);
+    QCOMPARE(m_db->createGroup(0, "群", {}), -1LL);
+}
+
+void TestDatabaseManager::addGroupMembersSkipsDuplicates()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto member = m_db->getUserByUsername("user2");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(owner.has_value());
+    QVERIFY(member.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->createGroup(owner->id, "邀请群", {member->id});
+    QVERIFY(convId > 0);
+
+    // 已在群中与非法 ID 被跳过，新成员加入成功
+    QVERIFY(m_db->addGroupMembers(convId, {member->id, outsider->id, 0}));
+    QCOMPARE(m_db->getGroupMembers(convId).size(), 3);
+    QCOMPARE(m_db->groupRole(convId, outsider->id), QString("member"));
+
+    // 全部重复的批量邀请：无变化也不报错
+    QVERIFY(m_db->addGroupMembers(convId, {member->id, outsider->id}));
+    QCOMPARE(m_db->getGroupMembers(convId).size(), 3);
+}
+
+void TestDatabaseManager::removeGroupMemberDeletesRow()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(owner.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->createGroup(owner->id, "踢人群", {outsider->id});
+    QVERIFY(convId > 0);
+
+    QVERIFY(m_db->removeGroupMember(convId, outsider->id));
+    QCOMPARE(m_db->groupRole(convId, outsider->id), QString());
+    QCOMPARE(m_db->getGroupMembers(convId).size(), 1);
+
+    // 重复移除返回 false
+    QVERIFY(!m_db->removeGroupMember(convId, outsider->id));
+}
+
+void TestDatabaseManager::groupRoleReportsOwnershipAndNonMember()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto member = m_db->getUserByUsername("user2");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(owner.has_value());
+    QVERIFY(member.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->createGroup(owner->id, "角色群", {member->id});
+    QVERIFY(convId > 0);
+
+    QCOMPARE(m_db->groupRole(convId, owner->id), QString("owner"));
+    QCOMPARE(m_db->groupRole(convId, member->id), QString("member"));
+    QCOMPARE(m_db->groupRole(convId, outsider->id), QString());
+
+    // 角色变更生效；非成员更新失败；非法角色取值被拒绝
+    QVERIFY(m_db->updateMemberRole(convId, member->id, "admin"));
+    QCOMPARE(m_db->groupRole(convId, member->id), QString("admin"));
+    QVERIFY(!m_db->updateMemberRole(convId, outsider->id, "admin"));
+    QVERIFY(!m_db->updateMemberRole(convId, member->id, "superadmin"));
+    QCOMPARE(m_db->groupRole(convId, member->id), QString("admin"));
+}
+
+void TestDatabaseManager::getConversationsForUserIncludesGroupWithNameAndMemberCount()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto member = m_db->getUserByUsername("user2");
+    QVERIFY(owner.has_value());
+    QVERIFY(member.has_value());
+
+    const qint64 groupConvId = m_db->createGroup(owner->id, "列表群", {member->id});
+    QVERIFY(groupConvId > 0);
+
+    // 改群名生效
+    QVERIFY(m_db->setGroupName(groupConvId, "改名后的群"));
+
+    bool groupFound = false;
+    const auto convs = m_db->getConversationsForUser(owner->id);
+    for (const auto &ci : convs) {
+        if (ci.id == groupConvId) {
+            groupFound = true;
+            QCOMPARE(ci.type, QString("group"));
+            QCOMPARE(ci.name, QString("改名后的群"));
+            QCOMPARE(ci.memberCount, 2);
+        } else if (ci.type == "private") {
+            // private 会话不受群聊字段影响
+            QVERIFY(ci.name.isEmpty());
+            QCOMPARE(ci.memberCount, 0);
+        }
+    }
+    QVERIFY(groupFound);
+
+    // setGroupName 拒绝 private 会话与空群名
+    const qint64 privateConvId = m_db->getOrCreatePrivateConversation(owner->id, member->id);
+    QVERIFY(privateConvId > 0);
+    QVERIFY(!m_db->setGroupName(privateConvId, "不是群"));
+    QVERIFY(!m_db->setGroupName(groupConvId, "  "));
 }
 
 QTEST_MAIN(TestDatabaseManager)

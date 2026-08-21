@@ -8,6 +8,7 @@
 #include <QDateTime>
 #include <QStandardPaths>
 #include <QDir>
+#include <QSet>
 
 static const QString DatabasePath = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/XYChat-Server/data/db";
 
@@ -110,6 +111,9 @@ bool DatabaseManager::runMigrations()
     }
     if (currentVersion < 6) {
         if (!migrateToV6()) return false;
+    }
+    if (currentVersion < 7) {
+        if (!migrateToV7()) return false;
     }
 
     return true;
@@ -491,6 +495,56 @@ bool DatabaseManager::migrateToV6()
     }
 
     qDebug() << "[DB] Migration V6 complete";
+    return true;
+}
+
+// V7：M7a 群聊基础列（群名 + 成员角色）
+bool DatabaseManager::migrateToV7()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V7...";
+
+    // conversations.name：群名，存量 private 会话保持 NULL
+    bool hasConvName = false;
+    if (q.exec("PRAGMA table_info(conversations)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "name") {
+                hasConvName = true;
+                break;
+            }
+        }
+    }
+    if (!hasConvName && !q.exec("ALTER TABLE conversations ADD COLUMN name TEXT")) {
+        qCritical() << "[DB] V7: Failed to add conversations.name:" << q.lastError().text();
+        return false;
+    }
+
+    // conversation_members.role：owner / admin / member，存量成员默认 member
+    bool hasMemberRole = false;
+    if (q.exec("PRAGMA table_info(conversation_members)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "role") {
+                hasMemberRole = true;
+                break;
+            }
+        }
+    }
+    if (!hasMemberRole &&
+        !q.exec("ALTER TABLE conversation_members "
+                "ADD COLUMN role TEXT NOT NULL DEFAULT 'member'")) {
+        qCritical() << "[DB] V7: Failed to add conversation_members.role:" << q.lastError().text();
+        return false;
+    }
+
+    q.prepare("INSERT INTO schema_version (version) VALUES (7)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V7: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V7 complete";
     return true;
 }
 
@@ -931,7 +985,7 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
     q.prepare(
         "SELECT c.id, c.type, c.created_at, c.updated_at, "
         "  m.id, m.content, m.created_at, m.sender_id, "
-        "  cm.last_read_message_id "
+        "  cm.last_read_message_id, c.name "
         "FROM conversation_members cm "
         "JOIN conversations c ON cm.conversation_id = c.id "
         "LEFT JOIN messages m ON m.id = ("
@@ -950,6 +1004,8 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
             ci.lastMessageId = q.value(4).toLongLong();
             ci.lastMessage = q.value(5).toString();
             ci.lastMessageAt = q.value(6).toString();
+            // M7a: 群名（private 会话为 NULL，toString 得空串）
+            ci.name = q.value(9).toString();
 
             // 查询对方用户信息（一对一会话）
             qint64 senderId = q.value(7).toLongLong();
@@ -972,7 +1028,7 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
         }
     }
 
-    // 填充 peer 信息
+    // 填充 peer / 群组信息
     for (auto &ci : result) {
         if (ci.type == "private") {
             QSqlQuery peerQ(db);
@@ -986,6 +1042,15 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
                 ci.peerUserId = peerQ.value(0).toLongLong();
                 ci.peerUsername = peerQ.value(1).toString();
             }
+        } else if (ci.type == "group") {
+            // M7a: 群会话回填成员数
+            QSqlQuery countQ(db);
+            countQ.prepare(
+                "SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?");
+            countQ.addBindValue(ci.id);
+            if (countQ.exec() && countQ.next()) {
+                ci.memberCount = countQ.value(0).toInt();
+            }
         }
     }
 
@@ -997,7 +1062,7 @@ std::optional<ConversationInfo> DatabaseManager::getConversation(qint64 conversa
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
     QSqlQuery q(db);
     q.prepare(
-        "SELECT id, type, created_at, updated_at FROM conversations WHERE id = ?");
+        "SELECT id, type, created_at, updated_at, name FROM conversations WHERE id = ?");
     q.addBindValue(conversationId);
     if (q.exec() && q.next()) {
         ConversationInfo ci;
@@ -1005,6 +1070,17 @@ std::optional<ConversationInfo> DatabaseManager::getConversation(qint64 conversa
         ci.type = q.value(1).toString();
         ci.createdAt = q.value(2).toString();
         ci.updatedAt = q.value(3).toString();
+        ci.name = q.value(4).toString();
+        if (ci.type == "group") {
+            // M7a: 群会话回填成员数
+            QSqlQuery countQ(db);
+            countQ.prepare(
+                "SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?");
+            countQ.addBindValue(conversationId);
+            if (countQ.exec() && countQ.next()) {
+                ci.memberCount = countQ.value(0).toInt();
+            }
+        }
         return ci;
     }
     return std::nullopt;
@@ -1681,4 +1757,205 @@ bool DatabaseManager::removeDeviceKeys(qint64 userId, const QString &deviceId)
         return false;
     }
     return true;
+}
+
+// M7a: 群组管理
+bool DatabaseManager::insertMember(qint64 conversationId, qint64 userId, const QString &role)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "INSERT INTO conversation_members (conversation_id, user_id, role) "
+        "VALUES (?, ?, ?)");
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    q.addBindValue(role);
+    if (!q.exec()) {
+        qWarning() << "[DB] insertMember failed:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+qint64 DatabaseManager::createGroup(qint64 ownerId, const QString &name,
+                                    const QList<qint64> &memberIds)
+{
+    const QString groupName = name.trimmed();
+    if (ownerId <= 0 || groupName.isEmpty()) {
+        return -1;
+    }
+
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    if (!db.transaction()) {
+        qWarning() << "[DB] createGroup: transaction start failed:" << db.lastError().text();
+        return -1;
+    }
+
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO conversations (type, name) VALUES ('group', ?)");
+    q.addBindValue(groupName);
+    if (!q.exec()) {
+        qWarning() << "[DB] createGroup: insert conversation failed:" << q.lastError().text();
+        db.rollback();
+        return -1;
+    }
+    const qint64 convId = q.lastInsertId().toLongLong();
+
+    // 创建者以 owner 角色入群
+    if (!insertMember(convId, ownerId, "owner")) {
+        db.rollback();
+        return -1;
+    }
+
+    // 初始成员：去重、剔除创建者自身、按成员上限截断
+    QSet<qint64> added{ ownerId };
+    for (qint64 memberId : memberIds) {
+        if (added.size() >= MaxGroupMembers) {
+            break;
+        }
+        if (memberId <= 0 || added.contains(memberId)) {
+            continue;
+        }
+        if (!insertMember(convId, memberId, "member")) {
+            db.rollback();
+            return -1;
+        }
+        added.insert(memberId);
+    }
+
+    if (!db.commit()) {
+        qWarning() << "[DB] createGroup: commit failed:" << db.lastError().text();
+        db.rollback();
+        return -1;
+    }
+    return convId;
+}
+
+bool DatabaseManager::addGroupMembers(qint64 conversationId, const QList<qint64> &userIds)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSet<qint64> seen;
+    for (qint64 userId : userIds) {
+        if (userId <= 0 || seen.contains(userId)) {
+            continue;
+        }
+        seen.insert(userId);
+
+        // 已在群中的用户跳过
+        if (isConversationMember(conversationId, userId)) {
+            continue;
+        }
+
+        // 成员上限：已达上限时停止加入，已加入部分保留
+        QSqlQuery countQ(db);
+        countQ.prepare("SELECT COUNT(*) FROM conversation_members WHERE conversation_id = ?");
+        countQ.addBindValue(conversationId);
+        if (!countQ.exec() || !countQ.next()) {
+            qWarning() << "[DB] addGroupMembers: count failed:" << countQ.lastError().text();
+            return false;
+        }
+        if (countQ.value(0).toInt() >= MaxGroupMembers) {
+            break;
+        }
+
+        if (!insertMember(conversationId, userId, "member")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool DatabaseManager::removeGroupMember(qint64 conversationId, qint64 userId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    if (!q.exec()) {
+        qWarning() << "[DB] removeGroupMember failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+bool DatabaseManager::updateMemberRole(qint64 conversationId, qint64 userId, const QString &role)
+{
+    // 角色白名单校验，拒绝非法取值入库
+    if (role != "owner" && role != "admin" && role != "member") {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE conversation_members SET role = ? "
+        "WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(role);
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    if (!q.exec()) {
+        qWarning() << "[DB] updateMemberRole failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+QString DatabaseManager::groupRole(qint64 conversationId, qint64 userId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT role FROM conversation_members "
+        "WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toString();
+    }
+    return QString();
+}
+
+QList<QJsonObject> DatabaseManager::getGroupMembers(qint64 conversationId)
+{
+    QList<QJsonObject> result;
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT cm.user_id, u.username, cm.role, cm.joined_at "
+        "FROM conversation_members cm "
+        "JOIN users u ON cm.user_id = u.id "
+        "WHERE cm.conversation_id = ? "
+        "ORDER BY cm.joined_at, cm.user_id");
+    q.addBindValue(conversationId);
+    if (q.exec()) {
+        while (q.next()) {
+            QJsonObject member;
+            member["userId"] = q.value(0).toLongLong();
+            member["username"] = q.value(1).toString();
+            member["role"] = q.value(2).toString();
+            member["joinedAt"] = q.value(3).toString();
+            result.append(member);
+        }
+    }
+    return result;
+}
+
+bool DatabaseManager::setGroupName(qint64 conversationId, const QString &name)
+{
+    const QString groupName = name.trimmed();
+    if (groupName.isEmpty()) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE conversations SET name = ?, updated_at = datetime('now') "
+        "WHERE id = ? AND type = 'group'");
+    q.addBindValue(groupName);
+    q.addBindValue(conversationId);
+    if (!q.exec()) {
+        qWarning() << "[DB] setGroupName failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
 }

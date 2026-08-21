@@ -1,8 +1,8 @@
 # XYChat 协议文档
 
-## 当前协议状态（M6.5 完成后）
+## 当前协议状态（M7a 子任务一完成后）
 
-M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。上述变更均有自动化测试覆盖。
+M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）；群组业务处理器与客户端接入在子任务二/三实施，本文档先行固化 payload 契约。上述变更均有自动化测试覆盖。
 
 仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级（续期已校验 token，但其他请求未逐包验 token）、群聊/媒体尚未 E2EE（M7/M8 目标）、设备信任为 TOFU（无安全码比对）。
 
@@ -63,6 +63,17 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `51` | `RegisterKeysResponse` | E2EE 密钥注册响应（M6） |
 | `52` | `FetchKeysRequest` | E2EE 密钥包拉取请求（M6） |
 | `53` | `FetchKeysResponse` | E2EE 密钥包拉取响应（M6） |
+| `60` | `CreateGroupRequest` | 创建群组请求（M7a） |
+| `61` | `CreateGroupResponse` | 创建群组响应（M7a） |
+| `62` | `InviteGroupMembersRequest` | 邀请群成员请求（M7a） |
+| `63` | `InviteGroupMembersResponse` | 邀请群成员响应（M7a） |
+| `64` | `LeaveGroupRequest` | 退出群组请求（M7a） |
+| `65` | `LeaveGroupResponse` | 退出群组响应（M7a） |
+| `66` | `KickGroupMemberRequest` | 移除群成员请求（M7a） |
+| `67` | `KickGroupMemberResponse` | 移除群成员响应（M7a） |
+| `68` | `GetGroupInfoRequest` | 获取群信息请求（M7a） |
+| `69` | `GetGroupInfoResponse` | 获取群信息响应（M7a） |
+| `70` | `GroupChangedNotification` | 群变更通知（服务端推送，M7a：成员变更/系统消息） |
 
 ### 注册请求
 
@@ -206,6 +217,10 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `3006` | `PermissionDenied` | 越权访问被拒绝：非会话成员、非本人会话等（M5.5） |
 | `3007` | `KeyBundleUnavailable` | 对方无可用设备或预密钥耗尽，无法建立加密会话（M6） |
 | `3008` | `E2eeInvalidEnvelope` | 消息密文 envelope 非法：格式错误、预密钥无效或重复设备条目（M6） |
+| `3009` | `GroupLimitExceeded` | 群数量或成员数超限（M7a） |
+| `3010` | `MemberAlreadyExists` | 被邀请者已在群中（M7a） |
+| `3011` | `MemberNotFound` | 目标不是群成员（M7a） |
+| `3012` | `NotGroupOwner` | 仅群主可执行的管理操作（M7a） |
 | `9001` | `Timeout` | 连接空闲超时 |
 | `9002` | `InternalError` | 服务端内部错误 |
 
@@ -488,4 +503,77 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 | 预密钥认领超时回收 + 身份变更废弃旧世代 + fetch_keys 限流 | ✅ 已实施（M6，代码审查后修复） | Signal 预密钥生命周期管理 |
 | 客户端本地加密持久化缓存 + 持久化 outbox（无线上协议变更） | ✅ 已实施（M6.5） | Telegram/WhatsApp 本地存储模型；复用 sync_events 游标与 clientMessageId 幂等 |
 
-后续协议方向：消息撤回/编辑/删除事件纳入 `sync_events`；群聊与 fan-out 策略（M7）；媒体分片上传走独立通道（M8）。
+后续协议方向：消息撤回/编辑/删除事件纳入 `sync_events`；群聊 fan-out 与送达/已读计数（M7a 子任务二）；媒体分片上传走独立通道（M8）。
+
+## M7a 新增：群组接口（子任务一仅定义，处理器待子任务二实现）
+
+群聊为明文形态（服务端存明文并 fan-out，E2EE 在 M7b 用 Sender Keys 补齐）；`send_message` 后续按会话类型分流：private 会话维持 envelope fail-closed，group 会话接受明文文本。所有群组请求均需已认证 session 并携带 timestamp/nonce。
+
+### 创建群组（create_group）
+
+```json
+// 请求（name 1-64 字符；memberIds 不含创建者自身，服务端自动去重/剔除；单次邀请 ≤100）
+{ "type": "create_group", "name": "项目群", "memberIds": [2, 3], "timestamp": ..., "nonce": "..." }
+// 响应 data
+{ "conversationId": 9, "name": "项目群", "memberCount": 3 }
+```
+
+创建者自动成为群主（role=`owner`）；成员数含创建者上限 200（超限截断/拒绝，`GroupLimitExceeded`）。
+
+### 邀请成员（invite_group_members）
+
+```json
+// 请求（仅群成员可邀请；已在群中的用户跳过）
+{ "type": "invite_group_members", "conversationId": 9, "userIds": [4] }
+// 响应 data
+{ "conversationId": 9, "added": [4], "memberCount": 4 }
+```
+
+### 退群（leave_group）
+
+```json
+// 请求（群主退群前须先转让，否则拒绝，子任务二定义转让接口或降级策略）
+{ "type": "leave_group", "conversationId": 9 }
+// 响应 data
+{ "conversationId": 9 }
+```
+
+### 移除成员（kick_group_member）
+
+```json
+// 请求（仅群主/管理员可移除普通成员，越权返回 NotGroupOwner/PermissionDenied）
+{ "type": "kick_group_member", "conversationId": 9, "userId": 4 }
+// 响应 data
+{ "conversationId": 9, "removedUserId": 4 }
+```
+
+### 获取群信息（get_group_info）
+
+```json
+// 请求（仅群成员可查询，越权返回 PermissionDenied）
+{ "type": "get_group_info", "conversationId": 9 }
+// 响应 data
+{ "conversationId": 9, "name": "项目群", "memberCount": 3, "myRole": "owner", "members": [{ "userId": 2, "username": "bob", "role": "member", "joinedAt": "..." }] }
+```
+
+### 群变更通知（GroupChangedNotification，服务端推送）
+
+```json
+{ "conversationId": 9, "changeType": "member_added", "operatorId": 1, "targetUserId": 4, "memberCount": 4 }
+```
+
+`changeType` 取值：`member_added` / `member_removed` / `member_left` / `name_changed`（后续可扩展 `owner_transferred`）。成员变更同时产生系统消息（子任务二实现）并写入成员 `sync_events`，离线成员上线后可经游标同步补齐。
+
+### 群聊与既有接口的兼容约定
+
+- `get_conversations` 响应中 group 会话额外携带 `name` 与 `memberCount`；private 会话字段不变。
+- `send_message`/`sync_messages`/`ack_message`/`sync_events` 对 group 会话沿用既有语义（成员授权、幂等键、游标）；群消息送达/已读计数在子任务二实现。
+- `NewMessageNotification` 对群消息额外携带 `senderUsername`（便于 UI 展示发送者）。
+
+### 角色模型
+
+| role | 权限（子任务二实现） |
+| --- | --- |
+| `owner` | 全部管理权限：邀请/移除成员、改群名 |
+| `admin` | 邀请/移除普通成员、改群名 |
+| `member` | 收发消息、邀请新成员、退群 |
