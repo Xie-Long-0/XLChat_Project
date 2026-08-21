@@ -15,8 +15,8 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# QML 模块：Qml + Quick
-find_package(Qt6 COMPONENTS Quick QuickControls2 Network REQUIRED)
+# QML 模块：Qml + Quick；M6.5 本地持久化缓存需要 Sql（QSQLITE）
+find_package(Qt6 COMPONENTS Quick QuickControls2 Network Sql REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 # QWindowKit
@@ -34,6 +34,7 @@ set(SOURCES
     main.cpp
     core/NetworkManager.cpp
     core/KeyStorage.cpp
+    core/LocalStore.cpp
 )
 
 # C++ 头文件
@@ -41,6 +42,7 @@ set(HEADERS
     core/NetworkManager.h
     core/ThemeSettings.h
     core/KeyStorage.h
+    core/LocalStore.h
 )
 
 # 生成可执行文件
@@ -56,6 +58,7 @@ target_link_libraries(Chat-Client PUBLIC
     Qt6::Quick
     Qt6::QuickControls2
     Qt6::Network
+    Qt6::Sql
     OpenSSL::SSL
     QWindowKit::Core
     QWindowKit::Quick

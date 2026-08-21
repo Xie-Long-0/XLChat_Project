@@ -442,6 +442,8 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         setState(ConnectionState::Authenticated);
         emit sessionChanged();
         emit loginSuccessful();
+        // M6.5: 打开本地加密缓存（加载持久化 outbox、立即展示缓存会话、游标增量同步）
+        openLocalStore();
         // M5.5: 登录成功后重发 outbox 中未确认的消息（幂等键保证不重复）
         flushOutbox();
         return;
@@ -538,7 +540,6 @@ void NetworkManager::resetAuthState()
     m_userId = 0;
     m_username.clear();
     m_pendingUsername.clear();
-    // M6: 重置 E2EE 会话态（身份密钥仍持久化在本地，下次登录复用）
     m_e2eeReady = false;
     m_e2eeBootstrapPending = false;
     m_pendingRegisterKeysRequestId = 0;
@@ -554,6 +555,14 @@ void NetworkManager::resetAuthState()
         XYChat::Security::SecureMemory::wipe(pk.privateKey);
     }
     m_localPrekeys.clear();
+    // M6.5: 登出清除本地用户数据（消息/会话/outbox/同步游标）；
+    // 解密缓存与存储密钥属 E2EE 密钥材料，必须保留——登出重登时一次性
+    // 预密钥已消费不可恢复，对方消息只能靠解密缓存兜底（M6 产品承诺）；
+    // E2EE 身份密钥同样不在此列，仍由 KeyStorage 保留供下次登录复用
+    if (m_localStore.isOpen()) {
+        m_localStore.clearUserData();
+        m_localStore.close();
+    }
     emit sessionChanged();
 }
 
@@ -640,6 +649,20 @@ QString NetworkManager::sendMessage(qint64 toUserId, const QString &content)
     // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
     // M4.5: 返回幂等键供 QML 跟踪乐观消息气泡状态
     const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    // M6.5: outbox 加密落库，重启后不丢未发送消息
+    if (!m_localStore.isOpen()) {
+        // 登录前排队的场景：尝试以待登录账号打开本地库
+        const QString user = m_state == ConnectionState::Authenticated
+            ? m_username : m_pendingUsername;
+        const QString deviceId = m_localDeviceId.isEmpty()
+            ? QString::fromLatin1(QSysInfo::machineUniqueId().toHex())
+            : m_localDeviceId;
+        if (!user.isEmpty() && !deviceId.isEmpty()) {
+            m_localStore.open(user, deviceId);
+        }
+    }
+    m_localStore.addOutboxItem(clientMessageId, toUserId, content);
 
     if (m_state != ConnectionState::Authenticated) {
         // M5.5: 未认证时进入 outbox，登录成功后自动重发
@@ -753,8 +776,11 @@ void NetworkManager::bootstrapE2ee()
 
     // 加载持久化解密缓存：一次性预密钥解密后即删除，重新登录后
     // 历史消息依靠此缓存恢复明文（修复：登出重登后无法解密旧消息）
+    // M6.5: 缓存已归口 LocalStore，仅本地库不可用时回退 KeyStorage 文件
     if (!m_decryptCacheLoaded) {
-        m_decryptCache = KeyStorage::loadDecryptCache(m_username, m_localDeviceId);
+        if (!m_localStore.isOpen()) {
+            m_decryptCache = KeyStorage::loadDecryptCache(m_username, m_localDeviceId);
+        }
         m_decryptCacheLoaded = true;
     }
 
@@ -866,9 +892,10 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
     if (code != static_cast<int>(ErrorCode::Ok)) {
         const QString message = response.value("message").toString("Key bundle unavailable");
         if (code == static_cast<int>(ErrorCode::CannotSendToSelf)) {
-            // 确定性失败：移除该用户的待发项并上报
+            // 确定性失败：移除该用户的待发项（含持久化 outbox）并上报
             for (int i = m_outbox.size() - 1; i >= 0; --i) {
                 if (m_outbox.at(i).toUserId == target) {
+                    m_localStore.removeOutboxItem(m_outbox.at(i).clientMessageId);
                     m_outbox.removeAt(i);
                 }
             }
@@ -937,6 +964,7 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
         if (envelope.isEmpty()) {
             qWarning() << "[NetMgr] E2EE encryption failed for message"
                        << item.clientMessageId;
+            m_localStore.removeOutboxItem(item.clientMessageId);
             m_outbox.removeAt(i);
             emit messageSendFailed("End-to-end encryption failed");
             break;
@@ -1137,6 +1165,15 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
         msg["content"] = m_decryptCache.value(msgId);
         return;
     }
+    // M6.5: LocalStore 持久化解密缓存兜底（预密钥已消费后重新同步仍可恢复明文）
+    if (msgId > 0) {
+        const QString cached = m_localStore.loadDecryptedContent(msgId);
+        if (!cached.isEmpty()) {
+            msg["content"] = cached;
+            m_decryptCache.insert(msgId, cached);
+            return;
+        }
+    }
 
     bool undecryptable = false;
     const QString plain = decryptIncomingContent(msg.value("content").toString(),
@@ -1150,9 +1187,11 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
             if (m_decryptCache.size() > 2000) {
                 m_decryptCache.clear();
             }
-            // 持久化解密缓存（DPAPI 保护）：预密钥已随解密删除，
-            // 重新登录/重新同步时依靠缓存恢复明文
-            KeyStorage::saveDecryptCache(m_username, m_localDeviceId, m_decryptCache);
+            // M6.5: 解密缓存归口 LocalStore（加密存储）；本地库不可用时回退
+            // KeyStorage（DPAPI 保护），避免预密钥消费后明文不可恢复
+            if (!m_localStore.saveDecryptedContent(msgId, plain)) {
+                KeyStorage::saveDecryptCache(m_username, m_localDeviceId, m_decryptCache);
+            }
         }
     }
 }
@@ -1179,6 +1218,15 @@ void NetworkManager::ackMessage(qint64 messageId, const QString &status)
 // ── M3: 同步消息 ──
 void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int limit)
 {
+    // M6.5: 首页拉取先立即展示本地缓存（重启后即刻可见、离线可查），
+    // 随后服务端响应到达时以权威数据覆盖
+    if (afterId == 0 && conversationId > 0) {
+        const QJsonArray cached = m_localStore.loadMessages(conversationId, limit);
+        if (!cached.isEmpty()) {
+            emit messagesSynced(conversationId, cached, false);
+        }
+    }
+
     if (m_state != ConnectionState::Authenticated) return;
 
     QJsonObject json;
@@ -1248,6 +1296,21 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
                 value = conv;
             }
         }
+        // M6.5: 服务端权威会话数据写入本地缓存；预览为占位符时先用本地
+        // 解密缓存回填真实明文，避免持久化预览退化为 "[Encrypted message]"
+        for (QJsonValueRef value : conversations) {
+            QJsonObject conv = value.toObject();
+            if (conv.value("lastMessage").toString() == QStringLiteral("[Encrypted message]")) {
+                const qint64 lastMessageId =
+                    conv.value("lastMessageId").toVariant().toLongLong();
+                const QString cached = m_localStore.loadDecryptedContent(lastMessageId);
+                if (!cached.isEmpty()) {
+                    conv["lastMessage"] = cached;
+                    value = conv;
+                }
+            }
+            m_localStore.upsertConversation(conv);
+        }
         emit conversationsResult(conversations);
     }
 }
@@ -1265,15 +1328,32 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
         const QJsonObject data = response.value("data").toObject();
         // 确认后从 outbox 移除（以服务端回传的幂等键为准）
         const QString ackedId = data.value("clientMessageId").toString(clientMessageId);
+        QString sentContent;
         for (int i = 0; i < m_outbox.size(); ++i) {
             if (m_outbox.at(i).clientMessageId == ackedId) {
+                sentContent = m_outbox.at(i).content;
                 m_outbox.removeAt(i);
                 break;
             }
         }
-        emit messageSent(data.value("messageId").toVariant().toLongLong(),
-                         data.value("conversationId").toVariant().toLongLong(),
-                         ackedId);
+        // M6.5: 同步移除持久化 outbox，并将已发送消息写入本地缓存
+        m_localStore.removeOutboxItem(ackedId);
+        const qint64 messageId = data.value("messageId").toVariant().toLongLong();
+        const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+        if (messageId > 0 && conversationId > 0 && !sentContent.isEmpty()) {
+            QJsonObject cached;
+            cached["messageId"] = messageId;
+            cached["conversationId"] = conversationId;
+            cached["senderId"] = m_userId;
+            cached["senderUsername"] = m_username;
+            cached["content"] = sentContent;
+            cached["contentType"] = QStringLiteral("text");
+            cached["status"] = QStringLiteral("sent");
+            cached["clientMessageId"] = ackedId;
+            cached["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+            m_localStore.upsertMessage(cached);
+        }
+        emit messageSent(messageId, conversationId, ackedId);
     } else {
         emit messageSendFailed(response.value("message").toString("Send failed"));
     }
@@ -1303,6 +1383,8 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
         for (QJsonValueRef value : messages) {
             QJsonObject msg = value.toObject();
             decryptMessageObject(msg);
+            // M6.5: 写入本地缓存（加密存储）
+            m_localStore.upsertMessage(msg);
             value = msg;
         }
         emit messagesSynced(
@@ -1317,6 +1399,15 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
     // M6: 实时推送的消息先解密再交给 UI
     decryptMessageObject(msg);
+    // M6.5: 新消息写入本地缓存，并更新会话预览/未读数（仅更新已存在会话）
+    m_localStore.upsertMessage(msg);
+    {
+        const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
+        const QString preview = msg.value("undecryptable").toBool()
+            ? QStringLiteral("[Encrypted message]")
+            : msg.value("content").toString();
+        m_localStore.bumpConversationPreview(convId, preview, true);
+    }
     emit newMessageReceived(msg);
 
     // 自动发送已送达确认
@@ -1333,6 +1424,8 @@ void NetworkManager::handleMessageStatusUpdate(const Packet &packet)
     const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
     const QString status = msg.value("status").toString();
     if (msgId > 0 && !status.isEmpty()) {
+        // M6.5: 同步更新本地缓存中的消息状态
+        m_localStore.updateMessageStatus(msgId, status);
         emit messageStatusChanged(msgId, status);
     }
 }
@@ -1375,10 +1468,111 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
                 value = event;
             }
         }
-        emit eventsSynced(
-            events,
-            data.value("lastSeq").toVariant().toLongLong(),
-            data.value("hasMore").toBool());
+        // M6.5: 事件写入本地缓存并推进游标（hasMore 时自动续拉）
+        const qint64 lastSeq = data.value("lastSeq").toVariant().toLongLong();
+        const bool hasMore = data.value("hasMore").toBool();
+        ingestSyncEvents(events, lastSeq, hasMore);
+        emit eventsSynced(events, lastSeq, hasMore);
+    }
+}
+
+// ── M6.5: 本地持久化缓存 ──
+void NetworkManager::openLocalStore()
+{
+    if (m_username.isEmpty() || m_localDeviceId.isEmpty()) {
+        return;
+    }
+    // 切换账号：清除旧账号用户可见数据后关闭（保留其解密缓存，
+    // 该账号重登时仍需依靠它解密），再打开新账号本地库
+    if (m_localStore.isOpen() && m_localStore.username() != m_username) {
+        m_localStore.clearUserData();
+        m_localStore.close();
+    }
+    if (!m_localStore.isOpen() && !m_localStore.open(m_username, m_localDeviceId)) {
+        qWarning() << "[NetMgr] LocalStore unavailable, running without local cache";
+        return;
+    }
+
+    // M6 遗留解密缓存一次性迁入 LocalStore（幂等，无文件时为空操作）
+    m_localStore.importLegacyDecryptCache(m_username, m_localDeviceId);
+
+    // 持久化 outbox 载入内存（幂等键去重），由后续 flushOutbox 重发
+    const QList<LocalStore::OutboxItem> persisted = m_localStore.loadOutbox();
+    for (const LocalStore::OutboxItem &item : persisted) {
+        bool exists = false;
+        for (const OutboxItem &mem : std::as_const(m_outbox)) {
+            if (mem.clientMessageId == item.clientMessageId) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            m_outbox.append({item.clientMessageId, item.toUserId, item.content});
+        }
+    }
+
+    emitCachedConversations();
+
+    // 基于 sync_events 游标增量同步，补齐离线期间错过的消息/回执
+    syncEvents(m_localStore.syncCursor());
+}
+
+void NetworkManager::emitCachedConversations()
+{
+    if (!m_localStore.isOpen()) {
+        return;
+    }
+    const QJsonArray cached = m_localStore.loadConversations();
+    if (!cached.isEmpty()) {
+        // 立即展示上一会话周期的会话列表，随后服务端数据到达时刷新
+        emit conversationsResult(cached);
+    }
+}
+
+void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, bool hasMore)
+{
+    if (!m_localStore.isOpen()) {
+        return;
+    }
+
+    for (const QJsonValue &value : events) {
+        const QJsonObject event = value.toObject();
+        const QString type = event.value("type").toString();
+        const QJsonObject payload = event.value("payload").toObject();
+
+        if (type == QStringLiteral("message")) {
+            QJsonObject msg = payload;
+            // 事件流无状态字段：按发送方推导初始状态
+            const bool fromSelf = msg.value("senderId").toVariant().toLongLong() == m_userId;
+            msg["status"] = fromSelf ? QStringLiteral("sent")
+                                     : QStringLiteral("delivered");
+            // 本机已成功投递的消息同步移除 outbox（ACK 丢失时的兜底）
+            const QString cmid = msg.value("clientMessageId").toString();
+            if (fromSelf && !cmid.isEmpty()) {
+                for (int i = m_outbox.size() - 1; i >= 0; --i) {
+                    if (m_outbox.at(i).clientMessageId == cmid) {
+                        m_outbox.removeAt(i);
+                        break;
+                    }
+                }
+                m_localStore.removeOutboxItem(cmid);
+            }
+            m_localStore.upsertMessage(msg);
+        } else if (type == QStringLiteral("receipt")) {
+            m_localStore.updateMessageStatus(
+                payload.value("messageId").toVariant().toLongLong(),
+                payload.value("status").toString());
+        }
+        // contact_added 等事件忽略：联系人列表按需从服务端拉取
+    }
+
+    // 游标单调前进
+    if (lastSeq > m_localStore.syncCursor()) {
+        m_localStore.setSyncCursor(lastSeq);
+    }
+    // 仍有事件时继续增量拉取，直至追平
+    if (hasMore && m_state == ConnectionState::Authenticated) {
+        syncEvents(lastSeq);
     }
 }
 

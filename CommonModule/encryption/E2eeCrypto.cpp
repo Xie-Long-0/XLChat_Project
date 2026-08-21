@@ -123,6 +123,18 @@ E2eeCrypto::KeyPair E2eeCrypto::keyPairFromPrivateKey(const QByteArray &privateK
     return result;
 }
 
+QByteArray E2eeCrypto::generateRandomBytes(int length)
+{
+    if (length <= 0) {
+        return {};
+    }
+    QByteArray out(length, Qt::Uninitialized);
+    if (RAND_bytes(reinterpret_cast<unsigned char *>(out.data()), length) != 1) {
+        return {};
+    }
+    return out;
+}
+
 QByteArray E2eeCrypto::ecdh(const QByteArray &privateKey, const QByteArray &peerPublicKey)
 {
     EVP_PKEY *priv = pkeyFromRawPrivate(privateKey);

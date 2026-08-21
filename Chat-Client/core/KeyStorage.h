@@ -49,6 +49,18 @@ public:
                                                    const QString &deviceId);
     static bool saveDecryptCache(const QString &username, const QString &deviceId,
                                  const QHash<qint64, QString> &cache);
+    // M6.5：删除遗留解密缓存文件（新缓存已归口 LocalStore，迁移后调用）
+    static bool removeDecryptCacheFile(const QString &username, const QString &deviceId);
+
+    // ── M6.5：LocalStore 存储密钥（32 字节 AES-256-GCM 密钥，DPAPI 保护） ──
+    // 文件：AppDataLocation/localstore/<username>_<deviceId>.key
+    static QByteArray loadLocalStoreKey(const QString &username, const QString &deviceId);
+    static bool saveLocalStoreKey(const QString &username, const QString &deviceId,
+                                  const QByteArray &key);
+    // 登出清除本地数据时删除存储密钥（旧密文不可再恢复）
+    static bool removeLocalStoreKey(const QString &username, const QString &deviceId);
+    // 存储密钥文件路径（供 LocalStore 判断“文件缺失”与“还原失败”）
+    static QString localStoreKeyFilePath(const QString &username, const QString &deviceId);
 
 private:
     // DPAPI 保护/还原（非 Windows 原样返回）

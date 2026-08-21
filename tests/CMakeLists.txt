@@ -92,3 +92,35 @@ add_custom_command(TARGET TestSecurity POST_BUILD
         ${OPENSSL_RUNTIME_DLLS}
         $<TARGET_FILE_DIR:TestSecurity>
 )
+
+# ── TestLocalStore (M6.5 客户端本地加密持久化缓存) ──
+add_executable(TestLocalStore
+    unit/TestLocalStore.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/KeyStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/KeyStorage.h
+)
+
+target_include_directories(TestLocalStore PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core
+)
+
+target_link_libraries(TestLocalStore PRIVATE
+    Qt6::Test
+    Qt6::Sql
+    XYChatCommon
+)
+
+# KeyStorage 使用 DPAPI 保护本地密钥与存储密钥
+if (WIN32)
+    target_link_libraries(TestLocalStore PRIVATE crypt32)
+endif()
+
+add_test(NAME TestLocalStore COMMAND TestLocalStore)
+
+add_custom_command(TARGET TestLocalStore POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENSSL_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:TestLocalStore>
+)

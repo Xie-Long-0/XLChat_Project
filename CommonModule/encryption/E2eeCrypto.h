@@ -34,6 +34,9 @@ public:
     // 从原始私钥重建密钥对（公钥由私钥推导）
     static KeyPair keyPairFromPrivateKey(const QByteArray &privateKey);
 
+    // 密码学安全随机字节（M6.5 本地存储密钥生成等用途），失败返回空
+    static QByteArray generateRandomBytes(int length);
+
     // X25519 ECDH，输出 32 字节共享密钥；失败返回空
     static QByteArray ecdh(const QByteArray &privateKey, const QByteArray &peerPublicKey);
 

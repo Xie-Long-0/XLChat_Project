@@ -13,6 +13,7 @@
 #include "protocol/PacketCodec.h"
 #include "encryption/E2eeCrypto.h"
 #include "KeyStorage.h"
+#include "LocalStore.h"
 
 class NetworkManager : public QObject
 {
@@ -141,6 +142,12 @@ private:
     QString decryptIncomingContent(const QString &content, bool *undecryptable);
     // M6: 在接收 JSON 上就地解密 content 字段（含预览占位替换）
     void decryptMessageObject(QJsonObject &msg);
+    // M6.5: 本地持久化缓存
+    // 登录后打开本地加密库：加载持久化 outbox、立即展示缓存会话、游标增量同步
+    void openLocalStore();
+    void emitCachedConversations();
+    // 将 sync_events 事件写入本地缓存并推进游标（hasMore 时自动续拉）
+    void ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, bool hasMore);
 
 private:
     QSslSocket *m_sslSocket;
@@ -203,4 +210,7 @@ private:
     int m_serverPrekeyRemaining = -1;                 // 服务端报告的未认领预密钥余量
     QHash<qint64, QString> m_decryptCache;            // messageId -> 已解密正文（避免重复消费预密钥）
     bool m_decryptCacheLoaded = false;                // 本次登录是否已从磁盘加载解密缓存
+
+    // M6.5: 本地加密持久化缓存（会话/消息/outbox/解密缓存/同步游标）
+    LocalStore m_localStore;
 };

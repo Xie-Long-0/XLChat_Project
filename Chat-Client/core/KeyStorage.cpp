@@ -130,7 +130,7 @@ QString KeyStorage::decryptCacheFilePath(const QString &username, const QString 
         + QStringLiteral(".cache");
 }
 
-// ── 身份密钥 ─────────────────────────────────────────────────────────────────
+// ── 身份密钥 ──
 
 QByteArray KeyStorage::loadIdentityPrivateKey(const QString &username, const QString &deviceId)
 {
@@ -166,7 +166,7 @@ bool KeyStorage::saveIdentityPrivateKey(const QString &username, const QString &
     return ok;
 }
 
-// ── 预密钥 ───────────────────────────────────────────────────────────────────
+// ── 预密钥 ──
 
 QList<KeyStorage::PrekeyEntry> KeyStorage::loadPrekeys(const QString &username,
                                                        const QString &deviceId)
@@ -220,7 +220,7 @@ bool KeyStorage::savePrekeys(const QString &username, const QString &deviceId,
     return ok;
 }
 
-// ── TOFU 信任存储 ────────────────────────────────────────────────────────────
+// ── TOFU 信任存储 ──
 
 QString KeyStorage::loadPeerFingerprint(qint64 peerUserId)
 {
@@ -236,7 +236,7 @@ bool KeyStorage::savePeerFingerprint(qint64 peerUserId, const QString &fingerpri
                            QJsonDocument(root).toJson(QJsonDocument::Compact));
 }
 
-// ── 解密缓存 ───────────────────────────────────────────────────────────────────
+// ── 解密缓存 ──
 
 QHash<qint64, QString> KeyStorage::loadDecryptCache(const QString &username,
                                                     const QString &deviceId)
@@ -272,4 +272,50 @@ bool KeyStorage::saveDecryptCache(const QString &username, const QString &device
     const bool ok = writeFileAtomic(decryptCacheFilePath(username, deviceId), blob);
     SecureMemory::wipe(blob);
     return ok;
+}
+
+bool KeyStorage::removeDecryptCacheFile(const QString &username, const QString &deviceId)
+{
+    return QFile::remove(decryptCacheFilePath(username, deviceId));
+}
+
+// ── M6.5: LocalStore 存储密钥 ────────────────────────────────────────
+
+QString KeyStorage::localStoreKeyFilePath(const QString &username, const QString &deviceId)
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        + "/localstore/";
+    return dir + username + '_' + deviceId + ".key";
+}
+
+QByteArray KeyStorage::loadLocalStoreKey(const QString &username, const QString &deviceId)
+{
+    QByteArray raw = unprotect(readFileBytes(localStoreKeyFilePath(username, deviceId)));
+    if (raw.isEmpty()) {
+        return {};
+    }
+    const QJsonObject root = QJsonDocument::fromJson(raw).object();
+    const QByteArray key =
+        QByteArray::fromBase64(root.value("storageKey").toString().toLatin1());
+    SecureMemory::wipe(raw);
+    return key;
+}
+
+bool KeyStorage::saveLocalStoreKey(const QString &username, const QString &deviceId,
+                                   const QByteArray &key)
+{
+    QJsonObject root;
+    root["storageKey"] = QString::fromLatin1(key.toBase64());
+    QByteArray blob = protect(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    if (blob.isEmpty()) {
+        return false;
+    }
+    const bool ok = writeFileAtomic(localStoreKeyFilePath(username, deviceId), blob);
+    SecureMemory::wipe(blob);
+    return ok;
+}
+
+bool KeyStorage::removeLocalStoreKey(const QString &username, const QString &deviceId)
+{
+    return QFile::remove(localStoreKeyFilePath(username, deviceId));
 }

@@ -18,9 +18,9 @@ XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含�
 
 ```text
 .
-├── Chat-Client/          # Qt Widgets 客户端：登录窗口、主窗口、网络管理
-├── Chat-Server/          # Qt Core/Network/Sql 服务端：TCP 监听、请求处理、SQLite 用户表
-├── CommonModule/         # 客户端与服务端共用模块，目前包含密码摘要工具
+├── Chat-Client/          # Qt QML 客户端：登录/主窗口、NetworkManager、KeyStorage、LocalStore（M6.5 本地加密缓存）
+├── Chat-Server/          # Qt Core/Network/Sql 服务端：TCP 监听、请求处理、SQLite
+├── CommonModule/         # 客户端与服务端共用模块：协议编解码、加密（PBKDF2/E2EE）、安全工具
 ├── docs/                 # 架构、协议、安全与路线图文档
 ├── tests/                # 自动化测试
 ├── 3rdparty/             # Windows 第三方依赖文件
@@ -58,6 +58,8 @@ cmake --build build -j
 ```bash
 ./out/build/release/Chat-Client
 ```
+
+> 客户端自 M6.5 起会在系统 AppData 目录下维护按账号+设备隔离的本地加密缓存（消息/会话以 AES-256-GCM 加密落库，未发送消息跨重启保留）；登出时自动清除。详见 `docs/SECURITY.md` 的本地存储安全章节。
 
 ## 测试
 
