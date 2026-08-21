@@ -385,3 +385,4 @@ install/
 .idea/
 .vscode/*.user
 /build_m4
+.workbuddy/
