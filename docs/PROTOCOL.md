@@ -1,8 +1,8 @@
 # XYChat 协议文档
 
-## 当前协议状态（M7a 子任务一完成后）
+## 当前协议状态（M7a 子任务二完成后）
 
-M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）；群组业务处理器与客户端接入在子任务二/三实施，本文档先行固化 payload 契约。上述变更均有自动化测试覆盖。
+M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。客户端接入在子任务三实施。上述变更均有自动化测试覆盖。
 
 仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级（续期已校验 token，但其他请求未逐包验 token）、群聊/媒体尚未 E2EE（M7/M8 目标）、设备信任为 TOFU（无安全码比对）。
 
@@ -344,11 +344,15 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 #### 发送消息
 
 ```json
-// 请求（M5.5 起 clientMessageId 必填；M6 起 content 必须为 E2EE envelope 密文）
+// 私聊请求（M5.5 起 clientMessageId 必填；M6 起 content 必须为 E2EE envelope 密文）
 { "type": "send_message", "toUserId": 2, "content": "{\"v\":1,\"devices\":[...]}", "contentType": "text", "clientMessageId": "<uuid>" }
+// M7a 群聊请求（conversationId > 0 走群路径；content 为明文文本，≤16384 字符，仅支持 text）
+{ "type": "send_message", "conversationId": 9, "content": "大家好", "contentType": "text", "clientMessageId": "<uuid>" }
 // 响应 data
 { "messageId": 1, "conversationId": 1, "clientMessageId": "<uuid>", "status": "sent" }
 ```
+
+M7a 分流规则：请求携带 `conversationId > 0` 时走群聊路径（会话必须存在且 type=group，发送者必须是成员，否则 `ConversationNotFound`/`PermissionDenied`；幂等重试语义与私聊一致）；否则走私聊 `toUserId` 路径。同一请求不得混用两种目标。
 
 `clientMessageId` 为客户端生成的 UUID 幂等键（参考 Telegram `random_id`/WhatsApp 客户端消息 ID）：服务端以 `(sender_id, sender_device_id, client_message_id)` 唯一约束去重，重试/重连重发返回已存储的同一条消息（幂等重试优先于 envelope 校验，因为重试时引用的预密钥可能已被首次发送消费）；客户端维护 outbox，登录成功后自动重发未确认消息。
 
@@ -359,6 +363,8 @@ M6 fail-closed 校验：`content` 必须解析为合法的 v1 envelope（见“M
 ```json
 { "messageId": 1, "conversationId": 1, "senderId": 2, "content": "Hi!", "contentType": "text", "createdAt": "..." }
 ```
+
+M7a 群消息额外携带 `senderUsername`（便于 UI 展示发送者）；群系统消息的 `contentType` 为 `system`，`content` 为结构化 JSON（见“M7a 新增：群组接口”）。
 
 #### 消息确认（回执）
 
@@ -374,6 +380,8 @@ M5.5 行为：
 - `status` 仅接受 `delivered` / `read`。
 - 回执写入 `message_receipts(message_id, user_id, device_id, delivered_at, read_at)`，按接收者/设备维度记录（参考 WhatsApp per-recipient 回执模型）；多设备各自回执互不覆盖。
 - 服务端根据回执聚合更新 `messages.status` 展示值，并向发送方推送 `MessageStatusUpdate`，同时写入发送方 `sync_events`。
+
+M7a 聚合语义：展示状态按**接收用户人数**聚合（接收者 = 会话成员中除发送方外的全体，私聊为 1 人）：全员送达才达 `delivered`，全员已读才达 `read`；同一用户多设备回执按用户去重（`receiptUserCount`），不会提前达成。`MessageStatusUpdate` 与发送方 `receipt` 事件额外携带 `deliveredCount`/`readCount`（群消息送达/已读计数）。
 
 #### 同步消息
 
@@ -396,7 +404,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```
 
 - 事件流按账号维度严格递增（`seq`），客户端保存 `lastSeq` 游标做增量拉取（参考 Telegram 差分同步模型）。
-- 当前事件类型：`message`（新消息，M6 起 payload.content 为 envelope 密文）、`contact_added`（联系人变更）、`receipt`（送达/已读回执）。
+- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）。
 - 实时推送（`NewMessageNotification`/`MessageStatusUpdate`）仅作为通知，离线或丢推送时由 `sync_events` 兜底补齐。
 
 ### M6 新增：端到端加密
@@ -502,12 +510,13 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 | envelope fail-closed：服务端只存/只转密文 | ✅ 已实施（M6） | Signal 服务端不可见明文 |
 | 预密钥认领超时回收 + 身份变更废弃旧世代 + fetch_keys 限流 | ✅ 已实施（M6，代码审查后修复） | Signal 预密钥生命周期管理 |
 | 客户端本地加密持久化缓存 + 持久化 outbox（无线上协议变更） | ✅ 已实施（M6.5） | Telegram/WhatsApp 本地存储模型；复用 sync_events 游标与 clientMessageId 幂等 |
+| M7a 明文群聊：群组接口 + send_message 分流 fan-out + 系统消息 + 按人数回执聚合 | ✅ 已实施（M7a 子任务一/二） | Telegram/WhatsApp 群模型（服务消息、per-recipient 回执聚合） |
 
-后续协议方向：消息撤回/编辑/删除事件纳入 `sync_events`；群聊 fan-out 与送达/已读计数（M7a 子任务二）；媒体分片上传走独立通道（M8）。
+后续协议方向：消息撤回/编辑/删除事件纳入 `sync_events`；群聊大群拉取/游标模式与群主转让接口、改群名接口（M7a 子任务三及后续）；媒体分片上传走独立通道（M8）。
 
-## M7a 新增：群组接口（子任务一仅定义，处理器待子任务二实现）
+## M7a 新增：群组接口（子任务一完成定义，子任务二已实现服务端处理器）
 
-群聊为明文形态（服务端存明文并 fan-out，E2EE 在 M7b 用 Sender Keys 补齐）；`send_message` 后续按会话类型分流：private 会话维持 envelope fail-closed，group 会话接受明文文本。所有群组请求均需已认证 session 并携带 timestamp/nonce。
+群聊为明文形态（服务端存明文并 fan-out，E2EE 在 M7b 用 Sender Keys 补齐）；`send_message` 按会话类型分流：private 会话维持 envelope fail-closed，group 会话接受明文文本。所有群组请求均需已认证 session 并携带 timestamp/nonce。
 
 ### 创建群组（create_group）
 
@@ -518,7 +527,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 { "conversationId": 9, "name": "项目群", "memberCount": 3 }
 ```
 
-创建者自动成为群主（role=`owner`）；成员数含创建者上限 200（超限截断/拒绝，`GroupLimitExceeded`）。
+创建者自动成为群主（role=`owner`）；成员数含创建者上限 200（超限拒绝，`GroupLimitExceeded`）；初始成员必须均为已注册用户（否则 `AccountNotFound`）。建群成功后产生 `group_created` 系统消息与群变更通知。
 
 ### 邀请成员（invite_group_members）
 
@@ -532,20 +541,24 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ### 退群（leave_group）
 
 ```json
-// 请求（群主退群前须先转让，否则拒绝，子任务二定义转让接口或降级策略）
+// 请求
 { "type": "leave_group", "conversationId": 9 }
 // 响应 data
 { "conversationId": 9 }
 ```
 
+已落地语义（降级策略）：群主退群时若仍有其他成员，群主身份自动转让给最早入群的成员（产生 `owner_transferred` 系统消息与通知）；退出者本人不再接收后续群消息与变更通知。
+
 ### 移除成员（kick_group_member）
 
 ```json
-// 请求（仅群主/管理员可移除普通成员，越权返回 NotGroupOwner/PermissionDenied）
+// 请求（层级保护：owner 可移除 admin/member；admin 仅可移除 member；不能移除自己，越权返回 NotGroupOwner）
 { "type": "kick_group_member", "conversationId": 9, "userId": 4 }
 // 响应 data
 { "conversationId": 9, "removedUserId": 4 }
 ```
+
+非成员目标返回 `MemberNotFound`；被移除者不再接收后续群消息与变更通知（其本地会话由客户端清理）。
 
 ### 获取群信息（get_group_info）
 
@@ -562,18 +575,21 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 { "conversationId": 9, "changeType": "member_added", "operatorId": 1, "targetUserId": 4, "memberCount": 4 }
 ```
 
-`changeType` 取值：`member_added` / `member_removed` / `member_left` / `name_changed`（后续可扩展 `owner_transferred`）。成员变更同时产生系统消息（子任务二实现）并写入成员 `sync_events`，离线成员上线后可经游标同步补齐。
+`changeType` 取值：`group_created` / `member_added` / `member_removed` / `member_left` / `owner_transferred`（后续可扩展 `name_changed`）。每次成员变更同时产生一条 `contentType=system` 的系统消息（`content` 为结构化 JSON，如 `{"event":"member_added","operatorId":1,"targetUserIds":[4]}`），与群变更通知一起写入成员 `sync_events`，离线成员上线后可经游标同步补齐。
 
 ### 群聊与既有接口的兼容约定
 
-- `get_conversations` 响应中 group 会话额外携带 `name` 与 `memberCount`；private 会话字段不变。
-- `send_message`/`sync_messages`/`ack_message`/`sync_events` 对 group 会话沿用既有语义（成员授权、幂等键、游标）；群消息送达/已读计数在子任务二实现。
-- `NewMessageNotification` 对群消息额外携带 `senderUsername`（便于 UI 展示发送者）。
+- `get_conversations` 响应中 group 会话额外携带 `name` 与 `memberCount`；private 会话字段不变（已实现）。
+- `send_message`/`sync_messages`/`ack_message`/`sync_events` 对 group 会话沿用既有语义（成员授权、幂等键、游标）；群消息送达/已读计数已由 `MessageStatusUpdate` 的 `deliveredCount`/`readCount` 提供（已实现）。
+- `NewMessageNotification` 对群消息额外携带 `senderUsername`（便于 UI 展示发送者，已实现）。
+- 群消息 fan-out 策略：当前为小群直推（逐成员在线推送 + 全员 sync_events 兜底）；大群拉取/游标模式随规模需求再引入。
 
 ### 角色模型
 
-| role | 权限（子任务二实现） |
+| role | 权限（已实现） |
 | --- | --- |
-| `owner` | 全部管理权限：邀请/移除成员、改群名 |
-| `admin` | 邀请/移除普通成员、改群名 |
+| `owner` | 全部管理权限：邀请/移除成员（含 admin）、退群时自动转让 |
+| `admin` | 邀请成员、移除普通成员 |
 | `member` | 收发消息、邀请新成员、退群 |
+
+> 改群名接口（`name_changed`）未纳入子任务二，数据层 `setGroupName` 已就绪，接口层留待后续。

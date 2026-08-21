@@ -76,6 +76,21 @@ private:
     // M6: 端到端加密密钥注册与拉取
     void processRegisterKeysRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
     void processFetchKeysRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    // M7a: 明文群聊处理器
+    void processCreateGroupRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processInviteGroupMembersRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processLeaveGroupRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processKickGroupMemberRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processGetGroupInfoRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+
+    // M7a: 群消息发送（明文入库 + fan-out，与私聊 E2EE 路径分流）
+    void processSendGroupMessage(const XYChat::Protocol::Packet &packet, const QJsonObject &request,
+                                 qint64 conversationId, const QString &clientMessageId);
+    // M7a: 群系统消息入库并 fan-out（contentType=system，无幂等键）
+    void postGroupSystemMessage(qint64 conversationId, qint64 operatorId, const QJsonObject &payload);
+    // M7a: 向全体现任成员推送群变更通知并写入各自 sync_events
+    void notifyGroupChanged(qint64 conversationId, const QString &changeType,
+                            qint64 operatorId, qint64 targetUserId);
 
     // M5.5: 重放保护（timestamp/nonce 强制必填）
     bool checkReplayProtection(const QJsonObject &request);
@@ -131,4 +146,9 @@ private:
     // M6 审查修复：fetch_keys 频率限制，防止恶意耗尽他人预密钥池
     static constexpr int MaxFetchKeysPerWindow = 20;  // 窗口内拉取上限
     static constexpr int FetchKeysWindowSeconds = 60; // 滑动窗口长度
+
+    // M7a: 群消息明文长度上限（单条 UTF-8 字符数；M7b E2EE / M8 媒体另行调整）
+    static constexpr int MaxGroupMessageLength = 16384;
+    // M7a: 群名长度上限（字符数）
+    static constexpr int MaxGroupNameLength = 64;
 };

@@ -109,6 +109,8 @@ public:
     // 用户管理
     bool userExists(const QString &username);
     std::optional<UserInfo> getUserByUsername(const QString &username);
+    // M7a: 按 ID 查询用户名（不存在返回空串）
+    QString usernameById(qint64 userId);
     qint64 registerUser(const QString &username,
                         const QString &email,
                         const QString &phone,
@@ -180,6 +182,8 @@ public:
     bool recordMessageReceipt(qint64 messageId, qint64 userId,
                               const QString &deviceId, const QString &status);
     int receiptCount(qint64 messageId, const QString &status); // "delivered" / "read"
+    // M7a: 按接收用户去重的回执计数（多设备不重复计数），供送达/已读人数聚合
+    int receiptUserCount(qint64 messageId, const QString &status);
     bool updateMemberReadCursor(qint64 conversationId, qint64 userId, qint64 messageId);
 
     // M5.5: 同步事件流
@@ -216,6 +220,10 @@ public:
     QString groupRole(qint64 conversationId, qint64 userId);
     QList<QJsonObject> getGroupMembers(qint64 conversationId);
     bool setGroupName(qint64 conversationId, const QString &name);
+    // M7a: 群成员 ID 列表（按入群顺序，供消息 fan-out 与群变更通知）
+    QList<qint64> getGroupMemberIds(qint64 conversationId);
+    // M7a: 会话成员数（排除指定用户，供回执聚合计算接收者总数）
+    int memberCountExcluding(qint64 conversationId, qint64 excludeUserId);
 
     // M7a: 群组规模约束（供数据层与业务层统一引用）
     static constexpr int MaxGroupMembers = 200;  // 单群成员上限

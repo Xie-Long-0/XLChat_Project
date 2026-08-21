@@ -69,6 +69,9 @@ private slots:
     void removeGroupMemberDeletesRow();
     void groupRoleReportsOwnershipAndNonMember();
     void getConversationsForUserIncludesGroupWithNameAndMemberCount();
+    // M7a 子任务二：fan-out 与回执聚合数据支撑
+    void groupMemberIdsAndCounts();
+    void groupMessageReceiptCounts();
 
 private:
     DatabaseManager *m_db = nullptr;
@@ -929,6 +932,85 @@ void TestDatabaseManager::getConversationsForUserIncludesGroupWithNameAndMemberC
     QVERIFY(privateConvId > 0);
     QVERIFY(!m_db->setGroupName(privateConvId, "不是群"));
     QVERIFY(!m_db->setGroupName(groupConvId, "  "));
+}
+
+void TestDatabaseManager::groupMemberIdsAndCounts()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto member = m_db->getUserByUsername("user2");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(owner.has_value());
+    QVERIFY(member.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->createGroup(owner->id, "分发群", {member->id});
+    QVERIFY(convId > 0);
+
+    // fan-out 用的成员 ID 列表
+    const auto ids = m_db->getGroupMemberIds(convId);
+    QCOMPARE(ids.size(), 2);
+    QVERIFY(ids.contains(owner->id));
+    QVERIFY(ids.contains(member->id));
+
+    // 回执聚合的接收者总数（排除发送方）；非成员不排除任何成员
+    QCOMPARE(m_db->memberCountExcluding(convId, owner->id), 1);
+    QCOMPARE(m_db->memberCountExcluding(convId, outsider->id), 2);
+
+    // 成员移除后接收者总数同步减少
+    QVERIFY(m_db->removeGroupMember(convId, member->id));
+    QCOMPARE(m_db->memberCountExcluding(convId, owner->id), 0);
+
+    // usernameById：存在返回用户名，不存在返回空串
+    QCOMPARE(m_db->usernameById(owner->id), QString("testuser"));
+    QCOMPARE(m_db->usernameById(999999), QString());
+}
+
+void TestDatabaseManager::groupMessageReceiptCounts()
+{
+    auto owner = m_db->getUserByUsername("testuser");
+    auto member = m_db->getUserByUsername("user2");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(owner.has_value());
+    QVERIFY(member.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->createGroup(owner->id, "回执群", {member->id, outsider->id});
+    QVERIFY(convId > 0);
+
+    const qint64 msgId = m_db->sendMessage(convId, owner->id, "hello group",
+                                           "text", "grp-key-1", "devA");
+    QVERIFY(msgId > 0);
+
+    // 接收者总数 = 除发送方外全体成员
+    const int recipients = m_db->memberCountExcluding(convId, owner->id);
+    QCOMPARE(recipients, 2);
+
+    // 送达：单人回执不达成，全员回执才达成
+    QCOMPARE(m_db->receiptCount(msgId, "delivered"), 0);
+    QVERIFY(m_db->recordMessageReceipt(msgId, member->id, "devM", "delivered"));
+    QCOMPARE(m_db->receiptCount(msgId, "delivered"), 1);
+    QVERIFY(m_db->recordMessageReceipt(msgId, outsider->id, "devO", "delivered"));
+    QCOMPARE(m_db->receiptCount(msgId, "delivered"), recipients);
+
+    // 已读：同样按接收者计数聚合
+    QVERIFY(m_db->recordMessageReceipt(msgId, member->id, "devM", "read"));
+    QCOMPARE(m_db->receiptCount(msgId, "read"), 1);
+    QVERIFY(m_db->recordMessageReceipt(msgId, outsider->id, "devO", "read"));
+    QCOMPARE(m_db->receiptCount(msgId, "read"), recipients);
+
+    // 按用户去重：同一用户多设备回执不重复计数，而逐设备计数保留原语义
+    QVERIFY(m_db->recordMessageReceipt(msgId, member->id, "devM2", "read"));
+    QCOMPARE(m_db->receiptUserCount(msgId, "read"), recipients);
+    QCOMPARE(m_db->receiptCount(msgId, "read"), recipients + 1);
+
+    // 系统消息（contentType=system）可正常入库与读回
+    const qint64 sysId = m_db->sendMessage(convId, owner->id,
+                                           "{\"event\":\"group_created\"}", "system");
+    QVERIFY(sysId > 0);
+    auto sysMsg = m_db->getMessage(sysId);
+    QVERIFY(sysMsg.has_value());
+    QCOMPARE(sysMsg->contentType, QString("system"));
+    QCOMPARE(sysMsg->conversationId, convId);
 }
 
 QTEST_MAIN(TestDatabaseManager)

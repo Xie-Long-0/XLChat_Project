@@ -1,6 +1,6 @@
 # XYChat 架构概览
 
-> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新；2026-08-21 完成 M6.5（本地持久化缓存与持久化 outbox，含代码审查修复）后再次更新；同日完成 M7a 子任务一（群聊协议定义与服务端数据模型，数据库迁移至 V7）后再次更新。
+> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新；2026-08-21 完成 M6.5（本地持久化缓存与持久化 outbox，含代码审查修复）后再次更新；同日完成 M7a 子任务一（群聊协议定义与服务端数据模型，数据库迁移至 V7）与子任务二（群组业务处理器与 fan-out）后再次更新。
 
 ## 当前组件（M6.5 完成后）
 
@@ -13,7 +13,7 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
 - `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
-- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换请求（M6 新增 register_keys/fetch_keys），管理 session 路由与在线状态，访问 SQLite。
+- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out），管理 session 路由与在线状态，访问 SQLite。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；
   - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）；
@@ -65,7 +65,8 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - M4.5 客户端体验完善：搜索用户直接发起对话（虚拟会话 + 首条消息 ACK 后绑定 conversationId）、发送乐观显示（发送中→已发送→已送达→已读实时流转）、显式已读回执、日期分隔线、会话选中高亮与未读角标本地实时更新、侧边栏用户信息栏与登出入口、亮/暗主题切换（`Theme.qml` darkMode 驱动 + `ThemeSettings` QSettings 持久化）。
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
-- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准。
+- M7a 群聊（明文，服务端已落地）：建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。
+- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式），客户端尚未接入（M7a 子任务三），群消息无发送限流（留待 M11 前置项）。
 
 ### 端到端加密（M6）
 
@@ -223,4 +224,4 @@ M6 首次实现后经代码审查发现并修复：
 2. **M4.5 已完成**：亮/暗主题切换、CMake Widgets 残留清理、搜索发起对话、乐观发送与状态流转、已读回执、会话列表/聊天对话框交互完善，并经 E2E 验证。
 3. **M6 已完成**：端到端加密一对一聊天（X25519 身份密钥/预密钥、每消息临时密钥、AES-GCM 认证加密、envelope fail-closed、TOFU、历史消息不可恢复），含审查后修复（见上表）。
 4. **M6.5 已完成**：客户端本地加密持久化缓存与持久化 outbox（`LocalStore`），重启后历史消息即刻可见、未发送消息不丢失，登出清除本地数据，含审查后修复（见上表）。
-5. **M7+**：群聊（M7a 明文群聊拆三期：子任务一协议/数据模型已完成，子任务二业务处理器与 fan-out、子任务三客户端 UI；随后 M7b Sender Keys 群 E2EE）、媒体、搜索与通知、设备信任带外验证与密钥备份策略。
+5. **M7+**：群聊（M7a 明文群聊拆三期：子任务一协议/数据模型与子任务二业务处理器/fan-out 已完成，子任务三客户端 UI 待实施；随后 M7b Sender Keys 群 E2EE）、媒体、搜索与通知、设备信任带外验证与密钥备份策略。

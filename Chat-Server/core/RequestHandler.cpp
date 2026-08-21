@@ -280,6 +280,28 @@ void RequestHandler::processPacket(const Packet &packet)
         return;
     }
 
+    // M7a: 明文群聊
+    if (packet.messageType == MessageType::CreateGroupRequest || type == "create_group") {
+        processCreateGroupRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::InviteGroupMembersRequest || type == "invite_group_members") {
+        processInviteGroupMembersRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::LeaveGroupRequest || type == "leave_group") {
+        processLeaveGroupRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::KickGroupMemberRequest || type == "kick_group_member") {
+        processKickGroupMemberRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::GetGroupInfoRequest || type == "get_group_info") {
+        processGetGroupInfoRequest(packet, json);
+        return;
+    }
+
     sendResponse(packet.requestId, MessageType::Error, ErrorCode::InvalidRequest,
                  QString("Unknown request type: %1").arg(type));
 }
@@ -673,6 +695,11 @@ void RequestHandler::processGetConversationsRequest(const Packet &packet)
         obj["lastMessageId"] = c.lastMessageId;
         obj["lastMessageAt"] = c.lastMessageAt;
         obj["unreadCount"] = c.unreadCount;
+        // M7a: 群会话额外携带群名与成员数
+        if (c.type == "group") {
+            obj["name"] = c.name;
+            obj["memberCount"] = c.memberCount;
+        }
         convArray.append(obj);
     }
 
@@ -685,11 +712,24 @@ void RequestHandler::processGetConversationsRequest(const Packet &packet)
 // M3: 发送消息
 void RequestHandler::processSendMessageRequest(const Packet &packet, const QJsonObject &request)
 {
+    // M5.5: 客户端幂等键必填，重试不重复写消息
+    const QString clientMessageId = request.value("clientMessageId").toString().trimmed();
+    if (clientMessageId.isEmpty() || clientMessageId.size() > 128) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "clientMessageId is required");
+        return;
+    }
+
+    // M7a: 按目标分流：conversationId 走群聊明文路径，toUserId 走私聊 E2EE 路径
+    const qint64 groupConvId = request.value("conversationId").toVariant().toLongLong();
+    if (groupConvId > 0) {
+        processSendGroupMessage(packet, request, groupConvId, clientMessageId);
+        return;
+    }
+
     const qint64 targetUserId = request.value("toUserId").toVariant().toLongLong();
     const QString content = request.value("content").toString();
     const QString contentType = request.value("contentType").toString("text");
-    // M5.5: 客户端幂等键必填，重试不重复写消息
-    const QString clientMessageId = request.value("clientMessageId").toString().trimmed();
 
     if (targetUserId <= 0 || targetUserId == m_authenticatedUserId) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
@@ -699,11 +739,6 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     if (content.isEmpty()) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      ErrorCode::InvalidRequest, "Message content is empty");
-        return;
-    }
-    if (clientMessageId.isEmpty() || clientMessageId.size() > 128) {
-        sendResponse(packet.requestId, MessageType::SendMessageResponse,
-                     ErrorCode::InvalidRequest, "clientMessageId is required");
         return;
     }
 
@@ -888,21 +923,31 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
         m_db->updateMemberReadCursor(msgOpt->conversationId, m_authenticatedUserId, messageId);
     }
 
-    // 根据回执聚合全局展示状态（私聊中回执数 > 0 即达成）
+    // M7a: 按接收者总数聚合展示状态（私聊接收者为 1 人，群聊为除发送方外全体成员），
+    // 修复此前“任一回执即聚合”在群聊下提前达成 read/delivered 的问题
+    const int expectedRecipients =
+        m_db->memberCountExcluding(msgOpt->conversationId, msgOpt->senderId);
+    // M7a: 按接收用户去重计数，避免单用户多设备回执导致提前达成
+    const int readCount = m_db->receiptUserCount(messageId, "read");
+    const int deliveredCount = m_db->receiptUserCount(messageId, "delivered");
+
     QString aggregatedStatus;
-    if (m_db->receiptCount(messageId, "read") > 0) {
+    if (expectedRecipients > 0 && readCount >= expectedRecipients) {
         aggregatedStatus = "read";
-    } else if (m_db->receiptCount(messageId, "delivered") > 0) {
+    } else if (expectedRecipients > 0 && deliveredCount >= expectedRecipients) {
         aggregatedStatus = "delivered";
     }
     if (!aggregatedStatus.isEmpty() && aggregatedStatus != msgOpt->status) {
         m_db->updateMessageStatus(messageId, aggregatedStatus);
 
-        // 推送状态更新给发送方（多设备可经 sync_events 同步）
+        // 推送状态更新给发送方（多设备可经 sync_events 同步）；
+        // 群消息额外携带送达/已读计数
         QJsonObject statusJson;
         statusJson["messageId"] = messageId;
         statusJson["conversationId"] = msgOpt->conversationId;
         statusJson["status"] = aggregatedStatus;
+        statusJson["deliveredCount"] = deliveredCount;
+        statusJson["readCount"] = readCount;
         Packet statusPacket;
         statusPacket.messageType = MessageType::MessageStatusUpdate;
         statusPacket.requestId = 0;
@@ -915,6 +960,8 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
         ev["conversationId"] = msgOpt->conversationId;
         ev["status"] = aggregatedStatus;
         ev["byUserId"] = m_authenticatedUserId;
+        ev["deliveredCount"] = deliveredCount;
+        ev["readCount"] = readCount;
         m_db->appendSyncEvent(msgOpt->senderId, "receipt",
                               QJsonDocument(ev).toJson(QJsonDocument::Compact));
     }
@@ -1161,6 +1208,522 @@ void RequestHandler::processFetchKeysRequest(const Packet &packet, const QJsonOb
     data["bundles"] = bundles;
     sendResponse(packet.requestId, MessageType::FetchKeysResponse, ErrorCode::Ok,
                  "OK", data);
+}
+
+// M7a: 群系统消息入库并 fan-out（contentType=system，无幂等键，不推送发送操作者）
+void RequestHandler::postGroupSystemMessage(qint64 conversationId, qint64 operatorId,
+                                            const QJsonObject &payload)
+{
+    const QString content = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    const qint64 msgId = m_db->sendMessage(conversationId, operatorId, content, "system");
+    if (msgId < 0) {
+        qWarning() << "[Handler] Failed to store group system message, conv" << conversationId;
+        return;
+    }
+
+    const QString createdAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    const QString senderUsername = m_db->usernameById(operatorId);
+
+    QJsonObject ev;
+    ev["messageId"] = msgId;
+    ev["conversationId"] = conversationId;
+    ev["senderId"] = operatorId;
+    ev["content"] = content;
+    ev["contentType"] = "system";
+    ev["createdAt"] = createdAt;
+    const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
+
+    QJsonObject notifyJson = ev;
+    notifyJson["senderUsername"] = senderUsername;
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::NewMessageNotification;
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = QJsonDocument(notifyJson).toJson(QJsonDocument::Compact);
+    const QByteArray encoded = PacketCodec::encode(notifyPacket);
+
+    // 系统消息面向全体成员：事件流全员写入（含操作者其他设备），
+    // 实时推送仅面向除操作者外的成员
+    for (qint64 memberId : m_db->getGroupMemberIds(conversationId)) {
+        m_db->appendSyncEvent(memberId, "message", evJson);
+        if (memberId != operatorId) {
+            emit messageForUser(memberId, encoded);
+        }
+    }
+}
+
+// M7a: 群变更通知：推送 GroupChangedNotification 并写入全体现任成员 sync_events
+void RequestHandler::notifyGroupChanged(qint64 conversationId, const QString &changeType,
+                                        qint64 operatorId, qint64 targetUserId)
+{
+    const int memberCount = m_db->getGroupMemberIds(conversationId).size();
+
+    QJsonObject payload;
+    payload["conversationId"] = conversationId;
+    payload["changeType"] = changeType;
+    payload["operatorId"] = operatorId;
+    if (targetUserId > 0) {
+        payload["targetUserId"] = targetUserId;
+    }
+    payload["memberCount"] = memberCount;
+    const QByteArray payloadJson = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::GroupChangedNotification;
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = payloadJson;
+    const QByteArray encoded = PacketCodec::encode(notifyPacket);
+
+    for (qint64 memberId : m_db->getGroupMemberIds(conversationId)) {
+        m_db->appendSyncEvent(memberId, "group_changed", QString::fromUtf8(payloadJson));
+        emit messageForUser(memberId, encoded);
+    }
+}
+
+// M7a: 创建群组
+void RequestHandler::processCreateGroupRequest(const Packet &packet, const QJsonObject &request)
+{
+    const QString name = request.value("name").toString().trimmed();
+    if (name.isEmpty() || name.size() > MaxGroupNameLength) {
+        sendResponse(packet.requestId, MessageType::CreateGroupResponse,
+                     ErrorCode::InvalidRequest,
+                     QString("Group name must be 1-%1 characters").arg(MaxGroupNameLength));
+        return;
+    }
+
+    // 解析并清洗初始成员：去重、剔除创建者自身、拒绝非法 ID
+    const QJsonArray memberArray = request.value("memberIds").toArray();
+    if (memberArray.size() > DatabaseManager::MaxInviteBatch) {
+        sendResponse(packet.requestId, MessageType::CreateGroupResponse,
+                     ErrorCode::GroupLimitExceeded,
+                     QString("At most %1 members per invite").arg(DatabaseManager::MaxInviteBatch));
+        return;
+    }
+
+    QList<qint64> memberIds;
+    QSet<qint64> seen;
+    for (const QJsonValue &v : memberArray) {
+        const qint64 id = v.toVariant().toLongLong();
+        if (id <= 0 || id == m_authenticatedUserId || seen.contains(id)) {
+            continue;
+        }
+        seen.insert(id);
+        memberIds.append(id);
+    }
+
+    // 含创建者的总人数不得超限
+    if (memberIds.size() + 1 > DatabaseManager::MaxGroupMembers) {
+        sendResponse(packet.requestId, MessageType::CreateGroupResponse,
+                     ErrorCode::GroupLimitExceeded,
+                     QString("Group members limited to %1").arg(DatabaseManager::MaxGroupMembers));
+        return;
+    }
+
+    // 初始成员必须均为已注册用户
+    for (qint64 id : memberIds) {
+        if (m_db->usernameById(id).isEmpty()) {
+            sendResponse(packet.requestId, MessageType::CreateGroupResponse,
+                         ErrorCode::AccountNotFound,
+                         QString("User %1 does not exist").arg(id));
+            return;
+        }
+    }
+
+    const qint64 convId = m_db->createGroup(m_authenticatedUserId, name, memberIds);
+    if (convId < 0) {
+        sendResponse(packet.requestId, MessageType::CreateGroupResponse,
+                     ErrorCode::InternalError, "Failed to create group");
+        return;
+    }
+
+    qDebug() << "[Handler] User" << m_authenticatedUserId << "created group" << convId
+             << "with" << memberIds.size() << "initial members";
+
+    // 建群系统消息（面向初始成员）与群变更通知
+    QJsonObject sysPayload;
+    sysPayload["event"] = "group_created";
+    sysPayload["operatorId"] = m_authenticatedUserId;
+    sysPayload["name"] = name;
+    postGroupSystemMessage(convId, m_authenticatedUserId, sysPayload);
+    notifyGroupChanged(convId, "group_created", m_authenticatedUserId, 0);
+
+    QJsonObject data;
+    data["conversationId"] = convId;
+    data["name"] = name;
+    data["memberCount"] = m_db->getGroupMemberIds(convId).size();
+    sendResponse(packet.requestId, MessageType::CreateGroupResponse, ErrorCode::Ok,
+                 "Group created", data);
+}
+
+// M7a: 邀请成员入群
+void RequestHandler::processInviteGroupMembersRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 convId = request.value("conversationId").toVariant().toLongLong();
+    if (convId <= 0) {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+    auto conv = m_db->getConversation(convId);
+    if (!conv.has_value() || conv->type != "group") {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::ConversationNotFound, "Group not found");
+        return;
+    }
+
+    // 先授权：仅群成员可邀请
+    if (!m_db->isConversationMember(convId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this group");
+        return;
+    }
+
+    const QJsonArray userArray = request.value("userIds").toArray();
+    if (userArray.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::InvalidRequest, "userIds is required");
+        return;
+    }
+    if (userArray.size() > DatabaseManager::MaxInviteBatch) {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::GroupLimitExceeded,
+                     QString("At most %1 members per invite").arg(DatabaseManager::MaxInviteBatch));
+        return;
+    }
+
+    // 逐个校验：合法、已注册、未在群中；受成员上限约束
+    QList<qint64> toAdd;
+    QSet<qint64> seen;
+    int currentCount = m_db->getGroupMemberIds(convId).size();
+    for (const QJsonValue &v : userArray) {
+        const qint64 id = v.toVariant().toLongLong();
+        if (id <= 0 || id == m_authenticatedUserId || seen.contains(id)) {
+            continue;
+        }
+        seen.insert(id);
+        if (m_db->usernameById(id).isEmpty()) {
+            sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                         ErrorCode::AccountNotFound,
+                         QString("User %1 does not exist").arg(id));
+            return;
+        }
+        if (m_db->isConversationMember(convId, id)) {
+            sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                         ErrorCode::MemberAlreadyExists,
+                         QString("User %1 is already in the group").arg(id));
+            return;
+        }
+        if (currentCount + toAdd.size() + 1 > DatabaseManager::MaxGroupMembers) {
+            sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                         ErrorCode::GroupLimitExceeded,
+                         QString("Group members limited to %1").arg(DatabaseManager::MaxGroupMembers));
+            return;
+        }
+        toAdd.append(id);
+    }
+    if (toAdd.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::InvalidRequest, "No valid users to invite");
+        return;
+    }
+
+    if (!m_db->addGroupMembers(convId, toAdd)) {
+        sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse,
+                     ErrorCode::InternalError, "Failed to add members");
+        return;
+    }
+
+    qDebug() << "[Handler] User" << m_authenticatedUserId << "invited" << toAdd.size()
+             << "members to group" << convId;
+
+    // 系统消息 + 群变更通知（面向变更后的全体成员，含新成员）
+    QJsonObject sysPayload;
+    sysPayload["event"] = "member_added";
+    sysPayload["operatorId"] = m_authenticatedUserId;
+    QJsonArray addedArray;
+    for (qint64 id : toAdd) {
+        addedArray.append(id);
+    }
+    sysPayload["targetUserIds"] = addedArray;
+    postGroupSystemMessage(convId, m_authenticatedUserId, sysPayload);
+    notifyGroupChanged(convId, "member_added", m_authenticatedUserId, toAdd.first());
+
+    QJsonObject data;
+    data["conversationId"] = convId;
+    data["added"] = addedArray;
+    data["memberCount"] = m_db->getGroupMemberIds(convId).size();
+    sendResponse(packet.requestId, MessageType::InviteGroupMembersResponse, ErrorCode::Ok,
+                 "Members invited", data);
+}
+
+// M7a: 退出群组（群主退群自动转让群主给最早入群成员，避免无主群）
+void RequestHandler::processLeaveGroupRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 convId = request.value("conversationId").toVariant().toLongLong();
+    if (convId <= 0) {
+        sendResponse(packet.requestId, MessageType::LeaveGroupResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+    auto conv = m_db->getConversation(convId);
+    if (!conv.has_value() || conv->type != "group") {
+        sendResponse(packet.requestId, MessageType::LeaveGroupResponse,
+                     ErrorCode::ConversationNotFound, "Group not found");
+        return;
+    }
+
+    const QString role = m_db->groupRole(convId, m_authenticatedUserId);
+    if (role.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::LeaveGroupResponse,
+                     ErrorCode::MemberNotFound, "Not a member of this group");
+        return;
+    }
+
+    // 群主退群：若仍有其他成员，先自动转让群主（降级策略）
+    if (role == "owner") {
+        qint64 successor = 0;
+        for (const auto &member : m_db->getGroupMembers(convId)) {
+            const qint64 memberId = member["userId"].toVariant().toLongLong();
+            if (memberId != m_authenticatedUserId) {
+                successor = memberId;
+                break;
+            }
+        }
+        if (successor > 0) {
+            m_db->updateMemberRole(convId, successor, "owner");
+            QJsonObject transferPayload;
+            transferPayload["event"] = "owner_transferred";
+            transferPayload["operatorId"] = m_authenticatedUserId;
+            transferPayload["newOwnerId"] = successor;
+            postGroupSystemMessage(convId, m_authenticatedUserId, transferPayload);
+            notifyGroupChanged(convId, "owner_transferred", m_authenticatedUserId, successor);
+        }
+    }
+
+    if (!m_db->removeGroupMember(convId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::LeaveGroupResponse,
+                     ErrorCode::InternalError, "Failed to leave group");
+        return;
+    }
+
+    qDebug() << "[Handler] User" << m_authenticatedUserId << "left group" << convId;
+
+    // 系统消息与变更通知面向剩余成员（退出者本人不再接收）
+    QJsonObject sysPayload;
+    sysPayload["event"] = "member_left";
+    sysPayload["operatorId"] = m_authenticatedUserId;
+    postGroupSystemMessage(convId, m_authenticatedUserId, sysPayload);
+    notifyGroupChanged(convId, "member_left", m_authenticatedUserId, m_authenticatedUserId);
+
+    QJsonObject data;
+    data["conversationId"] = convId;
+    sendResponse(packet.requestId, MessageType::LeaveGroupResponse, ErrorCode::Ok,
+                 "Left group", data);
+}
+
+// M7a: 移除群成员（仅群主/管理员，层级保护：不可移除同级或更高层级）
+void RequestHandler::processKickGroupMemberRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 convId = request.value("conversationId").toVariant().toLongLong();
+    const qint64 targetUserId = request.value("userId").toVariant().toLongLong();
+    if (convId <= 0 || targetUserId <= 0) {
+        sendResponse(packet.requestId, MessageType::KickGroupMemberResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId or userId");
+        return;
+    }
+    auto conv = m_db->getConversation(convId);
+    if (!conv.has_value() || conv->type != "group") {
+        sendResponse(packet.requestId, MessageType::KickGroupMemberResponse,
+                     ErrorCode::ConversationNotFound, "Group not found");
+        return;
+    }
+    if (targetUserId == m_authenticatedUserId) {
+        sendResponse(packet.requestId, MessageType::KickGroupMemberResponse,
+                     ErrorCode::InvalidRequest, "Cannot kick yourself, use leave_group");
+        return;
+    }
+
+    const QString myRole = m_db->groupRole(convId, m_authenticatedUserId);
+    const QString targetRole = m_db->groupRole(convId, targetUserId);
+    if (targetRole.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::KickGroupMemberResponse,
+                     ErrorCode::MemberNotFound, "Target is not a member of this group");
+        return;
+    }
+    // 层级保护：owner 可移除 admin/member；admin 仅可移除 member；member 无权
+    const bool allowed = (myRole == "owner" && targetRole != "owner")
+        || (myRole == "admin" && targetRole == "member");
+    if (!allowed) {
+        sendResponse(packet.requestId, MessageType::KickGroupMemberResponse,
+                     ErrorCode::NotGroupOwner, "Insufficient role to remove this member");
+        return;
+    }
+
+    if (!m_db->removeGroupMember(convId, targetUserId)) {
+        sendResponse(packet.requestId, MessageType::KickGroupMemberResponse,
+                     ErrorCode::InternalError, "Failed to remove member");
+        return;
+    }
+
+    qDebug() << "[Handler] User" << m_authenticatedUserId << "kicked" << targetUserId
+             << "from group" << convId;
+
+    // 系统消息与变更通知面向剩余成员（被移除者不再接收；其本地会话由客户端清理）
+    QJsonObject sysPayload;
+    sysPayload["event"] = "member_removed";
+    sysPayload["operatorId"] = m_authenticatedUserId;
+    sysPayload["targetUserId"] = targetUserId;
+    postGroupSystemMessage(convId, m_authenticatedUserId, sysPayload);
+    notifyGroupChanged(convId, "member_removed", m_authenticatedUserId, targetUserId);
+
+    QJsonObject data;
+    data["conversationId"] = convId;
+    data["removedUserId"] = targetUserId;
+    sendResponse(packet.requestId, MessageType::KickGroupMemberResponse, ErrorCode::Ok,
+                 "Member removed", data);
+}
+
+// M7a: 获取群信息（仅群成员）
+void RequestHandler::processGetGroupInfoRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 convId = request.value("conversationId").toVariant().toLongLong();
+    if (convId <= 0) {
+        sendResponse(packet.requestId, MessageType::GetGroupInfoResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+    auto conv = m_db->getConversation(convId);
+    if (!conv.has_value() || conv->type != "group") {
+        sendResponse(packet.requestId, MessageType::GetGroupInfoResponse,
+                     ErrorCode::ConversationNotFound, "Group not found");
+        return;
+    }
+
+    // 先授权再查询
+    const QString myRole = m_db->groupRole(convId, m_authenticatedUserId);
+    if (myRole.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::GetGroupInfoResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this group");
+        return;
+    }
+
+    QJsonArray memberArray;
+    for (const auto &member : m_db->getGroupMembers(convId)) {
+        memberArray.append(member);
+    }
+
+    QJsonObject data;
+    data["conversationId"] = convId;
+    data["name"] = conv->name;
+    data["memberCount"] = memberArray.size();
+    data["myRole"] = myRole;
+    data["members"] = memberArray;
+    sendResponse(packet.requestId, MessageType::GetGroupInfoResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// M7a: 群消息发送（明文入库 + fan-out；E2EE 在 M7b 用 Sender Keys 补齐）
+void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonObject &request,
+                                             qint64 conversationId, const QString &clientMessageId)
+{
+    auto conv = m_db->getConversation(conversationId);
+    if (!conv.has_value()) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::ConversationNotFound, "Conversation not found");
+        return;
+    }
+    if (conv->type != "group") {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest,
+                     "conversationId refers to a private conversation, use toUserId");
+        return;
+    }
+
+    // 先授权：仅群成员可发言
+    if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this group");
+        return;
+    }
+
+    const QString content = request.value("content").toString();
+    const QString contentType = request.value("contentType").toString("text");
+    if (content.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "Message content is empty");
+        return;
+    }
+    if (content.size() > MaxGroupMessageLength) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest, "Message content too long");
+        return;
+    }
+    if (contentType != "text") {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InvalidRequest,
+                     "Group messages only support text content in M7a");
+        return;
+    }
+
+    // M5.5 幂等重试优先：同键消息已存在时直接返回
+    if (auto existing = m_db->getMessageByClientKey(m_authenticatedUserId,
+                                                    m_currentDeviceId, clientMessageId);
+        existing.has_value()) {
+        QJsonObject retryData;
+        retryData["messageId"] = existing->id;
+        retryData["conversationId"] = existing->conversationId;
+        retryData["clientMessageId"] = clientMessageId;
+        retryData["status"] = existing->status;
+        retryData["reused"] = true;
+        sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
+                     "Message sent", retryData);
+        return;
+    }
+
+    const qint64 msgId = m_db->sendMessage(conversationId, m_authenticatedUserId, content,
+                                           contentType, clientMessageId, m_currentDeviceId);
+    if (msgId < 0) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InternalError, "Failed to send message");
+        return;
+    }
+
+    const QString createdAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    const QString senderUsername = m_db->usernameById(m_authenticatedUserId);
+
+    // 写入全体成员（含发送方其他设备）的同步事件流，离线由游标兜底
+    QJsonObject ev;
+    ev["messageId"] = msgId;
+    ev["conversationId"] = conversationId;
+    ev["senderId"] = m_authenticatedUserId;
+    ev["content"] = content;
+    ev["contentType"] = contentType;
+    ev["clientMessageId"] = clientMessageId;
+    ev["createdAt"] = createdAt;
+    const QString evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
+
+    // 在线推送给除发送方外的成员（小群直推 fan-out）
+    QJsonObject notifyJson = ev;
+    notifyJson["senderUsername"] = senderUsername;
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::NewMessageNotification;
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = QJsonDocument(notifyJson).toJson(QJsonDocument::Compact);
+    const QByteArray encoded = PacketCodec::encode(notifyPacket);
+
+    for (qint64 memberId : m_db->getGroupMemberIds(conversationId)) {
+        m_db->appendSyncEvent(memberId, "message", evJson);
+        if (memberId != m_authenticatedUserId) {
+            emit messageForUser(memberId, encoded);
+        }
+    }
+
+    QJsonObject data;
+    data["messageId"] = msgId;
+    data["conversationId"] = conversationId;
+    data["clientMessageId"] = clientMessageId;
+    data["status"] = "sent";
+    sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
+                 "Message sent", data);
 }
 
 // Session 验证

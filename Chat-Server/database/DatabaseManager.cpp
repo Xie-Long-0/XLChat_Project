@@ -583,6 +583,18 @@ std::optional<UserInfo> DatabaseManager::getUserByUsername(const QString &userna
     return std::nullopt;
 }
 
+QString DatabaseManager::usernameById(qint64 userId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT username FROM users WHERE id = ?");
+    q.addBindValue(userId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toString();
+    }
+    return QString();
+}
+
 qint64 DatabaseManager::registerUser(const QString &username,
                                      const QString &email,
                                      const QString &phone,
@@ -1412,6 +1424,28 @@ int DatabaseManager::receiptCount(qint64 messageId, const QString &status)
     return 0;
 }
 
+int DatabaseManager::receiptUserCount(qint64 messageId, const QString &status)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    // M7a: 按接收用户去重计数（同一用户多设备回执不重复计数），
+    // 与聚合基准 memberCountExcluding 的人数语义保持一致
+    if (status == "read") {
+        q.prepare(
+            "SELECT COUNT(DISTINCT user_id) FROM message_receipts "
+            "WHERE message_id = ? AND read_at IS NOT NULL");
+    } else {
+        q.prepare(
+            "SELECT COUNT(DISTINCT user_id) FROM message_receipts "
+            "WHERE message_id = ? AND (delivered_at IS NOT NULL OR read_at IS NOT NULL)");
+    }
+    q.addBindValue(messageId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt();
+    }
+    return 0;
+}
+
 bool DatabaseManager::updateMemberReadCursor(qint64 conversationId, qint64 userId, qint64 messageId)
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -1958,4 +1992,37 @@ bool DatabaseManager::setGroupName(qint64 conversationId, const QString &name)
         return false;
     }
     return q.numRowsAffected() > 0;
+}
+
+QList<qint64> DatabaseManager::getGroupMemberIds(qint64 conversationId)
+{
+    QList<qint64> result;
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT user_id FROM conversation_members "
+        "WHERE conversation_id = ? "
+        "ORDER BY joined_at, user_id");
+    q.addBindValue(conversationId);
+    if (q.exec()) {
+        while (q.next()) {
+            result.append(q.value(0).toLongLong());
+        }
+    }
+    return result;
+}
+
+int DatabaseManager::memberCountExcluding(qint64 conversationId, qint64 excludeUserId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT COUNT(*) FROM conversation_members "
+        "WHERE conversation_id = ? AND user_id != ?");
+    q.addBindValue(conversationId);
+    q.addBindValue(excludeUserId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt();
+    }
+    return 0;
 }
