@@ -7,7 +7,7 @@
 
 #include <optional>
 
-// ── 数据结构 ─────────────────────────────────────────────────────────────────
+// 数据结构
 struct UserInfo
 {
     qint64 id = 0;
@@ -93,17 +93,17 @@ struct ClaimedPrekey
     QString prekeyPub; // Base64 编码的 X25519 公钥
 };
 
-// ── DatabaseManager ──────────────────────────────────────────────────────────
+// DatabaseManager
 class DatabaseManager
 {
 public:
-    explicit DatabaseManager(const QString &connectionName = QStringLiteral("main"));
+    explicit DatabaseManager(const QString &connectionName = "main");
     ~DatabaseManager();
 
     // 初始化：打开连接并运行迁移
     bool initialize();
 
-    // ── 用户管理 ─────────────────────────────────────────────────────────────
+    // 用户管理
     bool userExists(const QString &username);
     std::optional<UserInfo> getUserByUsername(const QString &username);
     qint64 registerUser(const QString &username,
@@ -111,7 +111,7 @@ public:
                         const QString &phone,
                         const QString &passwordHash);
 
-    // ── Session 管理 ─────────────────────────────────────────────────────────
+    // Session 管理
     qint64 createSession(qint64 userId,
                          const QString &deviceId,
                          const QString &tokenHash,
@@ -124,7 +124,7 @@ public:
     bool deleteSessionsByUserId(qint64 userId);
     QList<SessionInfo> getSessionsByUserId(qint64 userId);
 
-    // ── 登录审计 ─────────────────────────────────────────────────────────────
+    // 登录审计
     void recordLoginAttempt(qint64 userId,
                             const QString &ipAddress,
                             bool success,
@@ -132,7 +132,7 @@ public:
     int recentFailedLoginCount(const QString &ipAddress, int windowSeconds = 300);
     int recentFailedLoginCountForUser(qint64 userId, int windowSeconds = 300);
 
-    // ── 设备管理 ─────────────────────────────────────────────────────────────────
+    // 设备管理
     bool registerDevice(qint64 userId,
                         const QString &deviceId,
                         const QString &deviceName,
@@ -140,16 +140,16 @@ public:
     QList<QJsonObject> getDevicesByUserId(qint64 userId);
     bool removeDevice(qint64 userId, const QString &deviceId);
 
-    // ── 用户搜索 ─────────────────────────────────────────────────────────────────
+    // 用户搜索
     QList<UserInfo> searchUsers(const QString &query, int limit = 20);
 
-    // ── 联系人管理 ─────────────────────────────────────────────────────────────
+    // 联系人管理
     bool addContact(qint64 userId, qint64 contactUserId);
     bool removeContact(qint64 userId, qint64 contactUserId);
     QList<ContactInfo> getContacts(qint64 userId);
     bool isContact(qint64 userId, qint64 contactUserId);
 
-    // ── 会话管理 ─────────────────────────────────────────────────────────────
+    // 会话管理
     qint64 getOrCreatePrivateConversation(qint64 userId1, qint64 userId2);
     QList<ConversationInfo> getConversationsForUser(qint64 userId);
     std::optional<ConversationInfo> getConversation(qint64 conversationId);
@@ -157,7 +157,7 @@ public:
     bool isConversationMember(qint64 conversationId, qint64 userId);
     bool canAccessMessage(qint64 messageId, qint64 userId);
 
-    // ── 消息管理 ─────────────────────────────────────────────────────────────
+    // 消息管理
     qint64 sendMessage(qint64 conversationId, qint64 senderId,
                        const QString &content, const QString &contentType = "text",
                        const QString &clientMessageId = {},
@@ -183,7 +183,7 @@ public:
     qint64 appendSyncEvent(qint64 userId, const QString &eventType, const QString &payloadJson);
     QList<SyncEventInfo> getSyncEvents(qint64 userId, qint64 afterSeq, int limit = 200);
 
-    // ── M6: 端到端加密密钥管理 ─────────────────────────────────────────────
+    // M6: 端到端加密密钥管理
     // 注册/更新设备身份公钥（仅公钥，私钥永不离开客户端）
     bool upsertIdentityKey(qint64 userId, const QString &deviceId, const QString &identityPub);
     QList<DeviceIdentityKey> getIdentityKeysByUser(qint64 userId);

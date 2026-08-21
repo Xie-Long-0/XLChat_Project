@@ -49,7 +49,7 @@ PacketCodec::DecodeStatus PacketCodec::nextPacket(Packet &packet, QString *error
 
     if (magic != Magic) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("Invalid packet magic");
+            *errorMessage = "Invalid packet magic";
         }
         m_buffer.clear();
         return DecodeStatus::InvalidData;
@@ -57,7 +57,7 @@ PacketCodec::DecodeStatus PacketCodec::nextPacket(Packet &packet, QString *error
 
     if (version != CurrentVersion) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("Unsupported protocol version");
+            *errorMessage = "Unsupported protocol version";
         }
         m_buffer.clear();
         return DecodeStatus::InvalidData;
@@ -65,7 +65,7 @@ PacketCodec::DecodeStatus PacketCodec::nextPacket(Packet &packet, QString *error
 
     if (payloadLength > MaxPayloadSize) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("Payload too large");
+            *errorMessage = "Payload too large";
         }
         m_buffer.clear();
         return DecodeStatus::InvalidData;

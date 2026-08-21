@@ -92,7 +92,7 @@ void TestDatabaseManager::cleanupTestCase()
     QSqlDatabase::removeDatabase(m_connectionName);
 }
 
-// ── 迁移 ──
+// 迁移
 void TestDatabaseManager::migrationCreatesAllTables()
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -297,7 +297,7 @@ void TestDatabaseManager::syncEventsCursorWorks()
     QCOMPARE(limited.size(), 1);
 }
 
-// ── 用户管理 ──
+// 用户管理
 void TestDatabaseManager::registerAndRetrieveUser()
 {
     const qint64 id = m_db->registerUser(
@@ -328,7 +328,7 @@ void TestDatabaseManager::userExistsReturnsCorrectly()
     QVERIFY(!m_db->userExists("nonexistent"));
 }
 
-// ── Session ──
+// Session
 void TestDatabaseManager::createAndRetrieveSession()
 {
     auto user = m_db->getUserByUsername("testuser");
@@ -376,7 +376,7 @@ void TestDatabaseManager::sessionExpiryIsSet()
     QVERIFY(!session->expiresAt.isEmpty());
 }
 
-// ── 登录审计 ──
+// 登录审计
 void TestDatabaseManager::recordAndCountFailedLogins()
 {
     auto user = m_db->getUserByUsername("testuser");
@@ -399,7 +399,7 @@ void TestDatabaseManager::recordAndCountFailedLogins()
     QCOMPARE(m_db->recentFailedLoginCount("192.168.1.1"), 3);
 }
 
-// ── 设备管理 ──
+// 设备管理
 void TestDatabaseManager::registerAndListDevices()
 {
     auto user = m_db->getUserByUsername("testuser");
@@ -420,7 +420,7 @@ void TestDatabaseManager::registerAndListDevices()
     QCOMPARE(devices.size(), 1);
 }
 
-// ── 联系人 ──
+// 联系人
 void TestDatabaseManager::addAndListContacts()
 {
     // 注册第二个用户
@@ -455,7 +455,7 @@ void TestDatabaseManager::contactIsBidirectional()
     QVERIFY(m_db->isContact(user2->id, user1->id));
 }
 
-// ── M3 会话与消息 ──
+// M3 会话与消息
 void TestDatabaseManager::createPrivateConversation()
 {
     auto user1 = m_db->getUserByUsername("testuser");
@@ -553,7 +553,7 @@ void TestDatabaseManager::markMessagesAsRead()
     QCOMPARE(unread, 0);
 }
 
-// ── M6: 端到端加密密钥管理 ──
+// M6: 端到端加密密钥管理
 void TestDatabaseManager::v5TablesExist()
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -575,14 +575,14 @@ void TestDatabaseManager::identityKeyUpsertAndRetrieve()
     QVERIFY(m_db->upsertIdentityKey(userId, "dev-a", "pubA"));
     auto keys = m_db->getIdentityKeysByUser(userId);
     QCOMPARE(keys.size(), 1);
-    QCOMPARE(keys[0].deviceId, QStringLiteral("dev-a"));
-    QCOMPARE(keys[0].identityPub, QStringLiteral("pubA"));
+    QCOMPARE(keys[0].deviceId, "dev-a");
+    QCOMPARE(keys[0].identityPub, "pubA");
 
     // UPSERT：同设备更新公钥不新增记录
     QVERIFY(m_db->upsertIdentityKey(userId, "dev-a", "pubA2"));
     keys = m_db->getIdentityKeysByUser(userId);
     QCOMPARE(keys.size(), 1);
-    QCOMPARE(keys[0].identityPub, QStringLiteral("pubA2"));
+    QCOMPARE(keys[0].identityPub, "pubA2");
 
     // 空参数被拒绝
     QVERIFY(!m_db->upsertIdentityKey(userId, "", "pub"));
@@ -632,7 +632,7 @@ void TestDatabaseManager::prekeyClaimIsOncePerDevice()
     // 再次认领：dev-b 无库存，只剩 dev-a，且不会重复认领同一预密钥
     auto claimed2 = m_db->claimPrekeys(user->id);
     QCOMPARE(claimed2.size(), 1);
-    QCOMPARE(claimed2[0].deviceId, QStringLiteral("dev-a"));
+    QCOMPARE(claimed2[0].deviceId, "dev-a");
     QVERIFY(claimed2[0].prekeyId != firstDevAPrekeyId);
 
     // 同一预密钥不会被两次认领：继续认领直到耗尽

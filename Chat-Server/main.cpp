@@ -28,7 +28,7 @@ int main(int argc, char *argv[])
         qWarning() << "[Main] TLS init failed.";
     }
 
-    // M5.5: fail-closed —— TLS 不可用且未显式允许明文时拒绝启动
+    // M5.5: fail-closed：TLS 不可用且未显式允许明文时拒绝启动
     if (!server.start(12345, parser.isSet(plaintextOption)))
     {
         qCritical() << "Failed to start server";

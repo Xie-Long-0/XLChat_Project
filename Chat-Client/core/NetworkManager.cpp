@@ -40,7 +40,7 @@ NetworkManager::NetworkManager(QObject *parent) :
     initTls();
 }
 
-// ── 登录 ──
+// 登录
 void NetworkManager::login(const QString &username, const QString &password)
 {
     m_pendingUsername = username;
@@ -59,7 +59,7 @@ void NetworkManager::login(const QString &username, const QString &password)
     }
 }
 
-// ── 注册 ──
+// 注册
 void NetworkManager::registerAccount(const QString &username, const QString &password,
                                      const QString &email, const QString &phone)
 {
@@ -81,7 +81,7 @@ void NetworkManager::registerAccount(const QString &username, const QString &pas
     }
 }
 
-// ── 登出 ──
+// 登出
 void NetworkManager::logout()
 {
     if (m_state != ConnectionState::Authenticated) {
@@ -99,7 +99,7 @@ void NetworkManager::logout()
     sendPacket(packet);
 }
 
-// ── Token 续期 ──
+// Token 续期
 void NetworkManager::renewToken()
 {
     if (m_state != ConnectionState::Authenticated || m_sessionToken.isEmpty()) {
@@ -118,7 +118,7 @@ void NetworkManager::renewToken()
     sendPacket(packet);
 }
 
-// ── 连接回调 ──
+// 连接回调
 void NetworkManager::onConnected()
 {
     setState(ConnectionState::Connected);
@@ -193,7 +193,7 @@ void NetworkManager::onSocketError(QAbstractSocket::SocketError socketError)
     }
 }
 
-// ── M5: SSL 错误处理 ──
+// M5: SSL 错误处理
 void NetworkManager::onSslErrors(const QList<QSslError> &errors)
 {
     // 证书错误时明确拒绝连接
@@ -234,16 +234,16 @@ void NetworkManager::connectToServer()
         return;
     }
 
-    // M5.5: fail-closed —— TLS 不可用时拒绝连接，
+    // M5.5: fail-closed：TLS 不可用时拒绝连接，
     // 除非显式设置环境变量 XYCHAT_ALLOW_PLAINTEXT=1（仅限开发）
     if (!m_tlsEnabled) {
         if (qEnvironmentVariable("XYCHAT_ALLOW_PLAINTEXT") == "1") {
             qWarning() << "[NetMgr] Connecting in PLAINTEXT development mode."
                        << "Do not use in production.";
         } else {
-            const QString err = QStringLiteral(
+            const QString err = 
                 "TLS unavailable: CA certificate not found. "
-                "Refusing plaintext connection (set XYCHAT_ALLOW_PLAINTEXT=1 for development only).");
+                "Refusing plaintext connection (set XYCHAT_ALLOW_PLAINTEXT=1 for development only).";
             qCritical() << "[NetMgr]" << err;
             m_reconnectEnabled = false;
             if (m_loginQueued) {
@@ -265,7 +265,7 @@ void NetworkManager::connectToServer()
     }
 }
 
-// ── M5: TLS 初始化 ──
+// M5: TLS 初始化
 void NetworkManager::initTls()
 {
     using namespace XYChat::Security;
@@ -310,7 +310,7 @@ void NetworkManager::initTls()
     qInfo() << "[NetMgr] TLS enabled, CA:" << caCertPath;
 }
 
-// ── 发送登录请求 ──
+// 发送登录请求
 void NetworkManager::sendLoginRequest()
 {
     QJsonObject json;
@@ -333,7 +333,7 @@ void NetworkManager::sendLoginRequest()
     sendPacket(packet);
 }
 
-// ── 发送注册请求 ──
+// 发送注册请求
 void NetworkManager::sendRegisterRequest()
 {
     QJsonObject json;
@@ -354,7 +354,7 @@ void NetworkManager::sendRegisterRequest()
     sendPacket(packet);
 }
 
-// ── 包分发 ──
+// 包分发
 void NetworkManager::handlePacket(const Packet &packet)
 {
     switch (packet.messageType) {
@@ -421,7 +421,7 @@ void NetworkManager::handlePacket(const Packet &packet)
     }
 }
 
-// ── 登录响应 ──
+// 登录响应
 void NetworkManager::handleLoginResponse(const Packet &packet)
 {
     if (packet.requestId != m_pendingLoginRequestId) {
@@ -454,7 +454,7 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
     emit loginFailed(message);
 }
 
-// ── 注册响应 ──
+// 注册响应
 void NetworkManager::handleRegisterResponse(const Packet &packet)
 {
     if (packet.requestId != m_pendingRegisterRequestId) {
@@ -479,7 +479,7 @@ void NetworkManager::handleRegisterResponse(const Packet &packet)
     emit registerFailed(message);
 }
 
-// ── 登出响应 ──
+// 登出响应
 void NetworkManager::handleLogoutResponse(const Packet &packet)
 {
     Q_UNUSED(packet);
@@ -489,7 +489,7 @@ void NetworkManager::handleLogoutResponse(const Packet &packet)
     emit logoutFinished();
 }
 
-// ── Token 续期响应 ──
+// Token 续期响应
 void NetworkManager::handleTokenRenewResponse(const Packet &packet)
 {
     const QJsonDocument responseDoc = QJsonDocument::fromJson(packet.payload);
@@ -504,7 +504,7 @@ void NetworkManager::handleTokenRenewResponse(const Packet &packet)
     }
 }
 
-// ── 工具 ──
+// 工具
 void NetworkManager::sendPacket(const Packet &packet)
 {
     const QByteArray encoded = PacketCodec::encode(packet);
@@ -556,7 +556,7 @@ void NetworkManager::resetAuthState()
     }
     m_localPrekeys.clear();
     // M6.5: 登出清除本地用户数据（消息/会话/outbox/同步游标）；
-    // 解密缓存与存储密钥属 E2EE 密钥材料，必须保留——登出重登时一次性
+    // 解密缓存与存储密钥属 E2EE 密钥材料，必须保留：登出重登时一次性
     // 预密钥已消费不可恢复，对方消息只能靠解密缓存兜底（M6 产品承诺）；
     // E2EE 身份密钥同样不在此列，仍由 KeyStorage 保留供下次登录复用
     if (m_localStore.isOpen()) {
@@ -566,14 +566,14 @@ void NetworkManager::resetAuthState()
     emit sessionChanged();
 }
 
-// ── M5: 重放保护 ──
+// M5: 重放保护
 void NetworkManager::addReplayProtection(QJsonObject &json)
 {
     json["timestamp"] = QDateTime::currentSecsSinceEpoch();
     json["nonce"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
-// ── M3: 用户搜索 ──
+// M3: 用户搜索
 void NetworkManager::searchUsers(const QString &query)
 {
     if (m_state != ConnectionState::Authenticated) return;
@@ -591,7 +591,7 @@ void NetworkManager::searchUsers(const QString &query)
     sendPacket(packet);
 }
 
-// ── M3: 添加联系人 ──
+// M3: 添加联系人
 void NetworkManager::addContact(qint64 userId)
 {
     if (m_state != ConnectionState::Authenticated) return;
@@ -609,7 +609,7 @@ void NetworkManager::addContact(qint64 userId)
     sendPacket(packet);
 }
 
-// ── M3: 获取联系人列表 ──
+// M3: 获取联系人列表
 void NetworkManager::getContacts()
 {
     if (m_state != ConnectionState::Authenticated) return;
@@ -626,7 +626,7 @@ void NetworkManager::getContacts()
     sendPacket(packet);
 }
 
-// ── M3: 获取会话列表 ──
+// M3: 获取会话列表
 void NetworkManager::getConversations()
 {
     if (m_state != ConnectionState::Authenticated) return;
@@ -643,7 +643,7 @@ void NetworkManager::getConversations()
     sendPacket(packet);
 }
 
-// ── M3: 发送消息 ──
+// M3: 发送消息
 QString NetworkManager::sendMessage(qint64 toUserId, const QString &content)
 {
     // M5.5: 客户端生成幂等键，重试/重连重发不会产生重复消息
@@ -717,7 +717,7 @@ void NetworkManager::flushOutbox()
     }
 }
 
-// ── M6: E2EE 引导（加载/生成身份密钥，补齐预密钥，注册到服务端） ──
+// M6: E2EE 引导（加载/生成身份密钥，补齐预密钥，注册到服务端）
 void NetworkManager::bootstrapE2ee()
 {
     using namespace XYChat::Security;
@@ -1196,7 +1196,7 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
     }
 }
 
-// ── M3: 确认消息 ──
+// M3: 确认消息
 void NetworkManager::ackMessage(qint64 messageId, const QString &status)
 {
     if (m_state != ConnectionState::Authenticated) return;
@@ -1215,7 +1215,7 @@ void NetworkManager::ackMessage(qint64 messageId, const QString &status)
     sendPacket(packet);
 }
 
-// ── M3: 同步消息 ──
+// M3: 同步消息
 void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int limit)
 {
     // M6.5: 首页拉取先立即展示本地缓存（重启后即刻可见、离线可查），
@@ -1244,7 +1244,7 @@ void NetworkManager::syncMessages(qint64 conversationId, qint64 afterId, int lim
     sendPacket(packet);
 }
 
-// ── M3: 响应处理 ──
+// M3: 响应处理
 void NetworkManager::handleSearchUsersResponse(const Packet &packet)
 {
     if (packet.requestId != m_pendingSearchRequestId) return;
@@ -1292,7 +1292,7 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
             QJsonObject conv = value.toObject();
             const QString lastMessage = conv.value("lastMessage").toString();
             if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(lastMessage)) {
-                conv["lastMessage"] = QStringLiteral("[Encrypted message]");
+                conv["lastMessage"] = "[Encrypted message]";
                 value = conv;
             }
         }
@@ -1300,7 +1300,7 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
         // 解密缓存回填真实明文，避免持久化预览退化为 "[Encrypted message]"
         for (QJsonValueRef value : conversations) {
             QJsonObject conv = value.toObject();
-            if (conv.value("lastMessage").toString() == QStringLiteral("[Encrypted message]")) {
+            if (conv.value("lastMessage").toString() == "[Encrypted message]") {
                 const qint64 lastMessageId =
                     conv.value("lastMessageId").toVariant().toLongLong();
                 const QString cached = m_localStore.loadDecryptedContent(lastMessageId);
@@ -1347,8 +1347,8 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
             cached["senderId"] = m_userId;
             cached["senderUsername"] = m_username;
             cached["content"] = sentContent;
-            cached["contentType"] = QStringLiteral("text");
-            cached["status"] = QStringLiteral("sent");
+            cached["contentType"] = "text";
+            cached["status"] = "sent";
             cached["clientMessageId"] = ackedId;
             cached["createdAt"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
             m_localStore.upsertMessage(cached);
@@ -1404,7 +1404,7 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     {
         const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
         const QString preview = msg.value("undecryptable").toBool()
-            ? QStringLiteral("[Encrypted message]")
+            ? "[Encrypted message]"
             : msg.value("content").toString();
         m_localStore.bumpConversationPreview(convId, preview, true);
     }
@@ -1417,7 +1417,7 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     }
 }
 
-// ── M5.5: 消息状态更新推送 ──
+// M5.5: 消息状态更新推送
 void NetworkManager::handleMessageStatusUpdate(const Packet &packet)
 {
     const QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
@@ -1430,7 +1430,7 @@ void NetworkManager::handleMessageStatusUpdate(const Packet &packet)
     }
 }
 
-// ── M5.5: 账号级增量同步 ──
+// M5.5: 账号级增量同步
 void NetworkManager::syncEvents(qint64 afterSeq, int limit)
 {
     if (m_state != ConnectionState::Authenticated) return;
@@ -1461,7 +1461,7 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
         QJsonArray events = data.value("events").toArray();
         for (QJsonValueRef value : events) {
             QJsonObject event = value.toObject();
-            if (event.value("type").toString() == QStringLiteral("message")) {
+            if (event.value("type").toString() == "message") {
                 QJsonObject payload = event.value("payload").toObject();
                 decryptMessageObject(payload);
                 event["payload"] = payload;
@@ -1476,7 +1476,7 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
     }
 }
 
-// ── M6.5: 本地持久化缓存 ──
+// M6.5: 本地持久化缓存
 void NetworkManager::openLocalStore()
 {
     if (m_username.isEmpty() || m_localDeviceId.isEmpty()) {
@@ -1540,12 +1540,12 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
         const QString type = event.value("type").toString();
         const QJsonObject payload = event.value("payload").toObject();
 
-        if (type == QStringLiteral("message")) {
+        if (type == "message") {
             QJsonObject msg = payload;
             // 事件流无状态字段：按发送方推导初始状态
             const bool fromSelf = msg.value("senderId").toVariant().toLongLong() == m_userId;
-            msg["status"] = fromSelf ? QStringLiteral("sent")
-                                     : QStringLiteral("delivered");
+            msg["status"] = fromSelf ? "sent"
+                                     : "delivered";
             // 本机已成功投递的消息同步移除 outbox（ACK 丢失时的兜底）
             const QString cmid = msg.value("clientMessageId").toString();
             if (fromSelf && !cmid.isEmpty()) {
@@ -1558,7 +1558,7 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
                 m_localStore.removeOutboxItem(cmid);
             }
             m_localStore.upsertMessage(msg);
-        } else if (type == QStringLiteral("receipt")) {
+        } else if (type == "receipt") {
             m_localStore.updateMessageStatus(
                 payload.value("messageId").toVariant().toLongLong(),
                 payload.value("status").toString());
@@ -1576,7 +1576,7 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
     }
 }
 
-// ── QML 辅助方法 ──
+// QML 辅助方法
 QString NetworkManager::encryptPassword(const QString &password) const
 {
     return EncryptionManager::encryptPassword(password);

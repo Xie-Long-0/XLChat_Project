@@ -16,7 +16,7 @@ class TestSecurity : public QObject
     Q_OBJECT
 
 private slots:
-    // ── LogSanitizer 测试 ──
+    // LogSanitizer 测试
     void testMaskPassword();
     void testMaskToken();
     void testMaskMessageContent();
@@ -24,11 +24,11 @@ private slots:
     void testMaskEmail();
     void testMaskGeneric();
 
-    // ── SecureMemory 测试 ──
+    // SecureMemory 测试
     void testWipeByteArray();
     void testWipeString();
 
-    // ── TlsHelper 测试 ──
+    // TlsHelper 测试
     void testGenerateDevCertificates();
     void testLoadServerConfig();
     void testLoadClientConfig();
@@ -39,7 +39,7 @@ private slots:
     void testNonceExpiresAfterTtl();
 };
 
-// ── LogSanitizer ──
+// LogSanitizer
 
 void TestSecurity::testMaskPassword()
 {
@@ -93,7 +93,7 @@ void TestSecurity::testMaskGeneric()
     QCOMPARE(LogSanitizer::mask("", 4), QString("[empty]"));
 }
 
-// ── SecureMemory ──
+// SecureMemory
 
 void TestSecurity::testWipeByteArray()
 {
@@ -111,7 +111,7 @@ void TestSecurity::testWipeString()
     QVERIFY(str.isEmpty());
 }
 
-// ── TlsHelper ──
+// TlsHelper
 
 void TestSecurity::testGenerateDevCertificates()
 {

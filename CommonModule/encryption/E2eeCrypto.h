@@ -27,7 +27,7 @@ public:
         bool valid = false;
     };
 
-    // ── 密钥操作 ─────────────────────────────────────────────────────────────
+    // 密钥操作
     // 生成 X25519 密钥对（身份密钥或一次性预密钥均可复用）
     static KeyPair generateX25519KeyPair();
 
@@ -46,7 +46,7 @@ public:
     // 身份公钥指纹（SHA-256 hex，前 16 字节），用于 TOFU 信任管理
     static QString publicKeyFingerprint(const QByteArray &publicKey);
 
-    // ── 消息加解密 ───────────────────────────────────────────────────────────
+    // 消息加解密
     struct GcmResult
     {
         QByteArray iv;         // 12 字节
@@ -58,7 +58,7 @@ public:
     static QByteArray aesGcmDecrypt(const QByteArray &key, const QByteArray &iv,
                                     const QByteArray &ciphertext);
 
-    // ── envelope 编解码 ──────────────────────────────────────────────────────
+    // envelope 编解码
     // envelope: {"v":1,"devices":[{"deviceId","prekeyId","eph","iv","ct"}...]}
     // prekeyId == SelfCopyPrekeyId 表示发送方自己设备的拷贝（仅用身份密钥加密，
     // 使发送方重新登录/多端同步后仍能解密自己发出的消息）

@@ -115,7 +115,7 @@ bool TlsHelper::generateDevCertificates(const QString &certDir)
     return generateCaCert(certDir) && generateServerCert(certDir);
 }
 
-// ── 内部辅助：写入 EVP_PKEY 到 PEM 文件（使用内存 BIO 避免 Windows applink 问题）───
+// 内部辅助：写入 EVP_PKEY 到 PEM 文件（使用内存 BIO 避免 Windows applink 问题）
 static bool writeKeyToFile(EVP_PKEY *pkey, const QString &path)
 {
     BIO *bio = BIO_new(BIO_s_mem());
@@ -136,7 +136,7 @@ static bool writeKeyToFile(EVP_PKEY *pkey, const QString &path)
     return ok;
 }
 
-// ── 内部辅助：写入 X509 到 PEM 文件 ─────────────────────────────────────────
+// 内部辅助：写入 X509 到 PEM 文件
 static bool writeCertToFile(X509 *cert, const QString &path)
 {
     BIO *bio = BIO_new(BIO_s_mem());
@@ -157,7 +157,7 @@ static bool writeCertToFile(X509 *cert, const QString &path)
     return ok;
 }
 
-// ── 内部辅助：从 PEM 文件读取 EVP_PKEY ──────────────────────────────────────
+// 内部辅助：从 PEM 文件读取 EVP_PKEY
 static EVP_PKEY *readKeyFromFile(const QString &path)
 {
     QFile file(path);
@@ -171,7 +171,7 @@ static EVP_PKEY *readKeyFromFile(const QString &path)
     return pkey;
 }
 
-// ── 内部辅助：从 PEM 文件读取 X509 ─────────────────────────────────────────
+// 内部辅助：从 PEM 文件读取 X509
 static X509 *readCertFromFile(const QString &path)
 {
     QFile file(path);

@@ -68,7 +68,7 @@ void DatabaseManager::closeDatabase()
     QSqlDatabase::removeDatabase(m_connectionName);
 }
 
-// ── 迁移 ─────────────────────────────────────────────────────────────────────
+// 迁移
 bool DatabaseManager::runMigrations()
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -494,7 +494,7 @@ bool DatabaseManager::migrateToV6()
     return true;
 }
 
-// ── 用户管理 ─────────────────────────────────────────────────────────────────
+// 用户管理
 bool DatabaseManager::userExists(const QString &username)
 {
     QSqlDatabase db = QSqlDatabase::database(m_connectionName);
@@ -549,7 +549,7 @@ qint64 DatabaseManager::registerUser(const QString &username,
     return -1;
 }
 
-// ── Session 管理 ─────────────────────────────────────────────────────────────
+// Session 管理
 qint64 DatabaseManager::createSession(qint64 userId,
                                       const QString &deviceId,
                                       const QString &tokenHash,
@@ -675,7 +675,7 @@ QList<SessionInfo> DatabaseManager::getSessionsByUserId(qint64 userId)
     return result;
 }
 
-// ── 登录审计 ─────────────────────────────────────────────────────────────────
+// 登录审计
 void DatabaseManager::recordLoginAttempt(qint64 userId,
                                          const QString &ipAddress,
                                          bool success,
@@ -725,7 +725,7 @@ int DatabaseManager::recentFailedLoginCountForUser(qint64 userId, int windowSeco
     return 0;
 }
 
-// ── 设备管理 ─────────────────────────────────────────────────────────────────
+// 设备管理
 bool DatabaseManager::registerDevice(qint64 userId,
                                      const QString &deviceId,
                                      const QString &deviceName,
@@ -788,7 +788,7 @@ bool DatabaseManager::removeDevice(qint64 userId, const QString &deviceId)
     return removeDeviceKeys(userId, deviceId);
 }
 
-// ── 用户搜索 ─────────────────────────────────────────────────────────────────
+// 用户搜索
 QList<UserInfo> DatabaseManager::searchUsers(const QString &query, int limit)
 {
     QList<UserInfo> result;
@@ -812,7 +812,7 @@ QList<UserInfo> DatabaseManager::searchUsers(const QString &query, int limit)
     return result;
 }
 
-// ── 联系人管理 ─────────────────────────────────────────────────────────────────
+// 联系人管理
 bool DatabaseManager::addContact(qint64 userId, qint64 contactUserId)
 {
     if (userId == contactUserId) return false;
@@ -882,7 +882,7 @@ bool DatabaseManager::isContact(qint64 userId, qint64 contactUserId)
     return false;
 }
 
-// ── 会话管理 ─────────────────────────────────────────────────────────────────
+// 会话管理
 qint64 DatabaseManager::getOrCreatePrivateConversation(qint64 userId1, qint64 userId2)
 {
     if (userId1 == userId2) return -1;
@@ -1043,13 +1043,13 @@ bool DatabaseManager::canAccessMessage(qint64 messageId, qint64 userId)
     return false;
 }
 
-// ── 消息管理 ─────────────────────────────────────────────────────────────────
+// 消息管理
 qint64 DatabaseManager::sendMessage(qint64 conversationId, qint64 senderId,
                                     const QString &content, const QString &contentType,
                                     const QString &clientMessageId,
                                     const QString &senderDeviceId)
 {
-    // M5.5: 幂等去重 —— 同一设备重复提交同一 client_message_id 时返回已有消息
+    // M5.5: 幂等去重：同一设备重复提交同一 client_message_id 时返回已有消息
     if (!clientMessageId.isEmpty()) {
         auto existing = getMessageByClientKey(senderId, senderDeviceId, clientMessageId);
         if (existing.has_value()) {
@@ -1282,7 +1282,7 @@ int DatabaseManager::getUnreadCount(qint64 conversationId, qint64 userId)
     return 0;
 }
 
-// ── M5.5: 消息回执 ─────────────────────────────────────────────────────────
+// M5.5: 消息回执
 bool DatabaseManager::recordMessageReceipt(qint64 messageId, qint64 userId,
                                            const QString &deviceId, const QString &status)
 {
@@ -1351,7 +1351,7 @@ bool DatabaseManager::updateMemberReadCursor(qint64 conversationId, qint64 userI
     return q.exec();
 }
 
-// ── M5.5: 同步事件流 ─────────────────────────────────────────────────────
+// M5.5: 同步事件流
 qint64 DatabaseManager::appendSyncEvent(qint64 userId, const QString &eventType,
                                         const QString &payloadJson)
 {
@@ -1361,7 +1361,7 @@ qint64 DatabaseManager::appendSyncEvent(qint64 userId, const QString &eventType,
         "INSERT INTO sync_events (user_id, event_type, payload) VALUES (?, ?, ?)");
     q.addBindValue(userId);
     q.addBindValue(eventType);
-    q.addBindValue(payloadJson.isEmpty() ? QStringLiteral("{}") : payloadJson);
+    q.addBindValue(payloadJson.isEmpty() ? "{}" : payloadJson);
     if (!q.exec()) {
         qWarning() << "[DB] appendSyncEvent failed:" << q.lastError().text();
         return -1;
@@ -1395,7 +1395,7 @@ QList<SyncEventInfo> DatabaseManager::getSyncEvents(qint64 userId, qint64 afterS
     return result;
 }
 
-// ── M6: 端到端加密密钥管理 ───────────────────────────────────────────────
+// M6: 端到端加密密钥管理
 bool DatabaseManager::upsertIdentityKey(qint64 userId, const QString &deviceId,
                                         const QString &identityPub)
 {

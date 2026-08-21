@@ -19,11 +19,11 @@
 
 namespace
 {
-const QString DeviceId = QStringLiteral("testdevice");
+const QString DeviceId = "testdevice";
 
 QString uniqueUser()
 {
-    return QStringLiteral("user_")
+    return "user_"
         + QUuid::createUuid().toString(QUuid::Id128).left(12).toLower();
 }
 
@@ -37,9 +37,9 @@ QJsonObject makeMessage(qint64 messageId, qint64 conversationId, const QString &
     msg["senderId"] = senderId;
     msg["senderUsername"] = senderUsername;
     msg["content"] = content;
-    msg["contentType"] = QStringLiteral("text");
+    msg["contentType"] = "text";
     msg["status"] = status;
-    msg["createdAt"] = QStringLiteral("2026-08-21T00:00:00Z");
+    msg["createdAt"] = "2026-08-21T00:00:00Z";
     return msg;
 }
 
@@ -60,14 +60,14 @@ class TestLocalStore : public QObject
 private slots:
     void initTestCase()
     {
-        QCoreApplication::setOrganizationName(QStringLiteral("XYChat"));
-        QCoreApplication::setApplicationName(QStringLiteral("XYChatTestLocalStore"));
+        QCoreApplication::setOrganizationName("XYChat");
+        QCoreApplication::setApplicationName("XYChatTestLocalStore");
         // 重定向 QStandardPaths 到测试目录，避免污染真实 AppData
         QStandardPaths::setTestModeEnabled(true);
         QVERIFY(!QStandardPaths::writableLocation(QStandardPaths::AppDataLocation).isEmpty());
     }
 
-    // ── schema 与同步游标 ──
+    // schema 与同步游标
     void schemaAndSyncCursorPersistAcrossReopen()
     {
         const QString user = uniqueUser();
@@ -83,26 +83,26 @@ private slots:
         store.closeAndDestroy();
     }
 
-    // ── 持久化 outbox ──
+    // 持久化 outbox
     void outboxPersistsAcrossReopen()
     {
         const QString user = uniqueUser();
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
-        QVERIFY(store.addOutboxItem(QStringLiteral("cmid-1"), 7, QStringLiteral("outbox plain 1")));
-        QVERIFY(store.addOutboxItem(QStringLiteral("cmid-2"), 8, QStringLiteral("outbox plain 2")));
+        QVERIFY(store.addOutboxItem("cmid-1", 7, "outbox plain 1"));
+        QVERIFY(store.addOutboxItem("cmid-2", 8, "outbox plain 2"));
         store.close();
 
         // 重启后 outbox 完整恢复（含解密后的明文）
         QVERIFY(store.open(user, DeviceId));
         const auto items = store.loadOutbox();
         QCOMPARE(items.size(), 2);
-        QCOMPARE(items.at(0).clientMessageId, QStringLiteral("cmid-1"));
+        QCOMPARE(items.at(0).clientMessageId, "cmid-1");
         QCOMPARE(items.at(0).toUserId, 7LL);
-        QCOMPARE(items.at(0).content, QStringLiteral("outbox plain 1"));
+        QCOMPARE(items.at(0).content, "outbox plain 1");
 
         // 确认后删除（幂等键）
-        QVERIFY(store.removeOutboxItem(QStringLiteral("cmid-1")));
+        QVERIFY(store.removeOutboxItem("cmid-1"));
         QCOMPARE(store.loadOutbox().size(), 1);
         store.closeAndDestroy();
     }
@@ -110,10 +110,10 @@ private slots:
     void outboxContentEncryptedOnDisk()
     {
         const QString user = uniqueUser();
-        const QString secret = QStringLiteral("OutboxTopSecret-M6.5-Probe");
+        const QString secret = "OutboxTopSecret-M6.5-Probe";
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
-        QVERIFY(store.addOutboxItem(QStringLiteral("cmid-x"), 9, secret));
+        QVERIFY(store.addOutboxItem("cmid-x", 9, secret));
         store.close();
 
         // fail-closed 验收：磁盘文件中不存在可读明文
@@ -126,11 +126,11 @@ private slots:
         store.closeAndDestroy();
     }
 
-    // ── 消息缓存 ──
+    // 消息缓存
     void messageContentEncryptedOnDisk()
     {
         const QString user = uniqueUser();
-        const QString secret = QStringLiteral("MessageTopSecret-M6.5-Probe");
+        const QString secret = "MessageTopSecret-M6.5-Probe";
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
         QVERIFY(store.upsertMessage(makeMessage(1, 10, secret)));
@@ -166,9 +166,9 @@ private slots:
         QCOMPARE(messages.at(2).toObject().value("messageId").toVariant().toLongLong(), 3LL);
 
         // 状态更新（已送达/已读推送落缓存）
-        QVERIFY(store.updateMessageStatus(1, QStringLiteral("read")));
+        QVERIFY(store.updateMessageStatus(1, "read"));
         const QJsonArray updated = store.loadMessages(11);
-        QCOMPARE(updated.at(0).toObject().value("status").toString(), QStringLiteral("read"));
+        QCOMPARE(updated.at(0).toObject().value("status").toString(), "read");
         store.closeAndDestroy();
     }
 
@@ -186,27 +186,27 @@ private slots:
         QJsonArray messages = store.loadMessages(20);
         QCOMPARE(messages.size(), 1);
         QCOMPARE(messages.at(0).toObject().value("content").toString(),
-                 QStringLiteral("decrypted plain"));
+                 "decrypted plain");
         QVERIFY(!messages.at(0).toObject().contains("undecryptable"));
 
         // 新的可解密正文允许覆盖
         QVERIFY(store.upsertMessage(makeMessage(5, 20, "re-decrypted")));
         messages = store.loadMessages(20);
         QCOMPARE(messages.at(0).toObject().value("content").toString(),
-                 QStringLiteral("re-decrypted"));
+                 "re-decrypted");
         store.closeAndDestroy();
     }
 
-    // ── 登出清理语义（运行期缺陷回归）──
+    // 登出清理语义（运行期缺陷回归）
     void logoutClearsUserDataButKeepsDecryptCache()
     {
         const QString user = uniqueUser();
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
         QVERIFY(store.upsertMessage(makeMessage(1, 50, "visible message")));
-        QVERIFY(store.addOutboxItem(QStringLiteral("cmid-l"), 7, QStringLiteral("pending")));
+        QVERIFY(store.addOutboxItem("cmid-l", 7, "pending"));
         QVERIFY(store.setSyncCursor(15));
-        QVERIFY(store.saveDecryptedContent(1, QStringLiteral("visible message")));
+        QVERIFY(store.saveDecryptedContent(1, "visible message"));
 
         // 登出语义：用户可见数据全部清除
         QVERIFY(store.clearUserData());
@@ -217,19 +217,19 @@ private slots:
 
         // 但解密缓存（E2EE 密钥材料）必须保留：预密钥已消费不可恢复，
         // 登出重登后对方消息只能靠它兜底（此前整库销毁导致重登无法解密）
-        QCOMPARE(store.loadDecryptedContent(1), QStringLiteral("visible message"));
+        QCOMPARE(store.loadDecryptedContent(1), "visible message");
         store.close();
 
         // 重新登录（重开库）后仍在
         QVERIFY(store.open(user, DeviceId));
-        QCOMPARE(store.loadDecryptedContent(1), QStringLiteral("visible message"));
+        QCOMPARE(store.loadDecryptedContent(1), "visible message");
         store.closeAndDestroy();
     }
 
     void upsertNeverPersistsEnvelopeCiphertext()
     {
         const QString user = uniqueUser();
-        const QString envelope = QStringLiteral("{\"v\":1,\"devices\":[]}");
+        const QString envelope = "{\"v\":1,\"devices\":[]}";
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
 
@@ -262,25 +262,25 @@ private slots:
         // 模拟旧缺陷版本写入的污染行：envelope 原文以存储密钥加密落库
         const QByteArray key = KeyStorage::loadLocalStoreKey(user, DeviceId);
         QCOMPARE(key.size(), 32);
-        const QString envelope = QStringLiteral("{\"v\":1,\"devices\":[]}");
+        const QString envelope = "{\"v\":1,\"devices\":[]}";
         const auto gcm = XYChat::Security::E2eeCrypto::aesGcmEncrypt(key, envelope.toUtf8());
         QVERIFY(gcm.valid);
-        const QString enc = QStringLiteral("enc1:")
+        const QString enc = "enc1:"
             + QString::fromLatin1(gcm.iv.toBase64()) + QLatin1Char(':')
             + QString::fromLatin1(gcm.ciphertext.toBase64());
         {
-            QSqlDatabase db = QSqlDatabase::addDatabase(QStringLiteral("QSQLITE"),
-                                                        QStringLiteral("healprobe"));
+            QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE",
+                                                        "healprobe");
             db.setDatabaseName(LocalStore::dbFilePath(user, DeviceId));
             QVERIFY(db.open());
             QSqlQuery query(db);
-            query.prepare(QStringLiteral(
-                "UPDATE messages SET content_enc = ?, undecryptable = 0 WHERE message_id = 1"));
+            query.prepare(
+                "UPDATE messages SET content_enc = ?, undecryptable = 0 WHERE message_id = 1");
             query.addBindValue(enc);
             QVERIFY(query.exec());
             db.close();
         }
-        QSqlDatabase::removeDatabase(QStringLiteral("healprobe"));
+        QSqlDatabase::removeDatabase("healprobe");
 
         // 再次打开触发自愈：污染行被清空为 undecryptable，不再泄漏到 UI
         QVERIFY(store.open(user, DeviceId));
@@ -291,7 +291,7 @@ private slots:
         store.closeAndDestroy();
     }
 
-    // ── 回执状态只前进不回退 ──
+    // 回执状态只前进不回退
     void statusOnlyMovesForward()
     {
         const QString user = uniqueUser();
@@ -299,40 +299,40 @@ private slots:
         QVERIFY(store.open(user, DeviceId));
         QVERIFY(store.upsertMessage(makeMessage(1, 30, "m", 2, "bob", "delivered")));
         // 回执推送推进到已读
-        QVERIFY(store.updateMessageStatus(1, QStringLiteral("read")));
+        QVERIFY(store.updateMessageStatus(1, "read"));
 
         // 滞后同步不得把 read 回退为 delivered（审查修复回归项）
         QVERIFY(store.upsertMessage(makeMessage(1, 30, "m", 2, "bob", "delivered")));
         QJsonArray messages = store.loadMessages(30);
         QCOMPARE(messages.at(0).toObject().value("status").toString(),
-                 QStringLiteral("read"));
+                 "read");
 
         // 前进方向覆盖允许（内容同步更新）
         QVERIFY(store.upsertMessage(makeMessage(1, 30, "m2", 2, "bob", "read")));
         messages = store.loadMessages(30);
         QCOMPARE(messages.at(0).toObject().value("status").toString(),
-                 QStringLiteral("read"));
+                 "read");
         QCOMPARE(messages.at(0).toObject().value("content").toString(),
-                 QStringLiteral("m2"));
+                 "m2");
         store.closeAndDestroy();
     }
 
-    // ── 会话缓存 ──
+    // 会话缓存
     void conversationRoundTripAndPreviewBump()
     {
         const QString user = uniqueUser();
-        const QString secretPreview = QStringLiteral("SecretPreview-M6.5-Probe");
+        const QString secretPreview = "SecretPreview-M6.5-Probe";
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
 
         QJsonObject conv;
         conv["conversationId"] = 5;
-        conv["type"] = QStringLiteral("private");
+        conv["type"] = "private";
         conv["peerUserId"] = 7;
-        conv["peerUsername"] = QStringLiteral("alice");
+        conv["peerUsername"] = "alice";
         conv["lastMessage"] = secretPreview;
         conv["lastMessageId"] = 3;
-        conv["lastMessageAt"] = QStringLiteral("2026-08-21T00:00:00Z");
+        conv["lastMessageAt"] = "2026-08-21T00:00:00Z";
         conv["unreadCount"] = 2;
         QVERIFY(store.upsertConversation(conv));
         store.close();
@@ -347,56 +347,56 @@ private slots:
         QCOMPARE(conversations.size(), 1);
         const QJsonObject loaded = conversations.at(0).toObject();
         QCOMPARE(loaded.value("conversationId").toVariant().toLongLong(), 5LL);
-        QCOMPARE(loaded.value("peerUsername").toString(), QStringLiteral("alice"));
+        QCOMPARE(loaded.value("peerUsername").toString(), "alice");
         QCOMPARE(loaded.value("lastMessage").toString(), secretPreview);
         QCOMPARE(loaded.value("unreadCount").toInt(), 2);
 
         // 新消息到达：预览与未读数更新
-        QVERIFY(store.bumpConversationPreview(5, QStringLiteral("new preview"), true));
+        QVERIFY(store.bumpConversationPreview(5, "new preview", true));
         conversations = store.loadConversations();
         QCOMPARE(conversations.at(0).toObject().value("lastMessage").toString(),
-                 QStringLiteral("new preview"));
+                 "new preview");
         QCOMPARE(conversations.at(0).toObject().value("unreadCount").toInt(), 3);
 
         // 不存在的会话不产生幻影行（事件流缺会话元数据时的保护）
-        QVERIFY(store.bumpConversationPreview(99, QStringLiteral("x"), true));
+        QVERIFY(store.bumpConversationPreview(99, "x", true));
         QCOMPARE(store.loadConversations().size(), 1);
         store.closeAndDestroy();
     }
 
-    // ── 解密缓存归口与遗留迁移 ──
+    // 解密缓存归口与遗留迁移
     void decryptCacheLegacyImport()
     {
         const QString user = uniqueUser();
         QHash<qint64, QString> legacy;
-        legacy.insert(101, QStringLiteral("legacy-plain-1"));
-        legacy.insert(102, QStringLiteral("legacy-plain-2"));
+        legacy.insert(101, "legacy-plain-1");
+        legacy.insert(102, "legacy-plain-2");
         QVERIFY(KeyStorage::saveDecryptCache(user, DeviceId, legacy));
 
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
         QCOMPARE(store.importLegacyDecryptCache(user, DeviceId), 2);
-        QCOMPARE(store.loadDecryptedContent(101), QStringLiteral("legacy-plain-1"));
-        QCOMPARE(store.loadDecryptedContent(102), QStringLiteral("legacy-plain-2"));
+        QCOMPARE(store.loadDecryptedContent(101), "legacy-plain-1");
+        QCOMPARE(store.loadDecryptedContent(102), "legacy-plain-2");
 
         // 遗留文件已删除（二次导入为空操作）
         QVERIFY(KeyStorage::loadDecryptCache(user, DeviceId).isEmpty());
         QCOMPARE(store.importLegacyDecryptCache(user, DeviceId), 0);
 
         // 新缓存写入/读取
-        QVERIFY(store.saveDecryptedContent(103, QStringLiteral("fresh-plain")));
-        QCOMPARE(store.loadDecryptedContent(103), QStringLiteral("fresh-plain"));
+        QVERIFY(store.saveDecryptedContent(103, "fresh-plain"));
+        QCOMPARE(store.loadDecryptedContent(103), "fresh-plain");
         store.closeAndDestroy();
     }
 
-    // ── 登出销毁 ──
+    // 登出销毁
     void destroyRemovesLocalData()
     {
         const QString user = uniqueUser();
         LocalStore store;
         QVERIFY(store.open(user, DeviceId));
         QVERIFY(store.upsertMessage(makeMessage(1, 10, "to be destroyed")));
-        QVERIFY(store.addOutboxItem(QStringLiteral("cmid-d"), 7, QStringLiteral("gone")));
+        QVERIFY(store.addOutboxItem("cmid-d", 7, "gone"));
         QVERIFY(store.setSyncCursor(7));
         store.closeAndDestroy();
 

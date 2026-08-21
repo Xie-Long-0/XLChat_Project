@@ -6,7 +6,7 @@
 
 #include <QStringList>
 
-// ── M1 兼容：SHA-256 ─────────────────────────────────────────────────────────
+// M1 兼容：SHA-256
 QString EncryptionManager::encryptPassword(const QString &password)
 {
     QByteArray passwordBytes = password.toUtf8();
@@ -18,7 +18,7 @@ QString EncryptionManager::encryptPassword(const QString &password)
     return hashBytes.toHex();
 }
 
-// ── M2：PBKDF2-HMAC-SHA256 慢哈希 ───────────────────────────────────────────
+// M2：PBKDF2-HMAC-SHA256 慢哈希
 QString EncryptionManager::hashPasswordWithSalt(const QString &password, int iterations)
 {
     // 生成 16 字节随机盐
@@ -87,7 +87,7 @@ bool EncryptionManager::verifyPassword(const QString &password, const QString &s
     return diff == 0;
 }
 
-// ── M2：Token 工具 ───────────────────────────────────────────────────────────
+// M2：Token 工具
 QString EncryptionManager::generateToken(int byteLength)
 {
     QByteArray buf(byteLength, Qt::Uninitialized);

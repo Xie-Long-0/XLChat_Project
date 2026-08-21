@@ -25,7 +25,7 @@ namespace
 bool writeFileAtomic(const QString &path, const QByteArray &data)
 {
     QDir().mkpath(QFileInfo(path).absolutePath());
-    const QString tmpPath = path + QStringLiteral(".tmp");
+    const QString tmpPath = path + ".tmp";
 
     QFile tmp(tmpPath);
     if (!tmp.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -61,7 +61,7 @@ QByteArray readFileBytes(const QString &path)
 
 } // namespace
 
-// ── DPAPI 保护（Windows）/ 原样回退（其他平台） ──────────────────────────────
+// DPAPI 保护（Windows）/ 原样回退（其他平台）
 
 QByteArray KeyStorage::protect(const QByteArray &data)
 {
@@ -106,31 +106,31 @@ QByteArray KeyStorage::unprotect(const QByteArray &data)
 #endif
 }
 
-// ── 路径 ─────────────────────────────────────────────────────────────────────
+// 路径
 
 QString KeyStorage::keyFilePath(const QString &username, const QString &deviceId)
 {
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-        + QStringLiteral("/e2ee");
-    return dir + QStringLiteral("/") + username + QStringLiteral("_") + deviceId
-        + QStringLiteral(".key");
+        + "/e2ee";
+    return dir + "/" + username + "_" + deviceId
+        + ".key";
 }
 
 QString KeyStorage::trustFilePath()
 {
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-        + QStringLiteral("/e2ee/trust.json");
+        + "/e2ee/trust.json";
 }
 
 QString KeyStorage::decryptCacheFilePath(const QString &username, const QString &deviceId)
 {
     const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
-        + QStringLiteral("/e2ee");
-    return dir + QStringLiteral("/") + username + QStringLiteral("_") + deviceId
-        + QStringLiteral(".cache");
+        + "/e2ee";
+    return dir + "/" + username + "_" + deviceId
+        + ".cache";
 }
 
-// ── 身份密钥 ──
+// 身份密钥
 
 QByteArray KeyStorage::loadIdentityPrivateKey(const QString &username, const QString &deviceId)
 {
@@ -166,7 +166,7 @@ bool KeyStorage::saveIdentityPrivateKey(const QString &username, const QString &
     return ok;
 }
 
-// ── 预密钥 ──
+// 预密钥
 
 QList<KeyStorage::PrekeyEntry> KeyStorage::loadPrekeys(const QString &username,
                                                        const QString &deviceId)
@@ -220,7 +220,7 @@ bool KeyStorage::savePrekeys(const QString &username, const QString &deviceId,
     return ok;
 }
 
-// ── TOFU 信任存储 ──
+// TOFU 信任存储
 
 QString KeyStorage::loadPeerFingerprint(qint64 peerUserId)
 {
@@ -236,7 +236,7 @@ bool KeyStorage::savePeerFingerprint(qint64 peerUserId, const QString &fingerpri
                            QJsonDocument(root).toJson(QJsonDocument::Compact));
 }
 
-// ── 解密缓存 ──
+// 解密缓存
 
 QHash<qint64, QString> KeyStorage::loadDecryptCache(const QString &username,
                                                     const QString &deviceId)
@@ -279,7 +279,7 @@ bool KeyStorage::removeDecryptCacheFile(const QString &username, const QString &
     return QFile::remove(decryptCacheFilePath(username, deviceId));
 }
 
-// ── M6.5: LocalStore 存储密钥 ────────────────────────────────────────
+// M6.5: LocalStore 存储密钥
 
 QString KeyStorage::localStoreKeyFilePath(const QString &username, const QString &deviceId)
 {

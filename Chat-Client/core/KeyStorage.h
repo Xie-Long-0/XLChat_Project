@@ -36,13 +36,13 @@ public:
     static bool savePrekeys(const QString &username, const QString &deviceId,
                             const QList<PrekeyEntry> &prekeys);
 
-    // ── TOFU 信任存储：对方用户身份公钥指纹 ────────────────────────────────
+    // TOFU 信任存储：对方用户身份公钥指纹
     // 返回该用户已记录的指纹，无记录返回空
     static QString loadPeerFingerprint(qint64 peerUserId);
     // 记录/更新指纹
     static bool savePeerFingerprint(qint64 peerUserId, const QString &fingerprint);
 
-    // ── 解密缓存：messageId -> 已解密正文 ─────────────────────────────────────
+    // 解密缓存：messageId -> 已解密正文
     // 一次性预密钥解密后即删除，重新登录/重新同步时依靠此缓存避免
     // 已读消息变为“无法解密”；同样经 DPAPI 保护
     static QHash<qint64, QString> loadDecryptCache(const QString &username,
@@ -52,7 +52,7 @@ public:
     // M6.5：删除遗留解密缓存文件（新缓存已归口 LocalStore，迁移后调用）
     static bool removeDecryptCacheFile(const QString &username, const QString &deviceId);
 
-    // ── M6.5：LocalStore 存储密钥（32 字节 AES-256-GCM 密钥，DPAPI 保护） ──
+    // M6.5：LocalStore 存储密钥（32 字节 AES-256-GCM 密钥，DPAPI 保护）
     // 文件：AppDataLocation/localstore/<username>_<deviceId>.key
     static QByteArray loadLocalStoreKey(const QString &username, const QString &deviceId);
     static bool saveLocalStoreKey(const QString &username, const QString &deviceId,

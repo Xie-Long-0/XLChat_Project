@@ -58,7 +58,7 @@ QByteArray fromBase64(const QString &data, bool *ok)
 }
 } // namespace
 
-// ── 密钥操作 ─────────────────────────────────────────────────────────────────
+// 密钥操作
 
 E2eeCrypto::KeyPair E2eeCrypto::generateX25519KeyPair()
 {
@@ -207,7 +207,7 @@ QString E2eeCrypto::publicKeyFingerprint(const QByteArray &publicKey)
     return QString::fromLatin1(QByteArray(reinterpret_cast<char *>(hash), 16).toHex());
 }
 
-// ── 消息加解密 ───────────────────────────────────────────────────────────────
+// 消息加解密
 
 E2eeCrypto::GcmResult E2eeCrypto::aesGcmEncrypt(const QByteArray &key, const QByteArray &plaintext)
 {
@@ -306,7 +306,7 @@ QByteArray E2eeCrypto::aesGcmDecrypt(const QByteArray &key, const QByteArray &iv
     return plaintext;
 }
 
-// ── envelope 编解码 ──────────────────────────────────────────────────────────
+// envelope 编解码
 
 QJsonObject E2eeCrypto::encodeEnvelope(const QList<EnvelopeEntry> &entries)
 {

@@ -19,7 +19,7 @@
 using namespace XYChat::Protocol;
 using XYChat::Security::LogSanitizer;
 
-// ── 构造 / 析构 ──────────────────────────────────────────────────────────────
+// 构造 / 析构
 RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
     : QThread(parent)
     , m_socketDescriptor(socketDescriptor)
@@ -32,7 +32,7 @@ RequestHandler::~RequestHandler()
     m_db = nullptr;
 }
 
-// ── M3: 跨线程发送数据到客户端 ─────────────────────────────────────────────
+// M3: 跨线程发送数据到客户端
 void RequestHandler::sendRawData(const QByteArray &data)
 {
     // M5.5: 投递到线程亲和于 handler 线程的发送代理对象，
@@ -63,7 +63,7 @@ void RequestHandler::disconnectClient()
     }, Qt::QueuedConnection);
 }
 
-// ── M5: 设置 TLS 配置 ───────────────────────────────────────────────────────
+// M5: 设置 TLS 配置
 void RequestHandler::setSslConfiguration(const QSslConfiguration &config)
 {
     m_sslConfig = config;
@@ -76,7 +76,7 @@ void RequestHandler::setNonceCache(NonceCache *cache)
     m_nonceCache = cache;
 }
 
-// ── 线程入口 ─────────────────────────────────────────────────────────────────
+// 线程入口
 void RequestHandler::run()
 {
     // 每个线程创建独立数据库连接
@@ -139,7 +139,7 @@ void RequestHandler::run()
     m_socket = nullptr;
 }
 
-// ── 数据接收 ─────────────────────────────────────────────────────────────────
+// 数据接收
 void RequestHandler::onReadyRead()
 {
     m_idleTimer->start();
@@ -168,7 +168,7 @@ void RequestHandler::onIdleTimeout()
     m_socket->disconnectFromHost();
 }
 
-// ── 包分发 ───────────────────────────────────────────────────────────────────
+// 包分发
 void RequestHandler::processPacket(const Packet &packet)
 {
     // Ping/Pong 不需要认证
@@ -284,7 +284,7 @@ void RequestHandler::processPacket(const Packet &packet)
                  QString("Unknown request type: %1").arg(type));
 }
 
-// ── 登录 ─────────────────────────────────────────────────────────────────────
+// 登录
 void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject &request)
 {
     const QString username = request.value("username").toString().trimmed();
@@ -372,7 +372,7 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
     qDebug() << "[Handler] Login successful for" << username;
 }
 
-// ── 注册 ─────────────────────────────────────────────────────────────────────
+// 注册
 void RequestHandler::processRegisterRequest(const Packet &packet, const QJsonObject &request)
 {
     const QString username = request.value("username").toString().trimmed();
@@ -431,7 +431,7 @@ void RequestHandler::processRegisterRequest(const Packet &packet, const QJsonObj
     qDebug() << "[Handler] Registered user" << username << "id=" << userId;
 }
 
-// ── 登出 ─────────────────────────────────────────────────────────────────────
+// 登出
 void RequestHandler::processLogoutRequest(const Packet &packet)
 {
     const qint64 sessionId = m_currentSessionId;
@@ -449,7 +449,7 @@ void RequestHandler::processLogoutRequest(const Packet &packet)
     qDebug() << "[Handler] User" << userId << "logged out";
 }
 
-// ── Token 续期 ───────────────────────────────────────────────────────────────
+// Token 续期
 void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 oldSessionId = m_currentSessionId;
@@ -506,10 +506,10 @@ void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonO
     qDebug() << "[Handler] Token renewed for user" << userId;
 }
 
-// ── 强制下线 ─────────────────────────────────────────────────────────────────
+// 强制下线
 void RequestHandler::processTerminateSessionRequest(const Packet &packet, const QJsonObject &request)
 {
-    // M5.5: 拒绝旧版越权用法 —— 不允许指定任意 userId
+    // M5.5: 拒绝旧版越权用法：不允许指定任意 userId
     if (request.contains("userId")) {
         const qint64 requestedUserId = request.value("userId").toVariant().toLongLong();
         if (requestedUserId != m_authenticatedUserId) {
@@ -566,7 +566,7 @@ void RequestHandler::processTerminateSessionRequest(const Packet &packet, const 
              << "terminated own session" << resolvedSessionId;
 }
 
-// ── M3: 用户搜索 ───────────────────────────────────────────────────────────
+// M3: 用户搜索
 void RequestHandler::processSearchUsersRequest(const Packet &packet, const QJsonObject &request)
 {
     const QString query = request.value("query").toString().trimmed();
@@ -593,7 +593,7 @@ void RequestHandler::processSearchUsersRequest(const Packet &packet, const QJson
                  "OK", data);
 }
 
-// ── M3: 添加联系人 ───────────────────────────────────────────────────────────
+// M3: 添加联系人
 void RequestHandler::processAddContactRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 contactUserId = request.value("userId").toVariant().toLongLong();
@@ -637,7 +637,7 @@ void RequestHandler::processAddContactRequest(const Packet &packet, const QJsonO
                  "Contact added", data);
 }
 
-// ── M3: 获取联系人列表 ─────────────────────────────────────────────────────
+// M3: 获取联系人列表
 void RequestHandler::processGetContactsRequest(const Packet &packet)
 {
     auto contacts = m_db->getContacts(m_authenticatedUserId);
@@ -657,7 +657,7 @@ void RequestHandler::processGetContactsRequest(const Packet &packet)
                  "OK", data);
 }
 
-// ── M3: 获取会话列表 ─────────────────────────────────────────────────────
+// M3: 获取会话列表
 void RequestHandler::processGetConversationsRequest(const Packet &packet)
 {
     auto conversations = m_db->getConversationsForUser(m_authenticatedUserId);
@@ -682,7 +682,7 @@ void RequestHandler::processGetConversationsRequest(const Packet &packet)
                  "OK", data);
 }
 
-// ── M3: 发送消息 ───────────────────────────────────────────────────────────
+// M3: 发送消息
 void RequestHandler::processSendMessageRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 targetUserId = request.value("toUserId").toVariant().toLongLong();
@@ -723,7 +723,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         return;
     }
 
-    // M6: fail-closed —— 消息正文必须为合法 E2EE envelope（服务端只见密文）
+    // M6: fail-closed：消息正文必须为合法 E2EE envelope（服务端只见密文）
     bool envelopeOk = false;
     const auto entries = XYChat::Security::E2eeCrypto::decodeEnvelope(content, &envelopeOk);
     if (!envelopeOk) {
@@ -850,7 +850,7 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
                  "Message sent", data);
 }
 
-// ── M3: 确认消息 ───────────────────────────────────────────────────────────
+// M3: 确认消息
 void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 messageId = request.value("messageId").toVariant().toLongLong();
@@ -874,7 +874,7 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
         return;
     }
 
-    // M5.5: 先授权再更新 —— 请求者必须是消息所属会话的成员
+    // M5.5: 先授权再更新：请求者必须是消息所属会话的成员
     if (!m_db->isConversationMember(msgOpt->conversationId, m_authenticatedUserId)) {
         sendResponse(packet.requestId, MessageType::AckMessageResponse,
                      ErrorCode::PermissionDenied, "Not a member of this conversation");
@@ -926,7 +926,7 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
                  "OK", data);
 }
 
-// ── M3: 同步消息 ───────────────────────────────────────────────────────────
+// M3: 同步消息
 void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 conversationId = request.value("conversationId").toVariant().toLongLong();
@@ -939,7 +939,7 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
         return;
     }
 
-    // M5.5: 先授权再查询 —— 验证用户是该会话的成员
+    // M5.5: 先授权再查询：验证用户是该会话的成员
     if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
         sendResponse(packet.requestId, MessageType::SyncMessagesResponse,
                      ErrorCode::PermissionDenied, "Not a member of this conversation");
@@ -977,7 +977,7 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
                  "OK", data);
 }
 
-// ── M5.5: 账号级增量同步 ───────────────────────────────────────────
+// M5.5: 账号级增量同步
 void RequestHandler::processSyncEventsRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 afterSeq = request.value("afterSeq").toVariant().toLongLong();
@@ -1012,7 +1012,7 @@ void RequestHandler::processSyncEventsRequest(const Packet &packet, const QJsonO
                  "OK", data);
 }
 
-// ── M6: 密钥注册（身份公钥 + 一次性预密钥公钥） ──────────────────────
+// M6: 密钥注册（身份公钥 + 一次性预密钥公钥）
 void RequestHandler::processRegisterKeysRequest(const Packet &packet, const QJsonObject &request)
 {
     // 仅允许注册当前认证设备自己的密钥（deviceId 取自 session，不信任请求参数）
@@ -1087,7 +1087,7 @@ void RequestHandler::processRegisterKeysRequest(const Packet &packet, const QJso
              << uploaded << "prekeys uploaded";
 }
 
-// ── M6: 拉取目标用户密钥包（每设备身份公钥 + 一个认领的预密钥） ────────────
+// M6: 拉取目标用户密钥包（每设备身份公钥 + 一个认领的预密钥）
 void RequestHandler::processFetchKeysRequest(const Packet &packet, const QJsonObject &request)
 {
     const qint64 targetUserId = request.value("userId").toVariant().toLongLong();
@@ -1163,7 +1163,7 @@ void RequestHandler::processFetchKeysRequest(const Packet &packet, const QJsonOb
                  "OK", data);
 }
 
-// ── Session 验证 ─────────────────────────────────────────────────────────────
+// Session 验证
 bool RequestHandler::validateSession()
 {
     if (m_currentSessionId > 0 && m_authenticatedUserId > 0) {
@@ -1172,7 +1172,7 @@ bool RequestHandler::validateSession()
     return false;
 }
 
-// ── 限流检查 ─────────────────────────────────────────────────────────────────
+// 限流检查
 bool RequestHandler::checkRateLimit(const QString &ipAddress, qint64 userId)
 {
     const int ipFails = m_db->recentFailedLoginCount(ipAddress, RateLimitWindowSeconds);
@@ -1190,7 +1190,7 @@ bool RequestHandler::checkRateLimit(const QString &ipAddress, qint64 userId)
     return false;
 }
 
-// ── 响应工具 ─────────────────────────────────────────────────────────────────
+// 响应工具
 void RequestHandler::sendResponse(quint64 requestId,
                                   MessageType messageType,
                                   ErrorCode code,
@@ -1221,7 +1221,7 @@ void RequestHandler::sendPacket(const Packet &packet)
     m_socket->flush();
 }
 
-// ── M5.5: 重放保护（timestamp/nonce 强制必填） ───────────────────────
+// M5.5: 重放保护（timestamp/nonce 强制必填）
 bool RequestHandler::checkReplayProtection(const QJsonObject &request)
 {
     // timestamp 必填且为合法整数

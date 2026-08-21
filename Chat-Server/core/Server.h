@@ -30,7 +30,7 @@ class Server : public QObject
 
 public:
     explicit Server(QObject *parent = nullptr);
-    // M5.5: fail-closed —— 若 TLS 未启用且未显式允许明文，start() 拒绝启动
+    // M5.5: fail-closed：若 TLS 未启用且未显式允许明文，start() 拒绝启动
     bool start(quint16 port, bool allowPlaintext = false);
 
     // M5: TLS 配置

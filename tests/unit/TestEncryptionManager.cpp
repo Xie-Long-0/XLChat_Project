@@ -46,7 +46,7 @@ private slots:
     void fullE2eeMessageFlow();
 };
 
-// ── M1 兼容 ──
+// M1 兼容
 void TestEncryptionManager::sha256DigestIsStable()
 {
     QCOMPARE(EncryptionManager::encryptPassword("passwd"),
@@ -60,7 +60,7 @@ void TestEncryptionManager::sha256DigestLengthIsHexEncoded()
     QVERIFY(digest.contains(QRegularExpression("^[0-9a-f]{64}$")));
 }
 
-// ── PBKDF2 ──
+// PBKDF2
 void TestEncryptionManager::pbkdf2HashProducesValidFormat()
 {
     const QString hash = EncryptionManager::hashPasswordWithSalt("test-password");
@@ -105,7 +105,7 @@ void TestEncryptionManager::pbkdf2RejectInvalidStoredHash()
     QVERIFY(!EncryptionManager::verifyPassword("password", "v1:0:aa:bb"));
 }
 
-// ── Token ──
+// Token
 void TestEncryptionManager::generateTokenReturnsHex()
 {
     const QString token = EncryptionManager::generateToken();
@@ -128,7 +128,7 @@ void TestEncryptionManager::hashTokenIsDeterministic()
     QCOMPARE(hash1, hash2);
 }
 
-// ── M6: E2EE 原语 ──
+// M6: E2EE 原语
 void TestEncryptionManager::x25519KeyPairIsValid()
 {
     const auto kp = E2eeCrypto::generateX25519KeyPair();
@@ -188,7 +188,7 @@ void TestEncryptionManager::hkdfDifferentSecretsYieldDifferentKeys()
 void TestEncryptionManager::aesGcmRoundTrip()
 {
     const QByteArray key = E2eeCrypto::deriveMessageKey(QByteArray(64, 'k'));
-    const QByteArray plaintext = QStringLiteral("你好，XYChat！").toUtf8();
+    const QByteArray plaintext = QString("你好，XYChat！").toUtf8();
 
     const auto gcm = E2eeCrypto::aesGcmEncrypt(key, plaintext);
     QVERIFY(gcm.valid);
@@ -281,7 +281,7 @@ void TestEncryptionManager::selfCopyEnvelopeRoundTrip()
     const QByteArray dh = E2eeCrypto::ecdh(eph.privateKey, identity.publicKey);
     QCOMPARE(dh.size(), 32);
     const QByteArray key = E2eeCrypto::deriveMessageKey(dh + dh);
-    const QString message = QStringLiteral("self copy message");
+    const QString message = "self copy message";
     const auto gcm = E2eeCrypto::aesGcmEncrypt(key, message.toUtf8());
     QVERIFY(gcm.valid);
 
@@ -322,7 +322,7 @@ void TestEncryptionManager::fullE2eeMessageFlow()
     senderShared += E2eeCrypto::ecdh(senderEph.privateKey, receiverIdentity.publicKey);
     const QByteArray senderKey = E2eeCrypto::deriveMessageKey(senderShared);
 
-    const QString message = QStringLiteral("端到端加密消息 ✓");
+    const QString message = "端到端加密消息 ✓";
     const auto gcm = E2eeCrypto::aesGcmEncrypt(senderKey, message.toUtf8());
     QVERIFY(gcm.valid);
 

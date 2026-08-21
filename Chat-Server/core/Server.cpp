@@ -42,7 +42,7 @@ bool Server::initTls(const QString &certDir)
 
 bool Server::start(quint16 port, bool allowPlaintext)
 {
-    // M5.5: fail-closed —— TLS 不可用时拒绝启动，
+    // M5.5: fail-closed：TLS 不可用时拒绝启动，
     // 除非显式开启开发明文模式（默认关闭）
     if (!m_tlsEnabled && !allowPlaintext) {
         qCritical() << "[Server] TLS is not available; refusing to start in plaintext."
@@ -166,7 +166,7 @@ QSet<qint64> Server::onlineUserIds() const
     return result;
 }
 
-// ── M3: 消息路由 ───────────────────────────────────────────────────────────
+// M3: 消息路由
 void Server::onMessageForUser(qint64 targetUserId, const QByteArray &packetData)
 {
     // 查找目标用户的所有在线 handler

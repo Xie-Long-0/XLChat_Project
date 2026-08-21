@@ -30,7 +30,7 @@ QString text(const QJsonObject &obj, const QString &key, const QString &fallback
     if (!value.isNull()) {
         return value;
     }
-    return fallback.isNull() ? "" : fallback;
+    return fallback.isNull() ? QString("") : fallback;
 }
 
 // 消息状态只前进不回退的排序（sending/failed 视为最低）
@@ -124,15 +124,15 @@ bool LocalStore::clearUserData()
     // 只清除用户可见数据；decrypt_cache 与存储密钥属 E2EE 密钥材料，
     // 登出重登时预密钥已消费不可恢复，必须保留供解密兜底
     const QStringList tables = {
-        QStringLiteral("messages"),
-        QStringLiteral("conversations"),
-        QStringLiteral("outbox"),
-        QStringLiteral("meta"),
+        "messages",
+        "conversations",
+        "outbox",
+        "meta",
     };
     bool ok = true;
     QSqlQuery query(m_db);
     for (const QString &table : tables) {
-        if (!query.exec(QStringLiteral("DELETE FROM ") + table)) {
+        if (!query.exec("DELETE FROM " + table)) {
             qWarning() << "[LocalStore] clearUserData failed on" << table
                        << query.lastError().text();
             ok = false;
@@ -212,9 +212,9 @@ bool LocalStore::ensureStorageKey(const QString &username, const QString &device
 bool LocalStore::ensureSchema()
 {
     const QStringList statements = {
-        QStringLiteral("CREATE TABLE IF NOT EXISTS schema_meta ("
-                       "version INTEGER NOT NULL)"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS messages ("
+        "CREATE TABLE IF NOT EXISTS schema_meta ("
+                       "version INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS messages ("
                        "message_id INTEGER PRIMARY KEY,"
                        "conversation_id INTEGER NOT NULL,"
                        "sender_id INTEGER NOT NULL DEFAULT 0,"
@@ -225,10 +225,10 @@ bool LocalStore::ensureSchema()
                        "status_rank INTEGER NOT NULL DEFAULT 0,"
                        "undecryptable INTEGER NOT NULL DEFAULT 0,"
                        "client_message_id TEXT NOT NULL DEFAULT '',"
-                       "created_at TEXT NOT NULL DEFAULT '')"),
-        QStringLiteral("CREATE INDEX IF NOT EXISTS idx_messages_conv "
-                       "ON messages(conversation_id, message_id)"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS conversations ("
+                       "created_at TEXT NOT NULL DEFAULT '')",
+        "CREATE INDEX IF NOT EXISTS idx_messages_conv "
+                       "ON messages(conversation_id, message_id)",
+        "CREATE TABLE IF NOT EXISTS conversations ("
                        "conversation_id INTEGER PRIMARY KEY,"
                        "type TEXT NOT NULL DEFAULT 'private',"
                        "peer_user_id INTEGER NOT NULL DEFAULT 0,"
@@ -236,18 +236,18 @@ bool LocalStore::ensureSchema()
                        "last_message_enc TEXT NOT NULL DEFAULT '',"
                        "last_message_id INTEGER NOT NULL DEFAULT 0,"
                        "last_message_at TEXT NOT NULL DEFAULT '',"
-                       "unread_count INTEGER NOT NULL DEFAULT 0)"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS outbox ("
+                       "unread_count INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS outbox ("
                        "client_message_id TEXT PRIMARY KEY,"
                        "to_user_id INTEGER NOT NULL,"
                        "content_enc TEXT NOT NULL,"
-                       "created_at TEXT NOT NULL DEFAULT '')"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS decrypt_cache ("
+                       "created_at TEXT NOT NULL DEFAULT '')",
+        "CREATE TABLE IF NOT EXISTS decrypt_cache ("
                        "message_id INTEGER PRIMARY KEY,"
-                       "content_enc TEXT NOT NULL)"),
-        QStringLiteral("CREATE TABLE IF NOT EXISTS meta ("
+                       "content_enc TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS meta ("
                        "key TEXT PRIMARY KEY,"
-                       "value TEXT NOT NULL)"),
+                       "value TEXT NOT NULL)",
     };
 
     QSqlQuery query(m_db);
@@ -259,12 +259,12 @@ bool LocalStore::ensureSchema()
     }
 
     // 记录 schema 版本（首次插入）
-    query.exec(QStringLiteral("INSERT INTO schema_meta(version) "
-                              "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)"));
+    query.exec("INSERT INTO schema_meta(version) "
+                              "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)");
     return true;
 }
 
-// ── 文本加解密 ───────────────────────────────────────────────────────────────
+// 文本加解密
 
 QString LocalStore::encryptText(const QString &plaintext) const
 {
@@ -299,7 +299,7 @@ QString LocalStore::decryptText(const QString &cipher) const
     return QString::fromUtf8(plain);
 }
 
-// ── 持久化 outbox ────────────────────────────────────────────────────────────
+// 持久化 outbox
 
 bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
                                const QString &plaintext)
@@ -314,9 +314,9 @@ bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
     }
 
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "INSERT OR REPLACE INTO outbox(client_message_id, to_user_id, content_enc, created_at) "
-        "VALUES (?, ?, ?, ?)"));
+        "VALUES (?, ?, ?, ?)");
     query.addBindValue(clientMessageId);
     query.addBindValue(toUserId);
     query.addBindValue(enc);
@@ -334,7 +334,7 @@ bool LocalStore::removeOutboxItem(const QString &clientMessageId)
         return false;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral("DELETE FROM outbox WHERE client_message_id = ?"));
+    query.prepare("DELETE FROM outbox WHERE client_message_id = ?");
     query.addBindValue(clientMessageId);
     return query.exec();
 }
@@ -346,8 +346,8 @@ QList<LocalStore::OutboxItem> LocalStore::loadOutbox() const
         return result;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
-        "SELECT client_message_id, to_user_id, content_enc FROM outbox ORDER BY created_at"));
+    query.prepare(
+        "SELECT client_message_id, to_user_id, content_enc FROM outbox ORDER BY created_at");
     if (!query.exec()) {
         return result;
     }
@@ -363,7 +363,7 @@ QList<LocalStore::OutboxItem> LocalStore::loadOutbox() const
     return result;
 }
 
-// ── 消息缓存 ─────────────────────────────────────────────────────────────────
+// 消息缓存
 
 QString LocalStore::loadMessageContent(qint64 messageId) const
 {
@@ -371,8 +371,8 @@ QString LocalStore::loadMessageContent(qint64 messageId) const
         return {};
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
-        "SELECT content_enc, undecryptable FROM messages WHERE message_id = ?"));
+    query.prepare(
+        "SELECT content_enc, undecryptable FROM messages WHERE message_id = ?");
     query.addBindValue(messageId);
     if (!query.exec() || !query.next()) {
         return {};
@@ -421,7 +421,7 @@ bool LocalStore::upsertMessage(const QJsonObject &msg)
     }
 
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "INSERT INTO messages(message_id, conversation_id, sender_id, sender_username,"
         " content_enc, content_type, status, status_rank, undecryptable, client_message_id, created_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -442,12 +442,12 @@ bool LocalStore::upsertMessage(const QJsonObject &msg)
         " undecryptable = CASE WHEN excluded.content_enc != '' THEN 0"
         "                      ELSE messages.undecryptable END,"
         " client_message_id = excluded.client_message_id,"
-        " created_at = excluded.created_at"));
+        " created_at = excluded.created_at");
     query.addBindValue(messageId);
     query.addBindValue(conversationId);
     query.addBindValue(msg.value("senderId").toVariant().toLongLong());
     query.addBindValue(text(msg, "senderUsername"));
-    query.addBindValue(enc.isEmpty() ? QStringLiteral("") : enc);
+    query.addBindValue(enc.isEmpty() ? QString("") : enc);
     query.addBindValue(text(msg, "contentType", "text"));
     query.addBindValue(text(msg, "status", "sent"));
     query.addBindValue(markUndecryptable && content.isEmpty() ? 1 : 0);
@@ -473,10 +473,10 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
         return result;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "SELECT message_id, conversation_id, sender_id, sender_username, content_enc,"
         " content_type, status, created_at"
-        " FROM messages WHERE conversation_id = ? ORDER BY message_id DESC LIMIT ?"));
+        " FROM messages WHERE conversation_id = ? ORDER BY message_id DESC LIMIT ?");
     query.addBindValue(conversationId);
     query.addBindValue(limit);
     if (!query.exec()) {
@@ -517,15 +517,15 @@ bool LocalStore::updateMessageStatus(qint64 messageId, const QString &status)
         return false;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
-        "UPDATE messages SET status = ?, status_rank = ? WHERE message_id = ?"));
+    query.prepare(
+        "UPDATE messages SET status = ?, status_rank = ? WHERE message_id = ?");
     query.addBindValue(status);
     query.addBindValue(statusRank(status));
     query.addBindValue(messageId);
     return query.exec();
 }
 
-// ── 会话缓存 ─────────────────────────────────────────────────────────────────
+// 会话缓存
 
 bool LocalStore::upsertConversation(const QJsonObject &conv)
 {
@@ -548,7 +548,7 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
     }
 
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "INSERT INTO conversations(conversation_id, type, peer_user_id, peer_username,"
         " last_message_enc, last_message_id, last_message_at, unread_count)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -559,14 +559,14 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
         " last_message_enc = excluded.last_message_enc,"
         " last_message_id = excluded.last_message_id,"
         " last_message_at = excluded.last_message_at,"
-        " unread_count = excluded.unread_count"));
+        " unread_count = excluded.unread_count");
     query.addBindValue(conversationId);
-    query.addBindValue(text(conv, QStringLiteral("type"), QStringLiteral("private")));
+    query.addBindValue(text(conv, "type", "private"));
     query.addBindValue(conv.value("peerUserId").toVariant().toLongLong());
-    query.addBindValue(text(conv, QStringLiteral("peerUsername")));
-    query.addBindValue(enc.isEmpty() ? QStringLiteral("") : enc);
+    query.addBindValue(text(conv, "peerUsername"));
+    query.addBindValue(enc.isEmpty() ? QString("") : enc);
     query.addBindValue(conv.value("lastMessageId").toVariant().toLongLong());
-    query.addBindValue(text(conv, QStringLiteral("lastMessageAt")));
+    query.addBindValue(text(conv, "lastMessageAt"));
     query.addBindValue(conv.value("unreadCount").toInt());
     if (!query.exec()) {
         qWarning() << "[LocalStore] upsertConversation failed:" << query.lastError().text();
@@ -582,10 +582,10 @@ QJsonArray LocalStore::loadConversations() const
         return result;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "SELECT conversation_id, type, peer_user_id, peer_username, last_message_enc,"
         " last_message_id, last_message_at, unread_count"
-        " FROM conversations ORDER BY last_message_at DESC, conversation_id DESC"));
+        " FROM conversations ORDER BY last_message_at DESC, conversation_id DESC");
     if (!query.exec()) {
         return result;
     }
@@ -618,17 +618,17 @@ bool LocalStore::bumpConversationPreview(qint64 conversationId, const QString &p
         }
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "UPDATE conversations SET last_message_enc = ?, last_message_at = ?,"
-        " unread_count = unread_count + ? WHERE conversation_id = ?"));
-    query.addBindValue(enc.isEmpty() ? QStringLiteral("") : enc);
+        " unread_count = unread_count + ? WHERE conversation_id = ?");
+    query.addBindValue(enc.isEmpty() ? QString("") : enc);
     query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
     query.addBindValue(incrementUnread ? 1 : 0);
     query.addBindValue(conversationId);
     return query.exec();
 }
 
-// ── 解密缓存 ─────────────────────────────────────────────────────────────────
+// 解密缓存
 
 QString LocalStore::loadDecryptedContent(qint64 messageId) const
 {
@@ -636,7 +636,7 @@ QString LocalStore::loadDecryptedContent(qint64 messageId) const
         return {};
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral("SELECT content_enc FROM decrypt_cache WHERE message_id = ?"));
+    query.prepare("SELECT content_enc FROM decrypt_cache WHERE message_id = ?");
     query.addBindValue(messageId);
     if (!query.exec() || !query.next()) {
         return {};
@@ -654,8 +654,8 @@ bool LocalStore::saveDecryptedContent(qint64 messageId, const QString &plaintext
         return false;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
-        "INSERT OR REPLACE INTO decrypt_cache(message_id, content_enc) VALUES (?, ?)"));
+    query.prepare(
+        "INSERT OR REPLACE INTO decrypt_cache(message_id, content_enc) VALUES (?, ?)");
     query.addBindValue(messageId);
     query.addBindValue(enc);
     return query.exec();
@@ -682,7 +682,7 @@ int LocalStore::importLegacyDecryptCache(const QString &username, const QString 
     return imported;
 }
 
-// ── 同步游标 ─────────────────────────────────────────────────────────────────
+// 同步游标
 
 qint64 LocalStore::syncCursor() const
 {
@@ -690,7 +690,7 @@ qint64 LocalStore::syncCursor() const
         return 0;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral("SELECT value FROM meta WHERE key = 'sync_seq'"));
+    query.prepare("SELECT value FROM meta WHERE key = 'sync_seq'");
     if (!query.exec() || !query.next()) {
         return 0;
     }
@@ -703,9 +703,9 @@ bool LocalStore::setSyncCursor(qint64 seq)
         return false;
     }
     QSqlQuery query(m_db);
-    query.prepare(QStringLiteral(
+    query.prepare(
         "INSERT INTO meta(key, value) VALUES ('sync_seq', ?)"
-        " ON CONFLICT(key) DO UPDATE SET value = excluded.value"));
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value");
     query.addBindValue(QString::number(seq));
     return query.exec();
 }
@@ -715,8 +715,8 @@ void LocalStore::healEnvelopeLeaks()
     // 旧版本缺陷曾把解密失败的 envelope 原文当作正文落库；打开时扫描并
     // 清空为 undecryptable，正文由后续重新同步 + 解密缓存恢复
     QSqlQuery select(m_db);
-    if (!select.exec(QStringLiteral(
-            "SELECT message_id, content_enc FROM messages WHERE content_enc != ''"))) {
+    if (!select.exec(
+            "SELECT message_id, content_enc FROM messages WHERE content_enc != ''")) {
         return;
     }
     QList<qint64> leaked;
@@ -731,8 +731,8 @@ void LocalStore::healEnvelopeLeaks()
     }
     for (const qint64 messageId : leaked) {
         QSqlQuery update(m_db);
-        update.prepare(QStringLiteral(
-            "UPDATE messages SET content_enc = '', undecryptable = 1 WHERE message_id = ?"));
+        update.prepare(
+            "UPDATE messages SET content_enc = '', undecryptable = 1 WHERE message_id = ?");
         update.addBindValue(messageId);
         update.exec();
     }

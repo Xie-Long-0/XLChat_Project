@@ -39,7 +39,7 @@ public:
     // 仅关闭数据库（保留文件，供下次启动复用）
     void close();
     // 清除用户可见数据（消息/会话/outbox/同步游标），但保留解密缓存与
-    // 存储密钥——二者属 E2EE 密钥材料：一次性预密钥消费后不可恢复，
+    // 存储密钥：二者属 E2EE 密钥材料：一次性预密钥消费后不可恢复，
     // 登出重登必须依靠解密缓存兜底（与 M6 产品承诺一致）
     bool clearUserData();
     // 关闭并删除本地数据库与存储密钥（彻底销毁，旧密文不可再恢复；
@@ -48,13 +48,13 @@ public:
     bool isOpen() const { return m_open; }
     QString username() const { return m_username; }
 
-    // ── 持久化 outbox（正文加密存储） ────────────────────────────────────────
+    // 持久化 outbox（正文加密存储）
     bool addOutboxItem(const QString &clientMessageId, qint64 toUserId,
                        const QString &plaintext);
     bool removeOutboxItem(const QString &clientMessageId);
     QList<OutboxItem> loadOutbox() const;
 
-    // ── 消息缓存（content 传入/返回均为明文，落库时加密） ───────────────────
+    // 消息缓存（content 传入/返回均为明文，落库时加密）
     // msg 需含 messageId/conversationId/content 等 sync_messages 响应字段；
     // undecryptable=true 且已有可解密正文时保留旧明文不覆盖
     bool upsertMessage(const QJsonObject &msg);
@@ -62,20 +62,20 @@ public:
     QJsonArray loadMessages(qint64 conversationId, int limit = 100) const;
     bool updateMessageStatus(qint64 messageId, const QString &status);
 
-    // ── 会话缓存（lastMessage 预览加密存储） ─────────────────────────────────
+    // 会话缓存（lastMessage 预览加密存储）
     bool upsertConversation(const QJsonObject &conv);
     QJsonArray loadConversations() const;
     // 仅更新已存在的会话行（避免事件流缺字段时产生幻影会话）
     bool bumpConversationPreview(qint64 conversationId, const QString &preview,
                                  bool incrementUnread);
 
-    // ── 解密缓存（messageId -> 明文，归口替代 M6 KeyStorage .cache） ─────────
+    // 解密缓存（messageId -> 明文，归口替代 M6 KeyStorage .cache）
     QString loadDecryptedContent(qint64 messageId) const;
     bool saveDecryptedContent(qint64 messageId, const QString &plaintext);
     // 一次性导入并删除 M6 遗留的 KeyStorage 解密缓存文件，返回导入条数
     int importLegacyDecryptCache(const QString &username, const QString &deviceId);
 
-    // ── sync_events 增量同步游标 ─────────────────────────────────────────────
+    // sync_events 增量同步游标
     qint64 syncCursor() const;
     bool setSyncCursor(qint64 seq);
 
@@ -88,7 +88,7 @@ private:
     // 清空为 undecryptable（正文由后续重新同步 + 解密缓存恢复）
     void healEnvelopeLeaks();
     // AES-256-GCM 文本加解密；格式 "enc1:<base64(iv)>:<base64(密文+标签)>"，
-    // 解密失败（含格式不符）返回空 —— 宁缺毋滥，绝不回退明文
+    // 解密失败（含格式不符）返回空：宁缺毋滥，绝不回退明文
     QString encryptText(const QString &plaintext) const;
     QString decryptText(const QString &cipher) const;
     QString loadMessageContent(qint64 messageId) const;
