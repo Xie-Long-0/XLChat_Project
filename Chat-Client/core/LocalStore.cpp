@@ -236,12 +236,15 @@ bool LocalStore::ensureSchema()
                        "last_message_enc TEXT NOT NULL DEFAULT '',"
                        "last_message_id INTEGER NOT NULL DEFAULT 0,"
                        "last_message_at TEXT NOT NULL DEFAULT '',"
-                       "unread_count INTEGER NOT NULL DEFAULT 0)",
+                       "unread_count INTEGER NOT NULL DEFAULT 0,"
+                       "name TEXT NOT NULL DEFAULT '',"
+                       "member_count INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS outbox ("
                        "client_message_id TEXT PRIMARY KEY,"
                        "to_user_id INTEGER NOT NULL,"
                        "content_enc TEXT NOT NULL,"
-                       "created_at TEXT NOT NULL DEFAULT '')",
+                       "created_at TEXT NOT NULL DEFAULT '',"
+                       "conversation_id INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS decrypt_cache ("
                        "message_id INTEGER PRIMARY KEY,"
                        "content_enc TEXT NOT NULL)",
@@ -258,10 +261,44 @@ bool LocalStore::ensureSchema()
         }
     }
 
+    // M7a: 存量库幂等补列（群名/成员数/群 outbox 目标）
+    if (!hasColumn("conversations", "name")
+        && !query.exec("ALTER TABLE conversations "
+                       "ADD COLUMN name TEXT NOT NULL DEFAULT ''")) {
+        qWarning() << "[LocalStore] Add conversations.name failed:" << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("conversations", "member_count")
+        && !query.exec("ALTER TABLE conversations "
+                       "ADD COLUMN member_count INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add conversations.member_count failed:" << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("outbox", "conversation_id")
+        && !query.exec("ALTER TABLE outbox "
+                       "ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add outbox.conversation_id failed:" << query.lastError().text();
+        return false;
+    }
+
     // 记录 schema 版本（首次插入）
     query.exec("INSERT INTO schema_meta(version) "
                               "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM schema_meta)");
     return true;
+}
+
+bool LocalStore::hasColumn(const QString &table, const QString &column) const
+{
+    QSqlQuery query(m_db);
+    if (!query.exec("PRAGMA table_info(" + table + ")")) {
+        return false;
+    }
+    while (query.next()) {
+        if (query.value(1).toString() == column) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // 文本加解密
@@ -302,9 +339,10 @@ QString LocalStore::decryptText(const QString &cipher) const
 // 持久化 outbox
 
 bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
-                               const QString &plaintext)
+                               const QString &plaintext, qint64 conversationId)
 {
-    if (!m_open || clientMessageId.isEmpty() || toUserId <= 0) {
+    // 私聊需有效接收者；群聊需有效会话 ID（两者至少一个）
+    if (!m_open || clientMessageId.isEmpty() || (toUserId <= 0 && conversationId <= 0)) {
         return false;
     }
     const QString enc = encryptText(plaintext);
@@ -315,12 +353,14 @@ bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
 
     QSqlQuery query(m_db);
     query.prepare(
-        "INSERT OR REPLACE INTO outbox(client_message_id, to_user_id, content_enc, created_at) "
-        "VALUES (?, ?, ?, ?)");
+        "INSERT OR REPLACE INTO outbox"
+        "(client_message_id, to_user_id, content_enc, created_at, conversation_id) "
+        "VALUES (?, ?, ?, ?, ?)");
     query.addBindValue(clientMessageId);
     query.addBindValue(toUserId);
     query.addBindValue(enc);
     query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+    query.addBindValue(conversationId);
     if (!query.exec()) {
         qWarning() << "[LocalStore] addOutboxItem failed:" << query.lastError().text();
         return false;
@@ -347,7 +387,8 @@ QList<LocalStore::OutboxItem> LocalStore::loadOutbox() const
     }
     QSqlQuery query(m_db);
     query.prepare(
-        "SELECT client_message_id, to_user_id, content_enc FROM outbox ORDER BY created_at");
+        "SELECT client_message_id, to_user_id, content_enc, conversation_id "
+        "FROM outbox ORDER BY created_at");
     if (!query.exec()) {
         return result;
     }
@@ -356,7 +397,9 @@ QList<LocalStore::OutboxItem> LocalStore::loadOutbox() const
         item.clientMessageId = query.value(0).toString();
         item.toUserId = query.value(1).toLongLong();
         item.content = decryptText(query.value(2).toString());
-        if (!item.clientMessageId.isEmpty() && item.toUserId > 0 && !item.content.isEmpty()) {
+        item.conversationId = query.value(3).toLongLong();
+        const bool validTarget = item.toUserId > 0 || item.conversationId > 0;
+        if (!item.clientMessageId.isEmpty() && validTarget && !item.content.isEmpty()) {
             result.append(item);
         }
     }
@@ -550,8 +593,9 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
     QSqlQuery query(m_db);
     query.prepare(
         "INSERT INTO conversations(conversation_id, type, peer_user_id, peer_username,"
-        " last_message_enc, last_message_id, last_message_at, unread_count)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        " last_message_enc, last_message_id, last_message_at, unread_count,"
+        " name, member_count)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(conversation_id) DO UPDATE SET"
         " type = excluded.type,"
         " peer_user_id = excluded.peer_user_id,"
@@ -559,7 +603,9 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
         " last_message_enc = excluded.last_message_enc,"
         " last_message_id = excluded.last_message_id,"
         " last_message_at = excluded.last_message_at,"
-        " unread_count = excluded.unread_count");
+        " unread_count = excluded.unread_count,"
+        " name = excluded.name,"
+        " member_count = excluded.member_count");
     query.addBindValue(conversationId);
     query.addBindValue(text(conv, "type", "private"));
     query.addBindValue(conv.value("peerUserId").toVariant().toLongLong());
@@ -568,6 +614,9 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
     query.addBindValue(conv.value("lastMessageId").toVariant().toLongLong());
     query.addBindValue(text(conv, "lastMessageAt"));
     query.addBindValue(conv.value("unreadCount").toInt());
+    // M7a: 群会话字段（private 会话为空/0）
+    query.addBindValue(text(conv, "name"));
+    query.addBindValue(conv.value("memberCount").toInt());
     if (!query.exec()) {
         qWarning() << "[LocalStore] upsertConversation failed:" << query.lastError().text();
         return false;
@@ -584,7 +633,7 @@ QJsonArray LocalStore::loadConversations() const
     QSqlQuery query(m_db);
     query.prepare(
         "SELECT conversation_id, type, peer_user_id, peer_username, last_message_enc,"
-        " last_message_id, last_message_at, unread_count"
+        " last_message_id, last_message_at, unread_count, name, member_count"
         " FROM conversations ORDER BY last_message_at DESC, conversation_id DESC");
     if (!query.exec()) {
         return result;
@@ -599,6 +648,8 @@ QJsonArray LocalStore::loadConversations() const
         conv["lastMessageId"] = query.value(5).toLongLong();
         conv["lastMessageAt"] = query.value(6).toString();
         conv["unreadCount"] = query.value(7).toInt();
+        conv["name"] = query.value(8).toString();
+        conv["memberCount"] = query.value(9).toInt();
         result.append(conv);
     }
     return result;

@@ -86,6 +86,39 @@ Window {
                 mainPage.resetUi()
                 mainWindow.logoutRequested()
             }
+
+            // M7a: 群组操作信号接入
+            onLoadContactsRequested: {
+                networkManager.getContacts()
+            }
+
+            onCreateGroupRequested: function(name, memberIds) {
+                networkManager.createGroup(name, memberIds)
+            }
+
+            onInviteGroupMembersRequested: function(conversationId, userIds) {
+                networkManager.inviteGroupMembers(conversationId, userIds)
+            }
+
+            onLeaveGroupRequested: function(conversationId) {
+                networkManager.leaveGroup(conversationId)
+            }
+
+            onKickGroupMemberRequested: function(conversationId, userId) {
+                networkManager.kickGroupMember(conversationId, userId)
+            }
+
+            onGetGroupInfoRequested: function(conversationId) {
+                networkManager.getGroupInfo(conversationId)
+            }
+
+            onSendGroupMessageRequested: function(conversationId, content) {
+                // 群消息同样以幂等键跟踪乐观气泡
+                var clientMessageId = networkManager.sendGroupMessage(conversationId, content)
+                if (clientMessageId) {
+                    mainPage.trackOutgoingMessage(clientMessageId, content)
+                }
+            }
         }
     }
 
@@ -153,6 +186,42 @@ Window {
                 userList.push(users[i])
             }
             mainPage.showSearchResults(userList)
+        }
+
+        // M7a: 联系人列表（建群对话框成员选择）
+        function onContactsResult(contacts) {
+            var contactList = []
+            for (var i = 0; i < contacts.length; i++) {
+                contactList.push(contacts[i])
+            }
+            mainPage.showContacts(contactList)
+        }
+
+        // M7a: 群组操作结果
+        function onGroupCreated(conversationId, name) {
+            mainPage.openCreatedGroup(conversationId, name)
+        }
+
+        function onGroupLeft(conversationId) {
+            mainPage.closeGroupIfCurrent(conversationId)
+        }
+
+        function onGroupInfoResult(info) {
+            mainPage.showGroupInfo(info)
+        }
+
+        function onGroupRequestFailed(error) {
+            console.log("Group operation failed:", error)
+        }
+
+        // M7a: 群变更推送：被移除/目标为自己的变更需关闭当前会话
+        function onGroupChanged(payload) {
+            var changeType = payload.changeType || ""
+            var target = payload.targetUserId || 0
+            if ((changeType === "member_removed" || changeType === "member_left")
+                && target === mainWindow.myUserId) {
+                mainPage.closeGroupIfCurrent(payload.conversationId || 0)
+            }
         }
     }
 

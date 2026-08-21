@@ -13,9 +13,13 @@ Rectangle {
     property bool hasConversation: false
     // M4.5: 当前登录用户 ID，用于判断消息归属
     property int myUserId: 0
+    // M7a: 群会话状态（未端到端加密提示、成员数副标题、群信息入口）
+    property bool isGroup: false
+    property int groupMemberCount: 0
 
     signal sendMessage(string content)
     signal backClicked()
+    signal groupInfoRequested()
 
     // 顶部标题栏
     Rectangle {
@@ -103,6 +107,53 @@ Rectangle {
                     color: Theme.textPrimary
                     elide: Text.ElideRight
                 }
+
+                // M7a: 群会话副标题（成员数）
+                Label {
+                    visible: isGroup
+                    text: groupMemberCount + " 位成员"
+                    font.pixelSize: Theme.fontSizeSmall - 1
+                    color: Theme.textTertiary
+                }
+            }
+
+            // M7a: 群信息按钮（打开群成员/管理对话框）
+            Rectangle {
+                id: groupInfoBtn
+                width: 36; height: 36
+                radius: 18
+                visible: isGroup
+                color: groupInfoMouse.containsMouse ? Theme.hoverColor : "transparent"
+
+                MouseArea {
+                    id: groupInfoMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: chatView.groupInfoRequested()
+                }
+
+                // 多人图标（两个圆 + 肩部弧线）
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 16; height: 16
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        ctx.strokeStyle = Theme.textSecondary
+                        ctx.lineWidth = 1.4
+                        ctx.beginPath()
+                        ctx.arc(6, 5, 2.6, 0, Math.PI * 2)
+                        ctx.stroke()
+                        ctx.beginPath()
+                        ctx.arc(11, 6, 2.1, 0, Math.PI * 2)
+                        ctx.stroke()
+                        ctx.beginPath()
+                        ctx.moveTo(1.5, 13.5)
+                        ctx.quadraticCurveTo(6, 8.5, 10.5, 13.5)
+                        ctx.stroke()
+                    }
+                }
             }
 
             Item {
@@ -111,10 +162,30 @@ Rectangle {
         }
     }
 
+    // M7a: 群聊未端到端加密提示（验收要求：UI 明确提示）；
+    // 高度随可见性折叠，避免私聊下锚点链残留空隙
+    Rectangle {
+        id: groupBanner
+        anchors.top: chatHeader.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: isGroup ? 28 : 0
+        visible: isGroup
+        clip: true
+        color: Theme.dateDividerColor
+
+        Label {
+            anchors.centerIn: parent
+            text: "群聊暂未端到端加密，消息内容对服务端可见（M7b 将支持 Sender Keys 加密）"
+            font.pixelSize: Theme.fontSizeSmall - 1
+            color: Theme.dateDividerTextColor
+        }
+    }
+
     // 消息列表（直接用 ListView 作为滚动容器，ScrollView 不暴露 contentY）
     ListView {
         id: messageListView
-        anchors.top: chatHeader.bottom
+        anchors.top: groupBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: messageInput.top
@@ -158,9 +229,32 @@ Rectangle {
                 }
             }
 
-            // 消息气泡
+            // M7a: 群系统消息（居中胶囊展示，不用气泡）
+            Item {
+                width: parent.width
+                height: 28
+                visible: !model.isDivider && model.contentType === "system"
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    height: 22
+                    width: systemLabel.implicitWidth + Theme.spacingLarge * 2
+                    radius: 11
+                    color: Theme.dateDividerColor
+
+                    Label {
+                        id: systemLabel
+                        anchors.centerIn: parent
+                        text: chatView.systemMessageText(model.content)
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.dateDividerTextColor
+                    }
+                }
+            }
+
+            // 消息气泡（系统消息不渲染气泡）
             MessageBubble {
-                visible: !model.isDivider
+                visible: !model.isDivider && model.contentType !== "system"
                 width: parent.width
                 isMine: model.isMine
                 senderName: model.senderUsername
@@ -292,6 +386,26 @@ Rectangle {
         if (diffDays === 0) return "今天"
         if (diffDays === 1) return "昨天"
         return d.getFullYear() + "年" + (d.getMonth() + 1) + "月" + d.getDate() + "日"
+    }
+
+    // M7a: 群系统消息结构化正文转可读文本（与服务端约定 event 取值）
+    function systemMessageText(content) {
+        try {
+            var obj = JSON.parse(content)
+            if (obj && obj.event) {
+                switch (obj.event) {
+                    case "group_created": return "创建了群组"
+                    case "member_added": return "新成员加入群聊"
+                    case "member_removed": return "成员被移出群聊"
+                    case "member_left": return "成员退出了群聊"
+                    case "owner_transferred": return "群主已转让"
+                    default: return content
+                }
+            }
+        } catch (e) {
+            // 非 JSON 正文直接展示原文
+        }
+        return content
     }
 
     // 若与上一条消息不在同一天，先插入日期分隔线

@@ -386,3 +386,4 @@ install/
 .vscode/*.user
 /build_m4
 .workbuddy/
+/.qoder

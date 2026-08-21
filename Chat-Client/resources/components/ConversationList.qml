@@ -11,6 +11,8 @@ Rectangle {
     signal conversationClicked(int index)
     signal searchClicked()
     signal refreshClicked()
+    // M7a: 打开建群对话框
+    signal createGroupClicked()
 
     // M4.5: 当前选中会话索引（修复原先错误的判断条件）
     property int selectedIndex: -1
@@ -81,6 +83,40 @@ Rectangle {
                 font.pixelSize: Theme.fontSizeXLarge
                 font.weight: Font.Bold
                 color: Theme.textPrimary
+            }
+
+            // M7a: 建群按钮
+            Rectangle {
+                id: createGroupBtn
+                width: 36; height: 36
+                radius: 18
+                color: createGroupMouse.containsMouse ? Theme.hoverColor : "transparent"
+
+                MouseArea {
+                    id: createGroupMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: conversationList.createGroupClicked()
+                }
+
+                // 加号图标
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 14; height: 14
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        ctx.strokeStyle = Theme.textSecondary
+                        ctx.lineWidth = 1.8
+                        ctx.beginPath()
+                        ctx.moveTo(7, 1)
+                        ctx.lineTo(7, 13)
+                        ctx.moveTo(1, 7)
+                        ctx.lineTo(13, 7)
+                        ctx.stroke()
+                    }
+                }
             }
 
             // 刷新按钮
@@ -171,21 +207,23 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Theme.spacingSmall
 
-                // 头像（按用户 ID 取色，同一用户颜色稳定；避免 delegate 移除时
-                // index 为 undefined 导致 "Unable to assign [undefined] to QColor"）
+                // 头像（按用户/会话 ID 取色，同一会话颜色稳定；避免 delegate
+                // 移除时 index 为 undefined 导致 "Unable to assign [undefined] to QColor"）
                 Rectangle {
                     width: Theme.avatarSize
                     height: Theme.avatarSize
-                    radius: Theme.avatarSize / 2
+                    // M7a: 群会话用圆角方形头像区分
+                    radius: model.type === "group" ? Theme.radiusMedium : Theme.avatarSize / 2
                     color: {
                         var colors = ["#FF6B6B", "#4ECDC4", "#45B7D1", "#96CEB4", "#FFEAA7", "#DDA0DD", "#98D8C8"]
-                        var id = model.peerUserId || 0
+                        var id = model.type === "group" ? (model.conversationId || 0)
+                                                        : (model.peerUserId || 0)
                         return colors[id % colors.length]
                     }
 
                     Label {
                         anchors.centerIn: parent
-                        text: model.peerUsername.length > 0 ? model.peerUsername[0].toUpperCase() : "?"
+                        text: model.displayName.length > 0 ? model.displayName[0].toUpperCase() : "?"
                         font.pixelSize: Theme.fontSizeXLarge
                         font.weight: Font.Bold
                         color: Theme.textOnPrimary
@@ -205,11 +243,21 @@ Rectangle {
 
                         Label {
                             Layout.fillWidth: true
-                            text: model.peerUsername
+                            text: model.displayName
                             font.pixelSize: Theme.fontSizeMedium
                             font.weight: Font.DemiBold
                             color: delegateItem.isSelected ? Theme.selectedConversationTextColor : Theme.textPrimary
                             elide: Text.ElideRight
+                        }
+
+                        // M7a: 群成员数标识
+                        Label {
+                            visible: model.type === "group"
+                            text: model.memberCount + "人"
+                            font.pixelSize: Theme.fontSizeSmall - 1
+                            color: delegateItem.isSelected
+                                 ? Theme.selectedConversationSecondaryColor
+                                 : Theme.textTertiary
                         }
 
                         Label {
@@ -287,10 +335,17 @@ Rectangle {
         convModel.clear()
         for (var i = 0; i < conversations.length; i++) {
             var conv = conversations[i]
+            var type = conv.type || "private"
             convModel.append({
                 conversationId: conv.conversationId || 0,
+                type: type,
                 peerUserId: conv.peerUserId || 0,
                 peerUsername: conv.peerUsername || "",
+                // M7a: 群会话显示群名与成员数
+                name: conv.name || "",
+                memberCount: conv.memberCount || 0,
+                displayName: type === "group" ? (conv.name || "未命名群组")
+                                              : (conv.peerUsername || ""),
                 lastMessage: conv.lastMessage || "",
                 lastMessageTime: formatConvTime(conv.lastMessageAt || ""),
                 unreadCount: conv.unreadCount || 0

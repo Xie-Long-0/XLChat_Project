@@ -126,6 +126,69 @@ private slots:
         store.closeAndDestroy();
     }
 
+    // M7a: 群 outbox（conversationId 目标）与群会话缓存字段
+    void groupOutboxAndConversationFields()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+        // 群消息 outbox：toUserId=0、conversationId 为目标，跨重启保留
+        QVERIFY(store.addOutboxItem("gcmid-1", 0, "group msg", 21));
+        // 非法目标（两者均无效）被拒绝
+        QVERIFY(!store.addOutboxItem("gcmid-bad", 0, "no target", 0));
+        store.close();
+
+        QVERIFY(store.open(user, DeviceId));
+        const auto items = store.loadOutbox();
+        QCOMPARE(items.size(), 1);
+        QCOMPARE(items.at(0).clientMessageId, "gcmid-1");
+        QCOMPARE(items.at(0).conversationId, 21LL);
+        QCOMPARE(items.at(0).toUserId, 0LL);
+        QCOMPARE(items.at(0).content, "group msg");
+
+        // 群会话缓存：群名与成员数落库并可读回
+        QJsonObject conv;
+        conv["conversationId"] = 21;
+        conv["type"] = "group";
+        conv["name"] = "项目群";
+        conv["memberCount"] = 3;
+        conv["lastMessage"] = "hello";
+        conv["lastMessageId"] = 5;
+        conv["lastMessageAt"] = "2026-08-21T00:00:00Z";
+        conv["unreadCount"] = 1;
+        QVERIFY(store.upsertConversation(conv));
+
+        const QJsonArray convs = store.loadConversations();
+        QCOMPARE(convs.size(), 1);
+        const QJsonObject loaded = convs.at(0).toObject();
+        QCOMPARE(loaded.value("type").toString(), QString("group"));
+        QCOMPARE(loaded.value("name").toString(), QString("项目群"));
+        QCOMPARE(loaded.value("memberCount").toInt(), 3);
+        QCOMPARE(loaded.value("lastMessage").toString(), QString("hello"));
+
+        // 私聊会话不受群字段影响（默认空/0）
+        QJsonObject privateConv;
+        privateConv["conversationId"] = 22;
+        privateConv["type"] = "private";
+        privateConv["peerUserId"] = 7;
+        privateConv["peerUsername"] = "bob";
+        QVERIFY(store.upsertConversation(privateConv));
+        const QJsonArray convs2 = store.loadConversations();
+        QCOMPARE(convs2.size(), 2);
+        bool foundPrivate = false;
+        for (const QJsonValue &v : convs2) {
+            const QJsonObject c = v.toObject();
+            if (c.value("conversationId").toVariant().toLongLong() == 22) {
+                foundPrivate = true;
+                QCOMPARE(c.value("name").toString(), QString());
+                QCOMPARE(c.value("memberCount").toInt(), 0);
+            }
+        }
+        QVERIFY(foundPrivate);
+
+        store.closeAndDestroy();
+    }
+
     // 消息缓存
     void messageContentEncryptedOnDisk()
     {

@@ -409,6 +409,25 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::FetchKeysResponse:
         handleFetchKeysResponse(packet);
         break;
+    // M7a: 群组响应与推送
+    case MessageType::CreateGroupResponse:
+        handleCreateGroupResponse(packet);
+        break;
+    case MessageType::InviteGroupMembersResponse:
+        handleInviteGroupMembersResponse(packet);
+        break;
+    case MessageType::LeaveGroupResponse:
+        handleLeaveGroupResponse(packet);
+        break;
+    case MessageType::KickGroupMemberResponse:
+        handleKickGroupMemberResponse(packet);
+        break;
+    case MessageType::GetGroupInfoResponse:
+        handleGetGroupInfoResponse(packet);
+        break;
+    case MessageType::GroupChangedNotification:
+        handleGroupChangedNotification(packet);
+        break;
     case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
@@ -666,12 +685,42 @@ QString NetworkManager::sendMessage(qint64 toUserId, const QString &content)
 
     if (m_state != ConnectionState::Authenticated) {
         // M5.5: 未认证时进入 outbox，登录成功后自动重发
-        m_outbox.append({clientMessageId, toUserId, content});
+        m_outbox.append({clientMessageId, toUserId, 0, content});
         return clientMessageId;
     }
 
-    m_outbox.append({clientMessageId, toUserId, content});
+    m_outbox.append({clientMessageId, toUserId, 0, content});
     flushOutbox();
+    return clientMessageId;
+}
+
+// M7a: 发送群消息（明文；返回幂等键供 QML 乐观消息跟踪）
+QString NetworkManager::sendGroupMessage(qint64 conversationId, const QString &content)
+{
+    if (conversationId <= 0 || content.trimmed().isEmpty()) {
+        emit messageSendFailed("Invalid group message");
+        return {};
+    }
+
+    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    // 与私聊一致：outbox 加密落库，重启后不丢未发送消息
+    if (!m_localStore.isOpen()) {
+        const QString user = m_state == ConnectionState::Authenticated
+            ? m_username : m_pendingUsername;
+        const QString deviceId = m_localDeviceId.isEmpty()
+            ? QString::fromLatin1(QSysInfo::machineUniqueId().toHex())
+            : m_localDeviceId;
+        if (!user.isEmpty() && !deviceId.isEmpty()) {
+            m_localStore.open(user, deviceId);
+        }
+    }
+    m_localStore.addOutboxItem(clientMessageId, 0, content, conversationId);
+
+    m_outbox.append({clientMessageId, 0, conversationId, content});
+    if (m_state == ConnectionState::Authenticated) {
+        flushOutbox();
+    }
     return clientMessageId;
 }
 
@@ -683,17 +732,38 @@ void NetworkManager::flushOutbox()
         return;
     }
 
-    // M6: 身份密钥尚未注册时先引导，完成后会再次 flush
-    if (!m_e2eeReady) {
-        bootstrapE2ee();
-        return;
-    }
-
     // 已在途的 clientMessageId 不重复发
     QSet<QString> inFlight;
     for (auto it = m_pendingSendByRequestId.constBegin();
          it != m_pendingSendByRequestId.constEnd(); ++it) {
         inFlight.insert(it.value());
+    }
+
+    // M7a: 群消息明文直发，不依赖 E2EE 引导（与私聊路径分流）
+    for (const OutboxItem &item : std::as_const(m_outbox)) {
+        if (item.conversationId <= 0 || inFlight.contains(item.clientMessageId)) {
+            continue;
+        }
+        QJsonObject json;
+        json["type"] = "send_message";
+        json["conversationId"] = item.conversationId;
+        json["content"] = item.content;
+        json["contentType"] = "text";
+        json["clientMessageId"] = item.clientMessageId;
+        addReplayProtection(json);
+
+        Packet groupPacket;
+        groupPacket.messageType = MessageType::SendMessageRequest;
+        groupPacket.requestId = nextRequestId();
+        groupPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+        m_pendingSendByRequestId.insert(groupPacket.requestId, item.clientMessageId);
+        sendPacket(groupPacket);
+    }
+
+    // M6: 身份密钥尚未注册时先引导，完成后会再次 flush
+    if (!m_e2eeReady) {
+        bootstrapE2ee();
+        return;
     }
 
     // 按目标用户汇总待发消息，逐用户拉取密钥包（每次 FetchKeys 的预密钥
@@ -702,6 +772,9 @@ void NetworkManager::flushOutbox()
     const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
     QSet<qint64> targets;
     for (const OutboxItem &item : std::as_const(m_outbox)) {
+        if (item.conversationId > 0) {
+            continue; // M7a: 群消息已在上方直发
+        }
         if (!inFlight.contains(item.clientMessageId)) {
             targets.insert(item.toUserId);
         }
@@ -1294,6 +1367,13 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
             if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(lastMessage)) {
                 conv["lastMessage"] = "[Encrypted message]";
                 value = conv;
+                continue;
+            }
+            // M7a: 群系统消息预览（结构化 JSON）转为可读摘要
+            const QJsonObject sysObj = QJsonDocument::fromJson(lastMessage.toUtf8()).object();
+            if (!sysObj.isEmpty() && sysObj.contains("event")) {
+                conv["lastMessage"] = systemMessageSummary(lastMessage);
+                value = conv;
             }
         }
         // M6.5: 服务端权威会话数据写入本地缓存；预览为占位符时先用本地
@@ -1355,6 +1435,23 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
         }
         emit messageSent(messageId, conversationId, ackedId);
     } else {
+        // M7a: 群消息的确定性失败（已不在群/会话不存在/请求非法）移除
+        // outbox 项避免无限重试；瞬时错误保留重试
+        const int code2 = response.value("code").toInt();
+        const bool deterministic = code2 == static_cast<int>(ErrorCode::PermissionDenied)
+            || code2 == static_cast<int>(ErrorCode::ConversationNotFound)
+            || code2 == static_cast<int>(ErrorCode::InvalidRequest);
+        if (deterministic) {
+            for (int i = m_outbox.size() - 1; i >= 0; --i) {
+                if (m_outbox.at(i).clientMessageId == clientMessageId) {
+                    if (m_outbox.at(i).conversationId > 0) {
+                        m_localStore.removeOutboxItem(clientMessageId);
+                        m_outbox.removeAt(i);
+                    }
+                    break;
+                }
+            }
+        }
         emit messageSendFailed(response.value("message").toString("Send failed"));
     }
 }
@@ -1403,9 +1500,12 @@ void NetworkManager::handleNewMessageNotification(const Packet &packet)
     m_localStore.upsertMessage(msg);
     {
         const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
+        // M7a: 群系统消息预览用可读摘要，避免结构化 JSON 直接展示
+        const bool isSystem = msg.value("contentType").toString() == "system";
         const QString preview = msg.value("undecryptable").toBool()
             ? "[Encrypted message]"
-            : msg.value("content").toString();
+            : (isSystem ? systemMessageSummary(msg.value("content").toString())
+                        : msg.value("content").toString());
         m_localStore.bumpConversationPreview(convId, preview, true);
     }
     emit newMessageReceived(msg);
@@ -1507,7 +1607,8 @@ void NetworkManager::openLocalStore()
             }
         }
         if (!exists) {
-            m_outbox.append({item.clientMessageId, item.toUserId, item.content});
+            m_outbox.append({item.clientMessageId, item.toUserId,
+                             item.conversationId, item.content});
         }
     }
 
@@ -1589,4 +1690,229 @@ QVariantList NetworkManager::toVariantList(const QJsonArray &array) const
         result.append(val.toVariant());
     }
     return result;
+}
+
+// M7a: 群组操作
+
+void NetworkManager::createGroup(const QString &name, const QVariantList &memberIds)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "create_group";
+    json["name"] = name;
+    QJsonArray members;
+    for (const QVariant &v : memberIds) {
+        const qint64 id = v.toLongLong();
+        if (id > 0 && id != m_userId) {
+            members.append(id);
+        }
+    }
+    json["memberIds"] = members;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::CreateGroupRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingCreateGroupRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::inviteGroupMembers(qint64 conversationId, const QVariantList &userIds)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "invite_group_members";
+    json["conversationId"] = conversationId;
+    QJsonArray users;
+    for (const QVariant &v : userIds) {
+        const qint64 id = v.toLongLong();
+        if (id > 0 && id != m_userId) {
+            users.append(id);
+        }
+    }
+    json["userIds"] = users;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::InviteGroupMembersRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingInviteGroupRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::leaveGroup(qint64 conversationId)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "leave_group";
+    json["conversationId"] = conversationId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::LeaveGroupRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingLeaveGroupRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::kickGroupMember(qint64 conversationId, qint64 userId)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "kick_group_member";
+    json["conversationId"] = conversationId;
+    json["userId"] = userId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::KickGroupMemberRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingKickGroupRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::getGroupInfo(qint64 conversationId)
+{
+    if (m_state != ConnectionState::Authenticated) return;
+
+    QJsonObject json;
+    json["type"] = "get_group_info";
+    json["conversationId"] = conversationId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::GetGroupInfoRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingGetGroupInfoRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+// M7a: 群组响应
+
+void NetworkManager::handleCreateGroupResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingCreateGroupRequestId) return;
+    m_pendingCreateGroupRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        emit groupRequestFailed(response.value("message").toString("Failed to create group"));
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    const QString name = data.value("name").toString();
+
+    // 新群立即写入本地缓存（缓存先行，服务端刷新随后覆盖）
+    QJsonObject conv = data;
+    conv["type"] = "group";
+    conv["unreadCount"] = 0;
+    m_localStore.upsertConversation(conv);
+    getConversations();
+
+    emit groupCreated(conversationId, name);
+}
+
+void NetworkManager::handleInviteGroupMembersResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingInviteGroupRequestId) return;
+    m_pendingInviteGroupRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        emit groupRequestFailed(response.value("message").toString("Failed to invite members"));
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    getConversations();
+    emit groupMembersInvited(data.value("conversationId").toVariant().toLongLong());
+}
+
+void NetworkManager::handleLeaveGroupResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingLeaveGroupRequestId) return;
+    m_pendingLeaveGroupRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        emit groupRequestFailed(response.value("message").toString("Failed to leave group"));
+        return;
+    }
+
+    const qint64 conversationId =
+        response.value("data").toObject().value("conversationId").toVariant().toLongLong();
+    getConversations();
+    emit groupLeft(conversationId);
+}
+
+void NetworkManager::handleKickGroupMemberResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingKickGroupRequestId) return;
+    m_pendingKickGroupRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        emit groupRequestFailed(response.value("message").toString("Failed to remove member"));
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    emit groupMemberKicked(data.value("conversationId").toVariant().toLongLong(),
+                           data.value("removedUserId").toVariant().toLongLong());
+}
+
+void NetworkManager::handleGetGroupInfoResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingGetGroupInfoRequestId) return;
+    m_pendingGetGroupInfoRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        emit groupRequestFailed(response.value("message").toString("Failed to get group info"));
+        return;
+    }
+
+    emit groupInfoResult(response.value("data").toObject());
+}
+
+// M7a: 群变更推送：刷新会话列表并通知 UI（被移除/退群后群从列表消失）
+void NetworkManager::handleGroupChangedNotification(const Packet &packet)
+{
+    const QJsonObject payload = QJsonDocument::fromJson(packet.payload).object();
+    getConversations();
+    emit groupChanged(payload);
+}
+
+// M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）
+QString NetworkManager::systemMessageSummary(const QString &content)
+{
+    const QJsonObject obj = QJsonDocument::fromJson(content.toUtf8()).object();
+    const QString event = obj.value("event").toString();
+    if (event == "group_created") {
+        return "创建了群组";
+    }
+    if (event == "member_added") {
+        return "新成员加入群聊";
+    }
+    if (event == "member_removed") {
+        return "成员被移出群聊";
+    }
+    if (event == "member_left") {
+        return "成员退出了群聊";
+    }
+    if (event == "owner_transferred") {
+        return "群主已转让";
+    }
+    return content;
 }

@@ -58,6 +58,15 @@ public:
     // M5.5: 账号级增量同步
     Q_INVOKABLE void syncEvents(qint64 afterSeq = 0, int limit = 200);
 
+    // M7a: 群组操作（明文群聊）
+    Q_INVOKABLE void createGroup(const QString &name, const QVariantList &memberIds);
+    Q_INVOKABLE void inviteGroupMembers(qint64 conversationId, const QVariantList &userIds);
+    Q_INVOKABLE void leaveGroup(qint64 conversationId);
+    Q_INVOKABLE void kickGroupMember(qint64 conversationId, qint64 userId);
+    Q_INVOKABLE void getGroupInfo(qint64 conversationId);
+    // M7a: 发送群消息（明文，返回幂等键供乐观消息跟踪）
+    Q_INVOKABLE QString sendGroupMessage(qint64 conversationId, const QString &content);
+
     // 状态查询
     ConnectionState state() const { return m_state; }
     QString sessionToken() const { return m_sessionToken; }
@@ -90,6 +99,14 @@ signals:
     void eventsSynced(const QJsonArray &events, qint64 lastSeq, bool hasMore);
     // M6: 对方身份公钥指纹变化（TOFU 告警，不阻塞发送）
     void peerIdentityChanged(qint64 peerUserId);
+    // M7a: 群组操作结果与推送
+    void groupCreated(qint64 conversationId, const QString &name);
+    void groupMembersInvited(qint64 conversationId);
+    void groupLeft(qint64 conversationId);
+    void groupMemberKicked(qint64 conversationId, qint64 removedUserId);
+    void groupInfoResult(const QJsonObject &info);
+    void groupRequestFailed(const QString &error);
+    void groupChanged(const QJsonObject &payload);
 
 private slots:
     void onConnected();
@@ -121,6 +138,15 @@ private:
     // M5.5
     void handleMessageStatusUpdate(const XYChat::Protocol::Packet &packet);
     void handleSyncEventsResponse(const XYChat::Protocol::Packet &packet);
+    // M7a: 群组响应与推送
+    void handleCreateGroupResponse(const XYChat::Protocol::Packet &packet);
+    void handleInviteGroupMembersResponse(const XYChat::Protocol::Packet &packet);
+    void handleLeaveGroupResponse(const XYChat::Protocol::Packet &packet);
+    void handleKickGroupMemberResponse(const XYChat::Protocol::Packet &packet);
+    void handleGetGroupInfoResponse(const XYChat::Protocol::Packet &packet);
+    void handleGroupChangedNotification(const XYChat::Protocol::Packet &packet);
+    // M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）
+    static QString systemMessageSummary(const QString &content);
     void sendPacket(const XYChat::Protocol::Packet &packet);
     quint64 nextRequestId();
     void setState(ConnectionState state);
@@ -187,11 +213,19 @@ private:
     bool m_tlsUnavailable = false;
     quint64 m_pendingSyncEventsRequestId = 0;
 
+    // M7a: 群组请求待处理 ID
+    quint64 m_pendingCreateGroupRequestId = 0;
+    quint64 m_pendingInviteGroupRequestId = 0;
+    quint64 m_pendingLeaveGroupRequestId = 0;
+    quint64 m_pendingKickGroupRequestId = 0;
+    quint64 m_pendingGetGroupInfoRequestId = 0;
+
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem
     {
         QString clientMessageId;
-        qint64 toUserId = 0;
+        qint64 toUserId = 0;       // 私聊目标（群消息为 0）
+        qint64 conversationId = 0; // M7a: 群聊目标会话（私聊为 0）
         QString content;
     };
     QList<OutboxItem> m_outbox;

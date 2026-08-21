@@ -24,8 +24,9 @@ public:
     struct OutboxItem
     {
         QString clientMessageId;
-        qint64 toUserId = 0;
-        QString content; // 解密后的明文正文
+        qint64 toUserId = 0;      // 私聊目标（群消息为 0）
+        qint64 conversationId = 0; // M7a: 群聊目标会话（私聊为 0）
+        QString content; // 明文正文（群消息为原文，私聊为待加密明文）
     };
 
     LocalStore() = default;
@@ -48,9 +49,9 @@ public:
     bool isOpen() const { return m_open; }
     QString username() const { return m_username; }
 
-    // 持久化 outbox（正文加密存储）
+    // 持久化 outbox（正文加密存储）；M7a: conversationId > 0 表示群消息
     bool addOutboxItem(const QString &clientMessageId, qint64 toUserId,
-                       const QString &plaintext);
+                       const QString &plaintext, qint64 conversationId = 0);
     bool removeOutboxItem(const QString &clientMessageId);
     QList<OutboxItem> loadOutbox() const;
 
@@ -83,6 +84,8 @@ public:
 
 private:
     bool ensureSchema();
+    // M7a: 列存在性检查（存量库幂等补列）
+    bool hasColumn(const QString &table, const QString &column) const;
     bool ensureStorageKey(const QString &username, const QString &deviceId);
     // 历史缺陷自愈：旧版本曾把 envelope 密文误存为正文，打开时检出并
     // 清空为 undecryptable（正文由后续重新同步 + 解密缓存恢复）
