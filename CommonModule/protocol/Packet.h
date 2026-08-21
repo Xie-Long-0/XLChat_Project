@@ -49,6 +49,11 @@ enum class MessageType : quint16
     // M5.5 - 账号级增量同步
     SyncEventsRequest = 40,
     SyncEventsResponse = 41,
+    // M6 - 端到端加密密钥交换
+    RegisterKeysRequest = 50,
+    RegisterKeysResponse = 51,
+    FetchKeysRequest = 52,
+    FetchKeysResponse = 53,
 };
 
 enum class ErrorCode : int
@@ -73,6 +78,9 @@ enum class ErrorCode : int
     MessageNotFound = 3004,
     CannotSendToSelf = 3005,
     PermissionDenied = 3006,
+    // M6: 端到端加密相关
+    KeyBundleUnavailable = 3007,   // 对方无可用设备或预密钥耗尽
+    E2eeInvalidEnvelope = 3008,    // 消息密文 envelope 非法
     // 9xxx: 系统相关
     Timeout = 9001,
     InternalError = 9002,

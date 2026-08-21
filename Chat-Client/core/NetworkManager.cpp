@@ -141,6 +141,12 @@ void NetworkManager::onDisconnected()
     // M5.5: 在途发送请求随连接丢失，清除映射，
     // 重新登录后由 outbox 以相同幂等键重发（服务端去重）
     m_pendingSendByRequestId.clear();
+    // M6: 密钥交换在途状态随连接重置，重新登录后重新引导
+    m_e2eeReady = false;
+    m_e2eeBootstrapPending = false;
+    m_pendingRegisterKeysRequestId = 0;
+    m_pendingFetchKeysRequestId = 0;
+    m_fetchKeysTargetUserId = 0;
     setState(ConnectionState::Disconnected);
 
     if (shouldRelogin) {
@@ -313,7 +319,8 @@ void NetworkManager::sendLoginRequest()
     json["password"] = m_pendingPassword;
     json["clientVersion"] = "0.2.0";
     json["platform"] = QSysInfo::productType();
-    json["deviceId"] = QString::fromLatin1(QSysInfo::machineUniqueId().toHex());
+    m_localDeviceId = QString::fromLatin1(QSysInfo::machineUniqueId().toHex());
+    json["deviceId"] = m_localDeviceId;
     addReplayProtection(json);
 
     Packet packet;
@@ -394,6 +401,13 @@ void NetworkManager::handlePacket(const Packet &packet)
         break;
     case MessageType::SyncEventsResponse:
         handleSyncEventsResponse(packet);
+        break;
+    // M6
+    case MessageType::RegisterKeysResponse:
+        handleRegisterKeysResponse(packet);
+        break;
+    case MessageType::FetchKeysResponse:
+        handleFetchKeysResponse(packet);
         break;
     case MessageType::Ping: {
         Packet pong;
@@ -524,6 +538,22 @@ void NetworkManager::resetAuthState()
     m_userId = 0;
     m_username.clear();
     m_pendingUsername.clear();
+    // M6: 重置 E2EE 会话态（身份密钥仍持久化在本地，下次登录复用）
+    m_e2eeReady = false;
+    m_e2eeBootstrapPending = false;
+    m_pendingRegisterKeysRequestId = 0;
+    m_pendingFetchKeysRequestId = 0;
+    m_fetchKeysTargetUserId = 0;
+    m_fetchBackoffUntil.clear();
+    m_serverPrekeyRemaining = -1;
+    m_decryptCache.clear();
+    m_decryptCacheLoaded = false;
+    XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
+    m_identityKey = {};
+    for (auto &pk : m_localPrekeys) {
+        XYChat::Security::SecureMemory::wipe(pk.privateKey);
+    }
+    m_localPrekeys.clear();
     emit sessionChanged();
 }
 
@@ -623,9 +653,16 @@ QString NetworkManager::sendMessage(qint64 toUserId, const QString &content)
 }
 
 // M5.5: 将 outbox 中未确认的消息逐条发送（同一 clientMessageId 只保留一份）
+// M6: 发送前先拉取接收方密钥包，正文加密为 envelope 后再提交
 void NetworkManager::flushOutbox()
 {
     if (m_state != ConnectionState::Authenticated) {
+        return;
+    }
+
+    // M6: 身份密钥尚未注册时先引导，完成后会再次 flush
+    if (!m_e2eeReady) {
+        bootstrapE2ee();
         return;
     }
 
@@ -636,25 +673,487 @@ void NetworkManager::flushOutbox()
         inFlight.insert(it.value());
     }
 
+    // 按目标用户汇总待发消息，逐用户拉取密钥包（每次 FetchKeys 的预密钥
+    // 仅供一条消息使用，后续消息在响应回调中继续触发 flush）；
+    // 处于退避期的目标（对方尚未注册密钥等）暂不拉取
+    const qint64 nowSecs = QDateTime::currentSecsSinceEpoch();
+    QSet<qint64> targets;
     for (const OutboxItem &item : std::as_const(m_outbox)) {
-        if (inFlight.contains(item.clientMessageId)) {
+        if (!inFlight.contains(item.clientMessageId)) {
+            targets.insert(item.toUserId);
+        }
+    }
+    for (qint64 target : targets) {
+        if (m_pendingFetchKeysRequestId != 0) {
+            break; // 同一时刻只保持一个在途 FetchKeys，响应后继续
+        }
+        if (m_fetchBackoffUntil.value(target, 0) > nowSecs) {
+            continue; // 等待对方注册密钥，稍后由定时器重试
+        }
+        sendFetchKeysRequest(target);
+    }
+}
+
+// ── M6: E2EE 引导（加载/生成身份密钥，补齐预密钥，注册到服务端） ──
+void NetworkManager::bootstrapE2ee()
+{
+    using namespace XYChat::Security;
+
+    if (m_e2eeBootstrapPending || m_localDeviceId.isEmpty() || m_username.isEmpty()) {
+        return;
+    }
+
+    // 加载或生成本机身份密钥对
+    if (!m_identityKey.valid) {
+        QByteArray priv = KeyStorage::loadIdentityPrivateKey(m_username, m_localDeviceId);
+        if (priv.isEmpty()) {
+            m_identityKey = E2eeCrypto::generateX25519KeyPair();
+            if (!m_identityKey.valid) {
+                qCritical() << "[NetMgr] Failed to generate identity keypair";
+                return;
+            }
+            if (!KeyStorage::saveIdentityPrivateKey(m_username, m_localDeviceId,
+                                                    m_identityKey.privateKey)) {
+                // 持久化失败时密钥仅存在于内存，重启后重新生成（服务端会
+                // 因身份变更废弃旧预密钥，语义上仍然安全）
+                qWarning() << "[NetMgr] Failed to persist identity key,"
+                              "it will be regenerated on next launch";
+            }
+            // 新身份世代：旧预密钥与新身份不匹配，全部丢弃
+            for (auto &pk : m_localPrekeys) {
+                SecureMemory::wipe(pk.privateKey);
+            }
+            m_localPrekeys.clear();
+            qInfo() << "[NetMgr] Generated new E2EE identity key";
+        } else {
+            m_identityKey = E2eeCrypto::keyPairFromPrivateKey(priv);
+            SecureMemory::wipe(priv);
+            if (!m_identityKey.valid) {
+                // 审查修复：存储的身份密钥损坏时重新生成，避免发送功能永久阻塞
+                qWarning() << "[NetMgr] Stored identity key invalid, regenerating";
+                m_identityKey = E2eeCrypto::generateX25519KeyPair();
+                if (!m_identityKey.valid) {
+                    qCritical() << "[NetMgr] Failed to regenerate identity keypair";
+                    return;
+                }
+                KeyStorage::saveIdentityPrivateKey(m_username, m_localDeviceId,
+                                                   m_identityKey.privateKey);
+                for (auto &pk : m_localPrekeys) {
+                    SecureMemory::wipe(pk.privateKey);
+                }
+                m_localPrekeys.clear();
+            }
+        }
+    }
+
+    // 加载本地预密钥，低于阈值时补齐并随注册一并上传公钥
+    if (m_localPrekeys.isEmpty()) {
+        m_localPrekeys = KeyStorage::loadPrekeys(m_username, m_localDeviceId);
+    }
+
+    // 加载持久化解密缓存：一次性预密钥解密后即删除，重新登录后
+    // 历史消息依靠此缓存恢复明文（修复：登出重登后无法解密旧消息）
+    if (!m_decryptCacheLoaded) {
+        m_decryptCache = KeyStorage::loadDecryptCache(m_username, m_localDeviceId);
+        m_decryptCacheLoaded = true;
+    }
+
+    m_e2eeBootstrapPending = true;
+    sendRegisterKeysRequest();
+}
+
+void NetworkManager::sendRegisterKeysRequest()
+{
+    using namespace XYChat::Security;
+
+    QJsonObject json;
+    json["type"] = "register_keys";
+    json["identityPub"] = QString::fromLatin1(m_identityKey.publicKey.toBase64());
+
+    // 预密钥补齐：同时参考本地存量与服务端报告余量（服务端消费/废弃对
+    // 本地不可见，仅看本地会导致服务端枯竭后永不补齐）
+    constexpr int PrekeyTarget = 20;
+    constexpr int PrekeyLowWatermark = 5;
+    const bool localLow = m_localPrekeys.size() < PrekeyLowWatermark;
+    const bool serverLow = m_serverPrekeyRemaining >= 0
+        && m_serverPrekeyRemaining < PrekeyLowWatermark;
+    if (localLow || serverLow) {
+        QJsonArray pubs;
+        const int uploadCount = PrekeyTarget - (serverLow ? m_serverPrekeyRemaining
+                                                          : m_localPrekeys.size());
+        for (int i = 0; i < uploadCount; ++i) {
+            const auto kp = E2eeCrypto::generateX25519KeyPair();
+            if (!kp.valid) {
+                break;
+            }
+            KeyStorage::PrekeyEntry entry;
+            entry.publicKey = kp.publicKey;
+            entry.privateKey = kp.privateKey;
+            m_localPrekeys.append(entry);
+            pubs.append(QString::fromLatin1(kp.publicKey.toBase64()));
+        }
+        KeyStorage::savePrekeys(m_username, m_localDeviceId, m_localPrekeys);
+        json["prekeys"] = pubs;
+    }
+
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::RegisterKeysRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingRegisterKeysRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::handleRegisterKeysResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingRegisterKeysRequestId) {
+        return;
+    }
+    m_pendingRegisterKeysRequestId = 0;
+    m_e2eeBootstrapPending = false;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
+        m_e2eeReady = true;
+        const QJsonObject data = response.value("data").toObject();
+        m_serverPrekeyRemaining = data.value("remainingPrekeys").toInt();
+        qInfo() << "[NetMgr] E2EE keys registered, remaining prekeys:"
+                << m_serverPrekeyRemaining;
+        // 引导完成后继续发送 outbox
+        flushOutbox();
+    } else {
+        qWarning() << "[NetMgr] RegisterKeys failed:"
+                   << response.value("message").toString() << ", retry in 3s";
+        QTimer::singleShot(3000, this, [this]() {
+            if (m_state == ConnectionState::Authenticated && !m_e2eeReady) {
+                bootstrapE2ee();
+            }
+        });
+    }
+}
+
+void NetworkManager::sendFetchKeysRequest(qint64 toUserId)
+{
+    QJsonObject json;
+    json["type"] = "fetch_keys";
+    json["userId"] = toUserId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::FetchKeysRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingFetchKeysRequestId = packet.requestId;
+    m_fetchKeysTargetUserId = toUserId;
+    sendPacket(packet);
+}
+
+void NetworkManager::handleFetchKeysResponse(const Packet &packet)
+{
+    using namespace XYChat::Security;
+
+    if (packet.requestId != m_pendingFetchKeysRequestId) {
+        return;
+    }
+    const qint64 target = m_fetchKeysTargetUserId;
+    m_pendingFetchKeysRequestId = 0;
+    m_fetchKeysTargetUserId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt();
+    if (code != static_cast<int>(ErrorCode::Ok)) {
+        const QString message = response.value("message").toString("Key bundle unavailable");
+        if (code == static_cast<int>(ErrorCode::CannotSendToSelf)) {
+            // 确定性失败：移除该用户的待发项并上报
+            for (int i = m_outbox.size() - 1; i >= 0; --i) {
+                if (m_outbox.at(i).toUserId == target) {
+                    m_outbox.removeAt(i);
+                }
+            }
+            emit messageSendFailed(message);
+        } else if (code == static_cast<int>(ErrorCode::KeyBundleUnavailable)
+                   || code == static_cast<int>(ErrorCode::AccountNotFound)) {
+            // 修复：对方尚未注册 E2EE 密钥（从未登录/未上线）是产品上的
+            // 可恢复状态，保留 outbox 并定期重试，对方首次登录注册密钥后送达；
+            // 不能直接丢弃消息（此前行为导致离线发送永久丢失）
+            qInfo() << "[NetMgr] Target" << target << "has no keys yet,"
+                    << "keeping outbox and retrying in 30s:" << message;
+            m_fetchBackoffUntil.insert(target, QDateTime::currentSecsSinceEpoch() + 30);
+            QTimer::singleShot(30000, this, [this]() { flushOutbox(); });
+        } else {
+            // 瞬时失败（限流/内部错误等）：保留 outbox，短退避后重试
+            qWarning() << "[NetMgr] FetchKeys transient failure:" << message
+                       << ", retry in 3s";
+            m_fetchBackoffUntil.insert(target, QDateTime::currentSecsSinceEpoch() + 3);
+            QTimer::singleShot(3000, this, [this]() { flushOutbox(); });
+        }
+        flushOutbox();
+        return;
+    }
+
+    m_fetchBackoffUntil.remove(target);
+
+    const QJsonArray bundles = response.value("data").toObject().value("bundles").toArray();
+    if (bundles.isEmpty()) {
+        emit messageSendFailed("Empty key bundle");
+        flushOutbox();
+        return;
+    }
+
+    // TOFU：首次记录对方身份公钥指纹，变更时告警（不阻塞发送）
+    {
+        const QByteArray identityPub =
+            QByteArray::fromBase64(bundles.first().toObject()
+                                       .value("identityPub").toString().toLatin1());
+        const QString fingerprint = E2eeCrypto::publicKeyFingerprint(identityPub);
+        const QString stored = KeyStorage::loadPeerFingerprint(target);
+        if (stored.isEmpty()) {
+            KeyStorage::savePeerFingerprint(target, fingerprint);
+        } else if (stored != fingerprint) {
+            qWarning() << "[NetMgr] Peer identity key changed for user" << target;
+            KeyStorage::savePeerFingerprint(target, fingerprint);
+            emit peerIdentityChanged(target);
+        }
+    }
+
+    // 已在途的 clientMessageId 不重复发
+    QSet<QString> inFlight;
+    for (auto it = m_pendingSendByRequestId.constBegin();
+         it != m_pendingSendByRequestId.constEnd(); ++it) {
+        inFlight.insert(it.value());
+    }
+
+    // 认领的预密钥仅供一条消息使用：本轮只处理该用户的第一条待发项，
+    // 发送完成后 flushOutbox 会为下一条重新拉取密钥包
+    for (int i = 0; i < m_outbox.size(); ++i) {
+        const OutboxItem &item = m_outbox.at(i);
+        if (item.toUserId != target || inFlight.contains(item.clientMessageId)) {
             continue;
+        }
+
+        const QString envelope = encryptForUser(target, bundles, item.content);
+        if (envelope.isEmpty()) {
+            qWarning() << "[NetMgr] E2EE encryption failed for message"
+                       << item.clientMessageId;
+            m_outbox.removeAt(i);
+            emit messageSendFailed("End-to-end encryption failed");
+            break;
         }
 
         QJsonObject json;
         json["type"] = "send_message";
         json["toUserId"] = item.toUserId;
-        json["content"] = item.content;
+        json["content"] = envelope;
         json["contentType"] = "text";
         json["clientMessageId"] = item.clientMessageId;
         addReplayProtection(json);
 
-        Packet packet;
-        packet.messageType = MessageType::SendMessageRequest;
-        packet.requestId = nextRequestId();
-        packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-        m_pendingSendByRequestId.insert(packet.requestId, item.clientMessageId);
-        sendPacket(packet);
+        Packet sendPacketMsg;
+        sendPacketMsg.messageType = MessageType::SendMessageRequest;
+        sendPacketMsg.requestId = nextRequestId();
+        sendPacketMsg.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+        m_pendingSendByRequestId.insert(sendPacketMsg.requestId, item.clientMessageId);
+        sendPacket(sendPacketMsg);
+        break;
+    }
+
+    // 继续处理其他目标用户的待发消息
+    flushOutbox();
+}
+
+// 逐设备加密：每条消息生成临时密钥对，shared = ECDH(eph, prekey) || ECDH(eph, identity)
+QString NetworkManager::encryptForUser(qint64 toUserId, const QJsonArray &bundles,
+                                       const QString &plaintext)
+{
+    Q_UNUSED(toUserId);
+    using namespace XYChat::Security;
+
+    const QByteArray plainBytes = plaintext.toUtf8();
+    QList<E2eeCrypto::EnvelopeEntry> entries;
+
+    for (const QJsonValue &value : bundles) {
+        const QJsonObject bundle = value.toObject();
+        const QString deviceId = bundle.value("deviceId").toString();
+        const qint64 prekeyId = static_cast<qint64>(bundle.value("prekeyId").toDouble());
+        const QByteArray identityPub =
+            QByteArray::fromBase64(bundle.value("identityPub").toString().toLatin1());
+        const QByteArray prekeyPub =
+            QByteArray::fromBase64(bundle.value("prekeyPub").toString().toLatin1());
+        if (deviceId.isEmpty() || prekeyId <= 0) {
+            return {};
+        }
+
+        const auto eph = E2eeCrypto::generateX25519KeyPair();
+        if (!eph.valid) {
+            return {};
+        }
+
+        QByteArray shared = E2eeCrypto::ecdh(eph.privateKey, prekeyPub);
+        shared += E2eeCrypto::ecdh(eph.privateKey, identityPub);
+        SecureMemory::wipe(const_cast<QByteArray &>(eph.privateKey));
+        if (shared.size() != 64) {
+            SecureMemory::wipe(shared);
+            return {};
+        }
+
+        QByteArray key = E2eeCrypto::deriveMessageKey(shared);
+        SecureMemory::wipe(shared);
+        if (key.isEmpty()) {
+            return {};
+        }
+
+        const auto gcm = E2eeCrypto::aesGcmEncrypt(key, plainBytes);
+        SecureMemory::wipe(key);
+        if (!gcm.valid) {
+            return {};
+        }
+
+        E2eeCrypto::EnvelopeEntry entry;
+        entry.deviceId = deviceId;
+        entry.prekeyId = prekeyId;
+        entry.ephemeralPublicKey = eph.publicKey;
+        entry.iv = gcm.iv;
+        entry.ciphertext = gcm.ciphertext;
+        entries.append(entry);
+    }
+
+    // 修复：追加发送方自己设备的拷贝（prekeyId=0，仅用本人身份密钥加密，
+    // 不消费预密钥），使发送方重新登录/多端同步后仍能解密自己发出的消息
+    if (m_identityKey.valid && !m_localDeviceId.isEmpty()) {
+        const auto eph = E2eeCrypto::generateX25519KeyPair();
+        if (eph.valid) {
+            const QByteArray dh = E2eeCrypto::ecdh(eph.privateKey, m_identityKey.publicKey);
+            SecureMemory::wipe(const_cast<QByteArray &>(eph.privateKey));
+            if (dh.size() == 32) {
+                QByteArray shared = dh + dh;
+                SecureMemory::wipe(const_cast<QByteArray &>(dh));
+                QByteArray key = E2eeCrypto::deriveMessageKey(shared);
+                SecureMemory::wipe(shared);
+                const auto gcm = E2eeCrypto::aesGcmEncrypt(key, plainBytes);
+                SecureMemory::wipe(key);
+                if (gcm.valid) {
+                    E2eeCrypto::EnvelopeEntry selfEntry;
+                    selfEntry.deviceId = m_localDeviceId;
+                    selfEntry.prekeyId = E2eeCrypto::SelfCopyPrekeyId;
+                    selfEntry.ephemeralPublicKey = eph.publicKey;
+                    selfEntry.iv = gcm.iv;
+                    selfEntry.ciphertext = gcm.ciphertext;
+                    entries.append(selfEntry);
+                }
+            }
+        }
+    }
+
+    if (entries.isEmpty()) {
+        return {};
+    }
+    return QString::fromUtf8(
+        QJsonDocument(E2eeCrypto::encodeEnvelope(entries)).toJson(QJsonDocument::Compact));
+}
+
+// 解密接收正文：非 envelope（M6 前存量明文）原样返回；否则逐本地预密钥尝试解密
+QString NetworkManager::decryptIncomingContent(const QString &content, bool *undecryptable)
+{
+    using namespace XYChat::Security;
+
+    if (undecryptable) {
+        *undecryptable = false;
+    }
+    if (!E2eeCrypto::looksLikeEnvelope(content)) {
+        return content; // 存量明文消息
+    }
+
+    bool ok = false;
+    const auto entries = E2eeCrypto::decodeEnvelope(content, &ok);
+    if (!ok) {
+        if (undecryptable) {
+            *undecryptable = true;
+        }
+        return {};
+    }
+
+    // 找到属于本设备的条目并尝试解密（同一台机器上收发双方 deviceId 可能
+    // 相同，自身拷贝与接收方条目都要尝试，失败继续下一条）
+    for (const auto &entry : entries) {
+        if (entry.deviceId != m_localDeviceId) {
+            continue;
+        }
+        if (!m_identityKey.valid) {
+            continue;
+        }
+
+        if (entry.prekeyId == E2eeCrypto::SelfCopyPrekeyId) {
+            // 自己设备的拷贝：仅用身份密钥解密，不消费预密钥
+            QByteArray dh = E2eeCrypto::ecdh(m_identityKey.privateKey, entry.ephemeralPublicKey);
+            if (dh.size() != 32) {
+                continue;
+            }
+            QByteArray shared = dh + dh;
+            SecureMemory::wipe(dh);
+            QByteArray key = E2eeCrypto::deriveMessageKey(shared);
+            SecureMemory::wipe(shared);
+            const QByteArray plain = E2eeCrypto::aesGcmDecrypt(key, entry.iv, entry.ciphertext);
+            SecureMemory::wipe(key);
+            if (!plain.isEmpty()) {
+                return QString::fromUtf8(plain);
+            }
+            continue;
+        }
+
+        // 服务端预密钥 ID 本地未知：逐个本地预密钥尝试，GCM 认证标签验证正确性
+        for (int i = 0; i < m_localPrekeys.size(); ++i) {
+            QByteArray shared = E2eeCrypto::ecdh(m_localPrekeys.at(i).privateKey,
+                                                 entry.ephemeralPublicKey);
+            shared += E2eeCrypto::ecdh(m_identityKey.privateKey, entry.ephemeralPublicKey);
+            QByteArray key = E2eeCrypto::deriveMessageKey(shared);
+            SecureMemory::wipe(shared);
+            const QByteArray plain = E2eeCrypto::aesGcmDecrypt(key, entry.iv, entry.ciphertext);
+            SecureMemory::wipe(key);
+            if (!plain.isEmpty()) {
+                // 一次性预密钥已消费：从本地删除（前向安全）；
+                // 同消息的后续重复投递/重新同步由持久化解密缓存兜底
+                m_localPrekeys.removeAt(i);
+                KeyStorage::savePrekeys(m_username, m_localDeviceId, m_localPrekeys);
+                return QString::fromUtf8(plain);
+            }
+        }
+    }
+
+    if (undecryptable) {
+        *undecryptable = true;
+    }
+    return {};
+}
+
+// 在接收消息 JSON 上就地解密 content；失败时标记 undecryptable
+void NetworkManager::decryptMessageObject(QJsonObject &msg)
+{
+    const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
+
+    // 同一消息可能经通知与同步重复投递：命中缓存避免重复消费预密钥
+    if (msgId > 0 && m_decryptCache.contains(msgId)) {
+        msg["content"] = m_decryptCache.value(msgId);
+        return;
+    }
+
+    bool undecryptable = false;
+    const QString plain = decryptIncomingContent(msg.value("content").toString(),
+                                                 &undecryptable);
+    if (undecryptable) {
+        msg["undecryptable"] = true;
+    } else {
+        msg["content"] = plain;
+        if (msgId > 0) {
+            m_decryptCache.insert(msgId, plain);
+            if (m_decryptCache.size() > 2000) {
+                m_decryptCache.clear();
+            }
+            // 持久化解密缓存（DPAPI 保护）：预密钥已随解密删除，
+            // 重新登录/重新同步时依靠缓存恢复明文
+            KeyStorage::saveDecryptCache(m_username, m_localDeviceId, m_decryptCache);
+        }
     }
 }
 
@@ -738,7 +1237,18 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
 
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
-        emit conversationsResult(response.value("data").toObject().value("conversations").toArray());
+        // M6: 会话预览中的 envelope 密文替换为占位文本
+        QJsonArray conversations =
+            response.value("data").toObject().value("conversations").toArray();
+        for (QJsonValueRef value : conversations) {
+            QJsonObject conv = value.toObject();
+            const QString lastMessage = conv.value("lastMessage").toString();
+            if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(lastMessage)) {
+                conv["lastMessage"] = QStringLiteral("[Encrypted message]");
+                value = conv;
+            }
+        }
+        emit conversationsResult(conversations);
     }
 }
 
@@ -788,16 +1298,25 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
+        // M6: 逐条解密同步到的消息正文
+        QJsonArray messages = data.value("messages").toArray();
+        for (QJsonValueRef value : messages) {
+            QJsonObject msg = value.toObject();
+            decryptMessageObject(msg);
+            value = msg;
+        }
         emit messagesSynced(
             data.value("conversationId").toVariant().toLongLong(),
-            data.value("messages").toArray(),
+            messages,
             data.value("hasMore").toBool());
     }
 }
 
 void NetworkManager::handleNewMessageNotification(const Packet &packet)
 {
-    const QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
+    QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
+    // M6: 实时推送的消息先解密再交给 UI
+    decryptMessageObject(msg);
     emit newMessageReceived(msg);
 
     // 自动发送已送达确认
@@ -845,8 +1364,19 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
+        // M6: 解密事件流中的 message 事件正文
+        QJsonArray events = data.value("events").toArray();
+        for (QJsonValueRef value : events) {
+            QJsonObject event = value.toObject();
+            if (event.value("type").toString() == QStringLiteral("message")) {
+                QJsonObject payload = event.value("payload").toObject();
+                decryptMessageObject(payload);
+                event["payload"] = payload;
+                value = event;
+            }
+        }
         emit eventsSynced(
-            data.value("events").toArray(),
+            events,
             data.value("lastSeq").toVariant().toLongLong(),
             data.value("hasMore").toBool());
     }

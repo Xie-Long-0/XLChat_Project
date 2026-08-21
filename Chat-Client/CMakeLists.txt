@@ -33,12 +33,14 @@ set(RESOURCES
 set(SOURCES
     main.cpp
     core/NetworkManager.cpp
+    core/KeyStorage.cpp
 )
 
 # C++ 头文件
 set(HEADERS
     core/NetworkManager.h
     core/ThemeSettings.h
+    core/KeyStorage.h
 )
 
 # 生成可执行文件
@@ -59,6 +61,11 @@ target_link_libraries(Chat-Client PUBLIC
     QWindowKit::Quick
     XYChatCommon
 )
+
+# M6: Windows 下 KeyStorage 使用 DPAPI 保护本地密钥
+if (WIN32)
+    target_link_libraries(Chat-Client PRIVATE crypt32)
+endif()
 
 # 添加 Network/Quick 模块的头文件路径
 target_include_directories(Chat-Client SYSTEM PUBLIC

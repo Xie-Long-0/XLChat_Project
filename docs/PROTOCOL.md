@@ -1,10 +1,10 @@
 # XYChat 协议文档
 
-## 当前协议状态（M5.5 完成后）
+## 当前协议状态（M6 完成后）
 
-M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed（初始化失败拒绝启动/连接，开发明文模式需显式开关）、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。上述变更均有自动化测试覆盖。
+M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。上述变更均有自动化测试覆盖。
 
-仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级（续期已校验 token，但其他请求未逐包验 token）、消息正文对服务端可读（E2EE 属 M6 目标）。
+仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级（续期已校验 token，但其他请求未逐包验 token）、群聊/媒体尚未 E2EE（M7/M8 目标）、设备信任为 TOFU（无安全码比对）。
 
 ### 固定包头
 
@@ -59,6 +59,10 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `39` | `MessageStatusUpdate` | 消息状态更新（服务端推送，M5.5 起由回执聚合触发） |
 | `40` | `SyncEventsRequest` | 账号级增量同步请求（M5.5） |
 | `41` | `SyncEventsResponse` | 账号级增量同步响应（M5.5） |
+| `50` | `RegisterKeysRequest` | E2EE 密钥注册请求（M6：身份公钥 + 预密钥公钥） |
+| `51` | `RegisterKeysResponse` | E2EE 密钥注册响应（M6） |
+| `52` | `FetchKeysRequest` | E2EE 密钥包拉取请求（M6） |
+| `53` | `FetchKeysResponse` | E2EE 密钥包拉取响应（M6） |
 
 ### 注册请求
 
@@ -200,6 +204,8 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `3004` | `MessageNotFound` | 消息不存在 |
 | `3005` | `CannotSendToSelf` | 不能给自己发送消息 |
 | `3006` | `PermissionDenied` | 越权访问被拒绝：非会话成员、非本人会话等（M5.5） |
+| `3007` | `KeyBundleUnavailable` | 对方无可用设备或预密钥耗尽，无法建立加密会话（M6） |
+| `3008` | `E2eeInvalidEnvelope` | 消息密文 envelope 非法：格式错误、预密钥无效或重复设备条目（M6） |
 | `9001` | `Timeout` | 连接空闲超时 |
 | `9002` | `InternalError` | 服务端内部错误 |
 
@@ -229,7 +235,10 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - 当前协议兼容策略只支持版本 `1`，后续版本升级需要扩展协商或降级策略。
 - Session token 通过连接级认证状态维护；仅 `TokenRenewRequest` 逐包校验 token（M5.5），其他命令尚未逐包验证。
 - nonce 去重缓存为单服务器内存 TTL 缓存（跨连接共享），服务端重启后清空；多服务器部署时需改为持久化存储。
-- 消息正文对服务端可读，E2EE 属 M6 目标。
+- E2EE 仅覆盖一对一文本消息（M6）；群聊、媒体消息仍为服务端可见明文（M7/M8 目标）。
+- 设备信任为 TOFU，无安全码/二维码带外验证；密钥备份与设备间迁移未实现（更换设备/清除应用数据后无法解密历史消息，但同一设备登出重登不受影响）。
+- 预密钥超时回收阈值为 10 分钟；发送方在认领后 10 分钟内仍可正常消费。
+- 客户端解密缓存以明文形式经 DPAPI 加密后存于本地（等价于本地消息存储）；本地持久化 outbox 仍未实现（发送方在对方注册密钥前退出应用会丢失未送达消息）。
 - 会话删除/消息撤回尚未实现，`sync_events` 暂无对应事件类型。
 
 ## M5 新增：传输层加密
@@ -273,11 +282,11 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 
 - `TestPacketCodec::parsesManyConsecutiveSmallPackets` 覆盖连续 1000 个小包解析。
 - `TestPacketCodec::waitsForSplitLargePacket` 覆盖单个大包拆成多次到达后的解析。
-- `TestEncryptionManager` 覆盖 PBKDF2 哈希、验证、token 生成。
-- `TestDatabaseManager` 覆盖迁移（V1-V4）、用户注册、session 管理（含按 ID 查询 token 哈希）、登录审计、设备管理、联系人、会话、消息；M5.5 新增：会话成员/消息访问授权、`clientMessageId` 幂等去重、回执聚合、读游标单调前进、`sync_events` 游标。
+- `TestEncryptionManager` 覆盖 PBKDF2 哈希、验证、token 生成；M6 新增：X25519 密钥对生成/重建、ECDH 双向一致性、HKDF 确定性、AES-GCM 加解密往返、篡改密文/IV/错误密钥必须失败、公钥指纹、envelope 编解码往返与非法输入拒绝、完整发送方/接收方密钥协商流程。
+- `TestDatabaseManager` 覆盖迁移（V1-V5）、用户注册、session 管理（含按 ID 查询 token 哈希）、登录审计、设备管理、联系人、会话、消息；M5.5 新增：会话成员/消息访问授权、`clientMessageId` 幂等去重、回执聚合、读游标单调前进、`sync_events` 游标；M6 新增：身份密钥 upsert、预密钥上传/计数、每设备一次性认领与耗尽、claimed 校验与消费、删除设备清除密钥材料、身份变更废弃旧预密钥。
 - `TestSecurity` 覆盖日志脱敏、安全内存清零、TLS 证书生成与加载；M5.5 新增：nonce 首次接受/重复拒绝/空值拒绝/TTL 过期。
 - 客户端登录响应按 `requestId` 匹配，不处理不属于当前登录请求的响应。
-- 尚缺：真实 TLS 客户端-服务端集成测试、并发路由与端到端消息测试（服务端授权逻辑已有数据库层测试覆盖）。
+- 尚缺：真实 TLS 客户端-服务端集成测试、端到端双客户端 E2EE 消息集成测试（加密原语与数据库密钥管理已有单元层覆盖）。
 
 ### M3 新增接口
 
@@ -320,13 +329,15 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 #### 发送消息
 
 ```json
-// 请求（M5.5 起 clientMessageId 必填）
-{ "type": "send_message", "toUserId": 2, "content": "Hello!", "contentType": "text", "clientMessageId": "<uuid>" }
+// 请求（M5.5 起 clientMessageId 必填；M6 起 content 必须为 E2EE envelope 密文）
+{ "type": "send_message", "toUserId": 2, "content": "{\"v\":1,\"devices\":[...]}", "contentType": "text", "clientMessageId": "<uuid>" }
 // 响应 data
 { "messageId": 1, "conversationId": 1, "clientMessageId": "<uuid>", "status": "sent" }
 ```
 
-`clientMessageId` 为客户端生成的 UUID 幂等键（参考 Telegram `random_id`/WhatsApp 客户端消息 ID）：服务端以 `(sender_id, sender_device_id, client_message_id)` 唯一约束去重，重试/重连重发返回已存储的同一条消息；客户端维护 outbox，登录成功后自动重发未确认消息。
+`clientMessageId` 为客户端生成的 UUID 幂等键（参考 Telegram `random_id`/WhatsApp 客户端消息 ID）：服务端以 `(sender_id, sender_device_id, client_message_id)` 唯一约束去重，重试/重连重发返回已存储的同一条消息（幂等重试优先于 envelope 校验，因为重试时引用的预密钥可能已被首次发送消费）；客户端维护 outbox，登录成功后自动重发未确认消息。
+
+M6 fail-closed 校验：`content` 必须解析为合法的 v1 envelope（见“M6 新增：端到端加密”）；每个接收方设备条目引用的 `prekeyId` 必须属于接收方且处于 `claimed` 状态，接收方条目无重复设备；允许额外携带一个发送方自身设备的拷贝条目（`deviceId` 为发送方设备 + `prekeyId=0`，仅身份密钥加密，不消费预密钥）；至少需要一个接收方条目，否则返回 `E2eeInvalidEnvelope (3008)`。消息入库与预密钥消费（`claimed -> used`）在同一事务内完成，保证一次性投递；服务端全程只见密文。
 
 #### 新消息通知（服务端推送）
 
@@ -370,8 +381,82 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```
 
 - 事件流按账号维度严格递增（`seq`），客户端保存 `lastSeq` 游标做增量拉取（参考 Telegram 差分同步模型）。
-- 当前事件类型：`message`（新消息）、`contact_added`（联系人变更）、`receipt`（送达/已读回执）。
+- 当前事件类型：`message`（新消息，M6 起 payload.content 为 envelope 密文）、`contact_added`（联系人变更）、`receipt`（送达/已读回执）。
 - 实时推送（`NewMessageNotification`/`MessageStatusUpdate`）仅作为通知，离线或丢推送时由 `sync_events` 兜底补齐。
+
+### M6 新增：端到端加密
+
+#### 密码学方案（简化 Signal）
+
+| 环节 | 算法 |
+| --- | --- |
+| 身份/预密钥/临时密钥 | X25519（32 字节原始格式，传输/存储用 Base64） |
+| 密钥协商 | `shared = ECDH(eph_priv, peer_prekey_pub) ‖ ECDH(eph_priv, peer_identity_pub)` |
+| 密钥派生 | HKDF-SHA256(shared, salt="xychat-e2ee-v1") → 32 字节消息密钥 |
+| 消息加密 | AES-256-GCM，随机 12 字节 IV，16 字节认证标签附在密文末尾 |
+| 设备信任 | TOFU：首次记录对方身份公钥 SHA-256 指纹（前 16 字节 hex），变更时告警不阻塞 |
+
+每条消息都使用全新的临时密钥对（前向安全）；一次性预密钥被服务端认领即消费，解密成功后客户端删除对应预密钥私钥。
+
+#### 密钥注册（register_keys）
+
+需要已认证 session；`deviceId` 取自 session，不信任请求参数（只能注册自己的密钥）。
+
+```json
+// 请求（prekeys 可选；单批 ≤100 个，每设备未认领总量上限 500）
+{ "type": "register_keys", "identityPub": "<base64-32B>", "prekeys": ["<base64-32B>", ...] }
+// 响应 data
+{ "deviceId": "<device-id>", "uploadedPrekeys": 20, "remainingPrekeys": 20 }
+```
+
+- 身份公钥变更（重装/密钥丢失后重新生成）时，服务端自动废弃该设备旧世代的全部 `unused`/`claimed` 预密钥，避免发送方认领到接收方无法解密的旧预密钥。
+- 客户端登录成功后自动引导：加载/生成身份密钥 → 注册 → 预密钥余量（本地或服务端报告）低于 5 时补齐到 20。
+
+#### 密钥包拉取（fetch_keys）
+
+```json
+// 请求
+{ "type": "fetch_keys", "userId": 2 }
+// 响应 data（每设备一个 bundle：身份公钥 + 一个认领的预密钥）
+{ "userId": 2, "bundles": [{ "deviceId": "...", "identityPub": "<b64>", "prekeyId": 7, "prekeyPub": "<b64>" }] }
+```
+
+- 服务端在事务内为目标用户每个有库存的设备原子认领（`unused -> claimed`）一个预密钥；认领后 10 分钟未被消费自动回退为 `unused`（防泄漏）。
+- 目标无设备返回 `AccountNotFound`；无可用预密钥返回 `KeyBundleUnavailable (3007)`。
+- 连接级频率限制（60 秒内 ≤20 次），超限返回 `LoginRateLimited`，防止恶意耗尽他人预密钥池。
+- 认领的密钥包仅供一条消息使用：消息入库时预密钥转为 `used`；发送方放弃时由超时回收兜底。
+
+#### 消息 envelope 格式
+
+`send_message` 的 `content` 为以下 JSON 的紧凑序列化（多设备时 `devices` 逐设备一个条目）：
+
+```json
+{
+  "v": 1,
+  "devices": [
+    {
+      "deviceId": "<receiver-device-id>",
+      "prekeyId": 7,
+      "eph": "<base64 发送方临时 X25519 公钥>",
+      "iv": "<base64 12B GCM IV>",
+      "ct": "<base64 密文 + 16B GCM 标签>"
+    },
+    {
+      "deviceId": "<sender-device-id>",
+      "prekeyId": 0,
+      "eph": "<base64 另一个临时公钥>",
+      "iv": "<base64 12B GCM IV>",
+      "ct": "<base64 密文 + 16B GCM 标签>"
+    }
+  ]
+}
+```
+
+- 接收方条目（`prekeyId > 0`）：接收方按 `deviceId` 找到自己的条目，逐个本地预密钥尝试解密（GCM 认证标签验证正确性）；成功即删除该预密钥私钥。
+- 发送方自身拷贝（`prekeyId = 0`，2026-08-20 修复新增）：仅用发送方本人身份密钥加密（`shared = ECDH(eph, identity) ‖ ECDH(eph, identity)`），不消费预密钥；使发送方重新登录或多端同步后仍能解密自己发出的消息。服务端对该条目不校验预密钥，仅要求属于发送方当前设备且最多一条。
+- 无本机条目或缺少对应预密钥私钥（新设备/历史消息）时显示“无法解密此消息”占位；**历史消息不可恢复**仅限真正丢失密钥材料的场景；已解密过的消息由客户端持久化解密缓存（DPAPI 保护）兜底，登出重登后仍可显示。
+- M6 前的存量明文消息保持原样展示；会话列表预览对 envelope 显示 `[Encrypted message]`。
+- 对方尚未注册密钥（从未登录）时，`fetch_keys` 返回 `AccountNotFound`/`KeyBundleUnavailable`；客户端保留消息在 outbox 并每 30 秒重试，对方首次登录注册密钥后自动送达（不会丢弃）。
 
 ### 消息状态
 
@@ -398,5 +483,8 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 | `force_logout` → `terminate_session`（仅本人会话） | ✅ 已实施 | Telegram sessions.killSession |
 | 续期接口真正校验 token | ✅ 已实施 | OAuth2 access token 验证 |
 | 全部命令逐包携带并验证 access token / TLS channel 绑定 | ⬜ 未实施（后续） | MTProto auth_key 绑定 |
+| 一对一 E2EE：X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 | ✅ 已实施（M6） | Signal PreKey 消息模式（简化） |
+| envelope fail-closed：服务端只存/只转密文 | ✅ 已实施（M6） | Signal 服务端不可见明文 |
+| 预密钥认领超时回收 + 身份变更废弃旧世代 + fetch_keys 限流 | ✅ 已实施（M6，代码审查后修复） | Signal 预密钥生命周期管理 |
 
 后续协议方向：消息撤回/编辑/删除事件纳入 `sync_events`；群聊与 fan-out 策略（M7）；媒体分片上传走独立通道（M8）。

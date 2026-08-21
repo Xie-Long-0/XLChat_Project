@@ -1,8 +1,8 @@
 # XYChat 架构概览
 
-> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新。
+> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新。
 
-## 当前组件（M5.5 完成后）
+## 当前组件（M6 完成后）
 
 ```text
 Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
@@ -12,11 +12,11 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
-- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
-- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息请求，管理 session 路由与在线状态，访问 SQLite。
+- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
+- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换请求（M6 新增 register_keys/fetch_keys），管理 session 路由与在线状态，访问 SQLite。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；
-  - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）；
+  - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）；
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）。
 - `docs`：路线图、协议、安全和架构说明。
 - `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager、Security）。
@@ -66,15 +66,25 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
 - **限制**：客户端仍无本地持久化缓存（outbox 仅在内存），重启后历史依赖重新拉取；消息撤回/删除未实现。
 
+### 端到端加密（M6）
+
+- 简化 Signal 方案：X25519 身份密钥（每设备长期）+ 一次性预密钥（客户端批量上传公钥，私钥留本地）+ 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM。
+- 发送链路：`sendMessage` → outbox → `fetch_keys`（服务端事务内逐设备认领预密钥）→ 逐设备加密为 envelope（另附发送方自身拷贝条目，仅身份密钥加密）→ `send_message`（服务端 fail-closed 校验后入库并同事务消费预密钥）；对方尚未注册密钥时保留 outbox 并每 30 秒重试，不丢弃。
+- 接收链路：`NewMessageNotification` / `sync_messages` / `sync_events` 统一解密；按 `deviceId` 定位本机条目（自身拷贝用身份密钥解密，接收方条目逐本地预密钥试解密，GCM 标签验证），成功后删除该预密钥私钥；解密结果持久化缓存（DPAPI），重复投递/重新登录同步时由缓存兜底。
+- 预密钥生命周期：认领后 10 分钟未消费自动回退；身份公钥变更时旧世代全部废弃；`fetch_keys` 连接级限流（60s/20 次）。
+- 私钥存储：`KeyStorage`（AppData/e2ee，Windows DPAPI 保护，临时文件+替换原子写入）；TOFU 指纹存于 `e2ee/trust.json`，变更时 `peerIdentityChanged` 告警；解密缓存存于 `e2ee/<account>_<device>.cache`。
+- 产品取舍：历史消息不可恢复仅限真正丢失密钥材料的场景（更换设备/清数据）；同一设备登出重登由自身拷贝 + 解密缓存兜底；M6 前存量明文保持可读。
+- **限制**：仅一对一文本消息；TOFU 无带外验证；无密钥备份/设备间迁移；本地持久化 outbox 未实现。
+
 ### 传输层安全（M5 + M5.5 fail-closed）
 
 - 服务端 `QSslSocket` + TLS 1.2+，开发环境自签 CA（`certs/` 脚本生成）；初始化失败拒绝启动（`--allow-plaintext` 显式开发开关）。
 - 客户端校验服务端证书，证书错误时断开；CA 缺失拒绝连接（`XYCHAT_ALLOW_PLAINTEXT=1` 显式开发开关）。
 - 业务请求强制携带 timestamp/nonce（缺失/格式错误/超时/重复一律拒绝），nonce 由服务端全局 TTL 缓存（`NonceCache`）跨连接去重。
 - 日志脱敏；敏感内存清零。
-- **限制**：nonce 缓存为单服务器内存（重启清空）；消息正文对服务端可读（E2EE 属 M6）。
+- **限制**：nonce 缓存为单服务器内存（重启清空）；群聊/媒体消息尚未 E2EE（M7/M8）。
 
-## 数据库 Schema（V4，M5.5 迁移）
+## 数据库 Schema（V6，M6 迁移）
 
 - `schema_version`：数据库迁移版本控制
 - `users`：用户基础信息（username, email, phone, password_hash）
@@ -84,9 +94,11 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - `contacts`：联系人关系（双向记录）
 - `conversations`：会话信息（type, updated_at）
 - `conversation_members`：会话成员（conversation_id, user_id, last_read_message_id，读游标只前进）
-- `messages`：消息主体（conversation_id, sender_id, content, status, created_at, client_message_id, sender_device_id）——消息正文为服务端可读明文，E2EE 属 M6 目标
+- `messages`：消息主体（conversation_id, sender_id, content, status, created_at, client_message_id, sender_device_id）——M6 起新消息正文为 E2EE envelope 密文，存量旧消息为明文
 - `message_receipts`（V4 新增）：送达/已读回执（message_id, user_id, device_id, delivered_at, read_at，UNIQUE(message_id, user_id, device_id)）
 - `sync_events`（V4 新增）：账号级同步事件流（seq 自增, user_id, event_type, payload），索引 (user_id, seq)
+- `device_identity_keys`（V5 新增）：设备身份公钥（user_id, device_id, identity_pub, UNIQUE(user_id, device_id)）——仅存公钥
+- `prekeys`（V5 新增）：一次性预密钥公钥（user_id, device_id, pub, status: unused/claimed/used, claimed_at）——仅存公钥，认领超时回退靠 `claimed_at`（V6 迁移兼容补齐该列）
 
 messages 表幂等唯一约束：`UNIQUE(sender_id, sender_device_id, client_message_id)`（部分索引，仅对非空幂等键生效，存量旧数据不受影响）。
 
@@ -100,7 +112,8 @@ Chat-Client
   │     ├── components/（TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton）
   │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册）
   ├── C++ 后端层
-  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪）
+  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密）
+  │     ├── core/KeyStorage（M6：身份/预密钥私钥持久化，Windows DPAPI 保护；TOFU 指纹存储）
   │     ├── core/ThemeSettings（QSettings 主题持久化，注册为 QML 上下文对象）
   │     └── models/User
   └── QWindowKit（QWK::Quick WindowAgent：无边框、拖拽、Snap Layout；标题栏自定义按钮需 setHitTestVisible 注册）
@@ -135,6 +148,31 @@ Chat-Client
 
 剩余已知问题（非阻塞）：nonce 去重为单服务器内存缓存（多服务器部署需持久化）；客户端无本地持久化缓存；服务端每连接一线程模型在高连接数下成本高；除续期外的命令未逐包验 token。
 
+## M6 代码审查修复记录（2026-08-17）
+
+M6 首次实现后经代码审查发现并修复：
+
+| 级别 | 问题 | 修复方式 |
+| --- | --- | --- |
+| P0 | claimed 预密钥无释放机制 + fetch_keys 无限流，可被耗尽且不自愈 | 预密钥表新增 `claimed_at`，认领 10 分钟未消费自动回退 unused；fetch_keys 连接级频率限制（60s/20 次）；消息入库与预密钥消费同事务 |
+| P0 | 身份密钥轮换后旧预密钥仍可被认领，导致消息静默丢失 | `upsertIdentityKey` 检测公钥变更时废弃该设备全部 unused/claimed 预密钥（附回归测试） |
+| P1 | claimPrekeys 并发竞争整体回滚 + 客户端瞬时失败即永久删除待发项 | 单设备竞争失败改为跳过；SQLite busy timeout 5 秒；客户端仅对确定性错误（3007/3005/2003）删除 outbox，瞬时错误延迟重试 |
+| P1 | 预密钥补齐仅看本地计数；身份密钥损坏时发送永久阻塞 | 补齐同时参考服务端 `remainingPrekeys`；损坏的身份密钥自动重新生成并丢弃旧预密钥 |
+| P2 | KeyStorage 非原子写入；DPAPI 解密中间明文未清零 | 临时文件+替换写入；中间 blob 使用后经 SecureMemory 清零 |
+
+## M6 运行期缺陷修复记录（2026-08-20）
+
+双客户端同机联调发现并修复：
+
+| 问题 | 根因 | 修复方式 |
+| --- | --- | --- |
+| 对方未上线时发送的加密消息永久丢失 | `fetch_keys` 返回 AccountNotFound/KeyBundleUnavailable 时客户端将消息从 outbox 删除，而对方尚未注册密钥属可恢复状态 | 保留 outbox，按目标用户 30 秒退避重试，对方首次登录注册密钥后自动送达；仅 CannotSendToSelf 才删除 |
+| 登出重登后自己发出的消息无法解密 | envelope 只含对方设备条目，发送方本机无密文拷贝 | 发送时追加自身拷贝条目（`prekeyId=0`，仅身份密钥加密，不消费预密钥）；服务端校验放行发送方设备的该类条目（同机 deviceId 相同时与接收方条目分开去重） |
+| 登出重登后对方发来的消息无法解密 | 一次性预密钥解密后即删除，内存解密缓存随登出清空 | 解密缓存按账号+设备持久化（DPAPI 保护，`e2ee/<account>_<device>.cache`），登录后加载；预密钥删除后重新同步由缓存兜底 |
+| 中间版本数据库兼容 | 早期构建创建的 prekeys 表可能缺 `claimed_at` 列 | 新增 V6 迁移补齐该列 |
+
+回归测试：新增 `selfCopyEnvelopeRoundTrip`（prekeyId=0 条目编解码与仅身份密钥加解密往返）；4 组测试套件全部通过。
+
 ## 架构调整依据
 
 修复方向参考主流 IM 的公开技术方案：
@@ -149,5 +187,5 @@ Chat-Client
 
 1. **M5.5 已完成**：上表 P0 全部修复、P1 大部分修复，并通过自动化测试（授权拒绝、nonce 拒绝/过期、幂等去重、回执聚合、读游标单调等）。
 2. **M4.5 已完成**：亮/暗主题切换、CMake Widgets 残留清理、搜索发起对话、乐观发送与状态流转、已读回执、会话列表/聊天对话框交互完善，并经 E2E 验证。
-3. **M6**：端到端加密一对一聊天（设备身份密钥、预密钥、消息 MAC）。
-4. **M7+**：群聊、媒体、客户端本地持久化缓存与持久化 outbox、搜索与通知。
+3. **M6 已完成**：端到端加密一对一聊天（X25519 身份密钥/预密钥、每消息临时密钥、AES-GCM 认证加密、envelope fail-closed、TOFU、历史消息不可恢复），含审查后修复（见上表）。
+4. **M7+**：群聊（含发送者密钥方案 E2EE）、媒体、客户端本地持久化缓存与持久化 outbox、搜索与通知、设备信任带外验证与密钥备份策略。

@@ -73,6 +73,9 @@ private:
     void processSyncMessagesRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
     // M5.5: 账号级增量同步
     void processSyncEventsRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    // M6: 端到端加密密钥注册与拉取
+    void processRegisterKeysRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processFetchKeysRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
 
     // M5.5: 重放保护（timestamp/nonce 强制必填）
     bool checkReplayProtection(const QJsonObject &request);
@@ -109,6 +112,10 @@ private:
     qint64 m_currentSessionId = 0;
     QString m_currentDeviceId;
 
+    // M6: fetch_keys 频率限制（连接级滑动窗口）
+    qint64 m_fetchKeysWindowStart = 0;
+    int m_fetchKeysCount = 0;
+
     // 数据库（每个线程使用独立连接名）
     DatabaseManager *m_db = nullptr;
 
@@ -117,4 +124,11 @@ private:
     static constexpr int MaxFailedLoginsPerUser = 5;
     static constexpr int RateLimitWindowSeconds = 300; // 5 分钟
     static constexpr int ReplayTimestampToleranceSecs = 300; // 5 分钟时间戳容差
+
+    // M6: 预密钥上传限制
+    static constexpr int MaxPrekeysPerBatch = 100;   // 单批上传上限
+    static constexpr int MaxPrekeysPerDevice = 500;  // 每设备未认领预密钥总量上限
+    // M6 审查修复：fetch_keys 频率限制，防止恶意耗尽他人预密钥池
+    static constexpr int MaxFetchKeysPerWindow = 20;  // 窗口内拉取上限
+    static constexpr int FetchKeysWindowSeconds = 60; // 滑动窗口长度
 };

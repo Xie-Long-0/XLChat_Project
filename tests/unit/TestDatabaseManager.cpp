@@ -1,4 +1,5 @@
 #include <QtTest/QtTest>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 
@@ -51,6 +52,15 @@ private slots:
     void receiptsAggregatePerRecipient();
     void readCursorOnlyMovesForward();
     void syncEventsCursorWorks();
+
+    // M6 端到端加密密钥管理测试
+    void v5TablesExist();
+    void identityKeyUpsertAndRetrieve();
+    void prekeyUploadAndCount();
+    void prekeyClaimIsOncePerDevice();
+    void claimedPrekeyValidationAndConsumption();
+    void removeDeviceClearsKeyMaterial();
+    void identityKeyChangePurgesStalePrekeys();
 
 private:
     DatabaseManager *m_db = nullptr;
@@ -541,6 +551,166 @@ void TestDatabaseManager::markMessagesAsRead()
     // 已读数应为 0
     const int unread = m_db->getUnreadCount(convId, user1->id);
     QCOMPARE(unread, 0);
+}
+
+// ── M6: 端到端加密密钥管理 ──
+void TestDatabaseManager::v5TablesExist()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    QVERIFY(q.exec("SELECT name FROM sqlite_master WHERE type='table'"));
+    QStringList tables;
+    while (q.next()) {
+        tables << q.value(0).toString();
+    }
+    QVERIFY(tables.contains("device_identity_keys"));
+    QVERIFY(tables.contains("prekeys"));
+}
+
+void TestDatabaseManager::identityKeyUpsertAndRetrieve()
+{
+    const qint64 userId = m_db->registerUser("e2eeuser", "", "", "hash-e2ee");
+    QVERIFY(userId > 0);
+
+    QVERIFY(m_db->upsertIdentityKey(userId, "dev-a", "pubA"));
+    auto keys = m_db->getIdentityKeysByUser(userId);
+    QCOMPARE(keys.size(), 1);
+    QCOMPARE(keys[0].deviceId, QStringLiteral("dev-a"));
+    QCOMPARE(keys[0].identityPub, QStringLiteral("pubA"));
+
+    // UPSERT：同设备更新公钥不新增记录
+    QVERIFY(m_db->upsertIdentityKey(userId, "dev-a", "pubA2"));
+    keys = m_db->getIdentityKeysByUser(userId);
+    QCOMPARE(keys.size(), 1);
+    QCOMPARE(keys[0].identityPub, QStringLiteral("pubA2"));
+
+    // 空参数被拒绝
+    QVERIFY(!m_db->upsertIdentityKey(userId, "", "pub"));
+    QVERIFY(!m_db->upsertIdentityKey(userId, "dev-a", ""));
+}
+
+void TestDatabaseManager::prekeyUploadAndCount()
+{
+    auto user = m_db->getUserByUsername("e2eeuser");
+    QVERIFY(user.has_value());
+
+    QCOMPARE(m_db->prekeyCount(user->id, "dev-a"), 0);
+    QCOMPARE(m_db->uploadPrekeys(user->id, "dev-a", {"pk1", "pk2", "pk3"}), 3);
+    QCOMPARE(m_db->prekeyCount(user->id, "dev-a"), 3);
+
+    // 非法参数
+    QCOMPARE(m_db->uploadPrekeys(user->id, "", {"pk"}), -1);
+    QCOMPARE(m_db->uploadPrekeys(user->id, "dev-a", {}), -1);
+}
+
+void TestDatabaseManager::prekeyClaimIsOncePerDevice()
+{
+    auto user = m_db->getUserByUsername("e2eeuser");
+    QVERIFY(user.has_value());
+
+    // 每设备认领一个：再加一台设备验证多设备各认领一个
+    m_db->uploadPrekeys(user->id, "dev-b", {"pk-b1"});
+
+    auto claimed = m_db->claimPrekeys(user->id);
+    QCOMPARE(claimed.size(), 2);
+    QSet<QString> claimedDevices;
+    qint64 firstDevAPrekeyId = 0;
+    for (const auto &c : claimed) {
+        claimedDevices.insert(c.deviceId);
+        QVERIFY(!c.prekeyPub.isEmpty());
+        QVERIFY(c.prekeyId > 0);
+        if (c.deviceId == "dev-a") firstDevAPrekeyId = c.prekeyId;
+    }
+    QVERIFY(claimedDevices.contains("dev-a"));
+    QVERIFY(claimedDevices.contains("dev-b"));
+    QVERIFY(firstDevAPrekeyId > 0);
+
+    // 认领后余量递减（dev-a 3-1=2，dev-b 1-1=0）
+    QCOMPARE(m_db->prekeyCount(user->id, "dev-a"), 2);
+    QCOMPARE(m_db->prekeyCount(user->id, "dev-b"), 0);
+
+    // 再次认领：dev-b 无库存，只剩 dev-a，且不会重复认领同一预密钥
+    auto claimed2 = m_db->claimPrekeys(user->id);
+    QCOMPARE(claimed2.size(), 1);
+    QCOMPARE(claimed2[0].deviceId, QStringLiteral("dev-a"));
+    QVERIFY(claimed2[0].prekeyId != firstDevAPrekeyId);
+
+    // 同一预密钥不会被两次认领：继续认领直到耗尽
+    auto claimed3 = m_db->claimPrekeys(user->id);
+    QCOMPARE(claimed3.size(), 1);
+    auto claimed4 = m_db->claimPrekeys(user->id);
+    QVERIFY(claimed4.isEmpty());
+}
+
+void TestDatabaseManager::claimedPrekeyValidationAndConsumption()
+{
+    auto user = m_db->getUserByUsername("e2eeuser");
+    QVERIFY(user.has_value());
+
+    m_db->uploadPrekeys(user->id, "dev-a", {"pk-v1"});
+    auto claimed = m_db->claimPrekeys(user->id);
+    QVERIFY(!claimed.isEmpty());
+    const ClaimedPrekey c = claimed.last();
+
+    // claimed 状态可校验通过
+    QVERIFY(m_db->validateClaimedPrekey(user->id, c.deviceId, c.prekeyId));
+    // 错误的设备/用户/ID 被拒绝
+    QVERIFY(!m_db->validateClaimedPrekey(user->id, "dev-x", c.prekeyId));
+    QVERIFY(!m_db->validateClaimedPrekey(user->id + 999, c.deviceId, c.prekeyId));
+    QVERIFY(!m_db->validateClaimedPrekey(user->id, c.deviceId, c.prekeyId + 999));
+
+    // 消费后（used）不再可校验
+    QCOMPARE(m_db->consumePrekeys({c.prekeyId}), 1);
+    QVERIFY(!m_db->validateClaimedPrekey(user->id, c.deviceId, c.prekeyId));
+    // 重复消费返回 0
+    QCOMPARE(m_db->consumePrekeys({c.prekeyId}), 0);
+}
+
+void TestDatabaseManager::removeDeviceClearsKeyMaterial()
+{
+    auto user = m_db->getUserByUsername("e2eeuser");
+    QVERIFY(user.has_value());
+
+    m_db->registerDevice(user->id, "dev-c", "Phone", "android");
+    m_db->upsertIdentityKey(user->id, "dev-c", "pubC");
+    m_db->uploadPrekeys(user->id, "dev-c", {"pk-c1", "pk-c2"});
+    QCOMPARE(m_db->prekeyCount(user->id, "dev-c"), 2);
+
+    // 删除设备后密钥材料全部清除，无法再认领
+    QVERIFY(m_db->removeDevice(user->id, "dev-c"));
+    QCOMPARE(m_db->prekeyCount(user->id, "dev-c"), 0);
+    bool found = false;
+    for (const auto &k : m_db->getIdentityKeysByUser(user->id)) {
+        if (k.deviceId == "dev-c") found = true;
+    }
+    QVERIFY(!found);
+    QVERIFY(m_db->claimPrekeys(user->id).isEmpty());
+    QVERIFY(m_db->removeDeviceKeys(user->id, "dev-c")); // 幂等删除
+}
+
+void TestDatabaseManager::identityKeyChangePurgesStalePrekeys()
+{
+    // 审查修复回归：身份公钥变更时，旧世代未消费预密钥必须废弃，
+    // 否则发送方会认领到接收方无法解密的旧预密钥导致消息静默丢失
+    const qint64 userId = m_db->registerUser("e2eerotate", "", "", "hash-rotate");
+    QVERIFY(userId > 0);
+
+    QVERIFY(m_db->upsertIdentityKey(userId, "dev-r", "gen1-pub"));
+    QCOMPARE(m_db->uploadPrekeys(userId, "dev-r", {"gen1-pk1", "gen1-pk2"}), 2);
+    QCOMPARE(m_db->prekeyCount(userId, "dev-r"), 2);
+
+    // 相同公钥重复注册不清除预密钥
+    QVERIFY(m_db->upsertIdentityKey(userId, "dev-r", "gen1-pub"));
+    QCOMPARE(m_db->prekeyCount(userId, "dev-r"), 2);
+
+    // 身份变更后旧预密钥全部废弃
+    QVERIFY(m_db->upsertIdentityKey(userId, "dev-r", "gen2-pub"));
+    QCOMPARE(m_db->prekeyCount(userId, "dev-r"), 0);
+    QVERIFY(m_db->claimPrekeys(userId).isEmpty());
+
+    // 新世代预密钥正常工作
+    QCOMPARE(m_db->uploadPrekeys(userId, "dev-r", {"gen2-pk1"}), 1);
+    QCOMPARE(m_db->claimPrekeys(userId).size(), 1);
 }
 
 QTEST_MAIN(TestDatabaseManager)

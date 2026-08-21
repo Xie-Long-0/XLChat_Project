@@ -13,6 +13,8 @@ Item {
     property string content: ""
     property string time: ""
     property string status: ""
+    // M6: 端到端加密消息无法解密（无对应预密钥/新设备无历史密钥）
+    property bool undecryptable: false
 
     // 气泡内容区可用宽度上限
     readonly property int maxContentWidth: Theme.messageMaxWidth - Theme.spacingMedium * 2
@@ -59,10 +61,11 @@ Item {
                 Label {
                     id: contentLabel
                     width: Math.min(implicitWidth, messageBubble.maxContentWidth)
-                    text: content
+                    text: undecryptable ? "⚠ 无法解密此消息" : content
                     wrapMode: Text.Wrap
                     font.pixelSize: Theme.fontSizeMedium
-                    color: Theme.textPrimary
+                    font.italic: undecryptable
+                    color: undecryptable ? Theme.textTertiary : Theme.textPrimary
                     textFormat: Text.PlainText
                 }
 

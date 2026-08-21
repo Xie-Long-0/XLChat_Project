@@ -8,8 +8,11 @@
 #include <QJsonArray>
 #include <QVariant>
 #include <QHash>
+#include <QSet>
 
 #include "protocol/PacketCodec.h"
+#include "encryption/E2eeCrypto.h"
+#include "KeyStorage.h"
 
 class NetworkManager : public QObject
 {
@@ -84,6 +87,8 @@ signals:
     // M5.5
     void messageStatusChanged(qint64 messageId, const QString &status);
     void eventsSynced(const QJsonArray &events, qint64 lastSeq, bool hasMore);
+    // M6: 对方身份公钥指纹变化（TOFU 告警，不阻塞发送）
+    void peerIdentityChanged(qint64 peerUserId);
 
 private slots:
     void onConnected();
@@ -123,6 +128,19 @@ private:
     void addReplayProtection(QJsonObject &json);
     // M5.5: outbox 重发
     void flushOutbox();
+    // M6: E2EE 引导与密钥交换
+    void bootstrapE2ee();
+    void sendRegisterKeysRequest();
+    void sendFetchKeysRequest(qint64 toUserId);
+    void handleRegisterKeysResponse(const XYChat::Protocol::Packet &packet);
+    void handleFetchKeysResponse(const XYChat::Protocol::Packet &packet);
+    // M6: 对指定用户加密正文（拉取的密钥包逐设备加密），失败返回空
+    QString encryptForUser(qint64 toUserId, const QJsonArray &bundles, const QString &plaintext);
+    // M6: 解密接收到的消息正文；非 envelope（存量明文）原样返回；
+    // 解密失败返回空并置 undecryptable=true
+    QString decryptIncomingContent(const QString &content, bool *undecryptable);
+    // M6: 在接收 JSON 上就地解密 content 字段（含预览占位替换）
+    void decryptMessageObject(QJsonObject &msg);
 
 private:
     QSslSocket *m_sslSocket;
@@ -171,4 +189,18 @@ private:
     };
     QList<OutboxItem> m_outbox;
     QHash<quint64, QString> m_pendingSendByRequestId; // requestId -> clientMessageId
+
+    // M6: E2EE 状态
+    QString m_localDeviceId;                          // 登录时使用的 deviceId
+    XYChat::Security::E2eeCrypto::KeyPair m_identityKey; // 本机身份密钥对
+    QList<KeyStorage::PrekeyEntry> m_localPrekeys;    // 本地未消费的一次性预密钥
+    bool m_e2eeReady = false;                         // 身份密钥已注册到服务端
+    bool m_e2eeBootstrapPending = false;
+    quint64 m_pendingRegisterKeysRequestId = 0;
+    quint64 m_pendingFetchKeysRequestId = 0;
+    qint64 m_fetchKeysTargetUserId = 0;               // 在途 FetchKeys 的目标用户
+    QHash<qint64, qint64> m_fetchBackoffUntil;        // userId -> 重试等待截止时间（秒），避免对未注册密钥的目标空转拉取
+    int m_serverPrekeyRemaining = -1;                 // 服务端报告的未认领预密钥余量
+    QHash<qint64, QString> m_decryptCache;            // messageId -> 已解密正文（避免重复消费预密钥）
+    bool m_decryptCacheLoaded = false;                // 本次登录是否已从磁盘加载解密缓存
 };

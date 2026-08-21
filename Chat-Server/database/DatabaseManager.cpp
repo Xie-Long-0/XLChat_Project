@@ -42,6 +42,8 @@ bool DatabaseManager::openDatabase()
 
     QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE", m_connectionName);
     db.setDatabaseName(DatabasePath + "/chatapp.db");
+    // M6: 多 handler 线程并发写时避免 SQLITE_BUSY 立即失败
+    db.setConnectOptions("QSQLITE_BUSY_TIMEOUT=5000");
 
     if (!db.open()) {
         qCritical() << "[DB] Failed to open:" << db.lastError().text();
@@ -102,6 +104,12 @@ bool DatabaseManager::runMigrations()
     }
     if (currentVersion < 4) {
         if (!migrateToV4()) return false;
+    }
+    if (currentVersion < 5) {
+        if (!migrateToV5()) return false;
+    }
+    if (currentVersion < 6) {
+        if (!migrateToV6()) return false;
     }
 
     return true;
@@ -397,6 +405,95 @@ bool DatabaseManager::migrateToV4()
     return true;
 }
 
+// V5（M6）：端到端加密密钥表（设备身份公钥 + 一次性预密钥公钥）
+bool DatabaseManager::migrateToV5()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V5...";
+
+    // device_identity_keys 表：每设备一个 X25519 身份公钥（仅存公钥）
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS device_identity_keys ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  user_id INTEGER NOT NULL,"
+            "  device_id TEXT NOT NULL,"
+            "  identity_pub TEXT NOT NULL,"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,"
+            "  UNIQUE(user_id, device_id)"
+            ")")) {
+        qCritical() << "[DB] V5: Failed to create device_identity_keys table:" << q.lastError().text();
+        return false;
+    }
+
+    // prekeys 表：一次性预密钥公钥，状态 unused -> claimed -> used
+    // claimed_at 用于超时回收：认领后未被消费（发送方放弃/掉线）的
+    // 预密钥在 claimPrekeys 中回退为 unused，避免泄漏导致预密钥池枯竭
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS prekeys ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  user_id INTEGER NOT NULL,"
+            "  device_id TEXT NOT NULL,"
+            "  pub TEXT NOT NULL,"
+            "  status TEXT NOT NULL DEFAULT 'unused',"
+            "  claimed_at TEXT,"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE"
+            ")")) {
+        qCritical() << "[DB] V5: Failed to create prekeys table:" << q.lastError().text();
+        return false;
+    }
+    q.exec("CREATE INDEX IF NOT EXISTS idx_prekeys_lookup "
+           "ON prekeys(user_id, device_id, status)");
+    q.exec("CREATE INDEX IF NOT EXISTS idx_prekeys_claimed_at ON prekeys(claimed_at)");
+
+    // 记录版本
+    q.prepare("INSERT INTO schema_version (version) VALUES (5)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V5: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V5 complete";
+    return true;
+}
+
+// V6（M6 修复）：兼容中间版本构建创建的 prekeys 表，补齐 claimed_at 列
+bool DatabaseManager::migrateToV6()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V6...";
+
+    bool hasClaimedAt = false;
+    if (q.exec("PRAGMA table_info(prekeys)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "claimed_at") {
+                hasClaimedAt = true;
+                break;
+            }
+        }
+    }
+    if (!hasClaimedAt && !q.exec("ALTER TABLE prekeys ADD COLUMN claimed_at TEXT")) {
+        qCritical() << "[DB] V6: Failed to add prekeys.claimed_at:" << q.lastError().text();
+        return false;
+    }
+    q.exec("CREATE INDEX IF NOT EXISTS idx_prekeys_claimed_at ON prekeys(claimed_at)");
+
+    q.prepare("INSERT INTO schema_version (version) VALUES (6)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V6: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V6 complete";
+    return true;
+}
+
 // ── 用户管理 ─────────────────────────────────────────────────────────────────
 bool DatabaseManager::userExists(const QString &username)
 {
@@ -684,7 +781,11 @@ bool DatabaseManager::removeDevice(qint64 userId, const QString &deviceId)
     q.prepare("DELETE FROM devices WHERE user_id = ? AND device_id = ?");
     q.addBindValue(userId);
     q.addBindValue(deviceId);
-    return q.exec();
+    if (!q.exec()) {
+        return false;
+    }
+    // M6: 同步清除该设备密钥材料，删除后不能再收到新消息
+    return removeDeviceKeys(userId, deviceId);
 }
 
 // ── 用户搜索 ─────────────────────────────────────────────────────────────────
@@ -1292,4 +1393,292 @@ QList<SyncEventInfo> DatabaseManager::getSyncEvents(qint64 userId, qint64 afterS
         }
     }
     return result;
+}
+
+// ── M6: 端到端加密密钥管理 ───────────────────────────────────────────────
+bool DatabaseManager::upsertIdentityKey(qint64 userId, const QString &deviceId,
+                                        const QString &identityPub)
+{
+    if (deviceId.isEmpty() || identityPub.isEmpty()) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+
+    // M6 审查修复：身份公钥变更（重装/密钥丢失后重新生成）时，
+    // 旧身份世代下未消费的预密钥与新身份不匹配，必须废弃，
+    // 否则发送方会认领到无法解密的旧预密钥导致消息静默丢失
+    {
+        QSqlQuery checkQ(db);
+        checkQ.prepare(
+            "SELECT identity_pub FROM device_identity_keys "
+            "WHERE user_id = ? AND device_id = ?");
+        checkQ.addBindValue(userId);
+        checkQ.addBindValue(deviceId);
+        if (checkQ.exec() && checkQ.next()) {
+            const QString oldPub = checkQ.value(0).toString();
+            if (oldPub != identityPub) {
+                QSqlQuery purgeQ(db);
+                purgeQ.prepare(
+                    "DELETE FROM prekeys WHERE user_id = ? AND device_id = ? "
+                    "AND status IN ('unused', 'claimed')");
+                purgeQ.addBindValue(userId);
+                purgeQ.addBindValue(deviceId);
+                if (!purgeQ.exec()) {
+                    qWarning() << "[DB] upsertIdentityKey: failed to purge stale prekeys:"
+                               << purgeQ.lastError().text();
+                }
+            }
+        }
+    }
+
+    QSqlQuery q(db);
+    q.prepare(
+        "INSERT INTO device_identity_keys (user_id, device_id, identity_pub) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, device_id) DO UPDATE SET "
+        "  identity_pub = excluded.identity_pub,"
+        "  updated_at = datetime('now')");
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    q.addBindValue(identityPub);
+    if (!q.exec()) {
+        qWarning() << "[DB] upsertIdentityKey failed:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+QList<DeviceIdentityKey> DatabaseManager::getIdentityKeysByUser(qint64 userId)
+{
+    QList<DeviceIdentityKey> result;
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT device_id, identity_pub FROM device_identity_keys WHERE user_id = ?");
+    q.addBindValue(userId);
+    if (q.exec()) {
+        while (q.next()) {
+            DeviceIdentityKey key;
+            key.deviceId = q.value(0).toString();
+            key.identityPub = q.value(1).toString();
+            result.append(key);
+        }
+    }
+    return result;
+}
+
+int DatabaseManager::uploadPrekeys(qint64 userId, const QString &deviceId,
+                                   const QStringList &prekeyPubs)
+{
+    if (deviceId.isEmpty() || prekeyPubs.isEmpty()) {
+        return -1;
+    }
+
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    if (!db.transaction()) {
+        qWarning() << "[DB] uploadPrekeys: failed to begin transaction";
+        return -1;
+    }
+
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO prekeys (user_id, device_id, pub) VALUES (?, ?, ?)");
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    int inserted = 0;
+    bool ok = true;
+    for (const QString &pub : prekeyPubs) {
+        if (pub.isEmpty()) {
+            continue;
+        }
+        q.bindValue(2, pub);
+        if (!q.exec()) {
+            ok = false;
+            break;
+        }
+        ++inserted;
+    }
+
+    if (!ok || !db.commit()) {
+        db.rollback();
+        qWarning() << "[DB] uploadPrekeys failed:" << q.lastError().text();
+        return -1;
+    }
+    return inserted;
+}
+
+int DatabaseManager::prekeyCount(qint64 userId, const QString &deviceId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT COUNT(*) FROM prekeys "
+        "WHERE user_id = ? AND device_id = ? AND status = 'unused'");
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt();
+    }
+    return 0;
+}
+
+// 事务内为每个有库存的设备认领一个 unused 预密钥（select + 条件 update，
+// SQLite 写锁保证并发下同一预密钥只被认领一次）
+QList<ClaimedPrekey> DatabaseManager::claimPrekeys(qint64 userId)
+{
+    QList<ClaimedPrekey> result;
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    // BEGIN IMMEDIATE：立即获取写锁，避免事务中途升级锁失败
+    {
+        QSqlQuery beginQ(db);
+        if (!beginQ.exec("BEGIN IMMEDIATE")) {
+            qWarning() << "[DB] claimPrekeys: failed to begin immediate transaction:";
+            return result;
+        }
+    }
+
+    // 超时认领回收：认领后 10 分钟内未被消费的预密钥回退为 unused，
+    // 避免发送方放弃/掉线导致预密钥池永久泄漏
+    {
+        QSqlQuery reclaimQ(db);
+        if (!reclaimQ.exec(
+                "UPDATE prekeys SET status = 'unused', claimed_at = NULL "
+                "WHERE status = 'claimed' "
+                "AND claimed_at <= datetime('now', '-600 seconds')")) {
+            qWarning() << "[DB] claimPrekeys: failed to reclaim expired claims:"
+                       << reclaimQ.lastError().text();
+        }
+    }
+
+    // 有库存的设备列表
+    QStringList deviceIds;
+    {
+        QSqlQuery q(db);
+        q.prepare(
+            "SELECT DISTINCT device_id FROM prekeys "
+            "WHERE user_id = ? AND status = 'unused'");
+        q.addBindValue(userId);
+        if (q.exec()) {
+            while (q.next()) {
+                deviceIds.append(q.value(0).toString());
+            }
+        }
+    }
+
+    for (const QString &deviceId : deviceIds) {
+        // 选出最早上传的一个未认领预密钥；并发竞争失败时跳过该设备，
+        // 不影响其他设备的认领（瞬时失败不应拖垮整批）
+        qint64 prekeyId = 0;
+        QString pub;
+        {
+            QSqlQuery q(db);
+            q.prepare(
+                "SELECT id, pub FROM prekeys "
+                "WHERE user_id = ? AND device_id = ? AND status = 'unused' "
+                "ORDER BY id LIMIT 1");
+            q.addBindValue(userId);
+            q.addBindValue(deviceId);
+            if (!q.exec() || !q.next()) {
+                continue;
+            }
+            prekeyId = q.value(0).toLongLong();
+            pub = q.value(1).toString();
+        }
+
+        // 条件更新：仅当仍为 unused 时认领成功（记录认领时间供超时回收）
+        QSqlQuery updateQ(db);
+        updateQ.prepare(
+            "UPDATE prekeys SET status = 'claimed', claimed_at = datetime('now') "
+            "WHERE id = ? AND status = 'unused'");
+        updateQ.addBindValue(prekeyId);
+        if (!updateQ.exec() || updateQ.numRowsAffected() != 1) {
+            continue; // 被并发认领走，跳过该设备
+        }
+
+        ClaimedPrekey claimed;
+        claimed.deviceId = deviceId;
+        claimed.prekeyId = prekeyId;
+        claimed.prekeyPub = pub;
+        result.append(claimed);
+    }
+
+    if (!db.commit()) {
+        db.rollback();
+        qWarning() << "[DB] claimPrekeys failed, rolled back";
+        return {};
+    }
+    return result;
+}
+
+// 手动事务包装（供调用方把多个写操作绑定为原子单元）
+bool DatabaseManager::beginTransaction()
+{
+    return QSqlDatabase::database(m_connectionName).transaction();
+}
+
+bool DatabaseManager::commitTransaction()
+{
+    return QSqlDatabase::database(m_connectionName).commit();
+}
+
+bool DatabaseManager::rollbackTransaction()
+{
+    return QSqlDatabase::database(m_connectionName).rollback();
+}
+
+bool DatabaseManager::validateClaimedPrekey(qint64 userId, const QString &deviceId,
+                                            qint64 prekeyId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT COUNT(*) FROM prekeys "
+        "WHERE id = ? AND user_id = ? AND device_id = ? AND status = 'claimed'");
+    q.addBindValue(prekeyId);
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    if (q.exec() && q.next()) {
+        return q.value(0).toInt() > 0;
+    }
+    return false;
+}
+
+int DatabaseManager::consumePrekeys(const QList<qint64> &prekeyIds)
+{
+    if (prekeyIds.isEmpty()) {
+        return 0;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("UPDATE prekeys SET status = 'used' WHERE id = ? AND status = 'claimed'");
+    int consumed = 0;
+    for (qint64 id : prekeyIds) {
+        q.bindValue(0, id);
+        if (q.exec() && q.numRowsAffected() == 1) {
+            ++consumed;
+        }
+    }
+    return consumed;
+}
+
+bool DatabaseManager::removeDeviceKeys(qint64 userId, const QString &deviceId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM device_identity_keys WHERE user_id = ? AND device_id = ?");
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    if (!q.exec()) {
+        qWarning() << "[DB] removeDeviceKeys (identity) failed:" << q.lastError().text();
+        return false;
+    }
+
+    q.prepare("DELETE FROM prekeys WHERE user_id = ? AND device_id = ?");
+    q.addBindValue(userId);
+    q.addBindValue(deviceId);
+    if (!q.exec()) {
+        qWarning() << "[DB] removeDeviceKeys (prekeys) failed:" << q.lastError().text();
+        return false;
+    }
+    return true;
 }

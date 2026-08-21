@@ -1,6 +1,7 @@
 #include "RequestHandler.h"
 #include "NonceCache.h"
 #include "database/DatabaseManager.h"
+#include "E2eeCrypto.h"
 #include "EncryptionManager.h"
 #include "LogSanitizer.h"
 #include "SecureMemory.h"
@@ -10,6 +11,8 @@
 #include <QJsonArray>
 #include <QJsonParseError>
 #include <QDateTime>
+#include <QHash>
+#include <QSet>
 #include <QUuid>
 #include <QMetaObject>
 
@@ -265,6 +268,15 @@ void RequestHandler::processPacket(const Packet &packet)
     // M5.5: 账号级增量同步
     if (packet.messageType == MessageType::SyncEventsRequest || type == "sync_events") {
         processSyncEventsRequest(packet, json);
+        return;
+    }
+    // M6: 端到端加密密钥注册与拉取
+    if (packet.messageType == MessageType::RegisterKeysRequest || type == "register_keys") {
+        processRegisterKeysRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::FetchKeysRequest || type == "fetch_keys") {
+        processFetchKeysRequest(packet, json);
         return;
     }
 
@@ -695,6 +707,73 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         return;
     }
 
+    // M5.5 幂等重试优先：同键消息已存在时直接返回，不再校验 envelope
+    // （重试时 envelope 引用的预密钥可能已被首次发送消费）
+    if (auto existing = m_db->getMessageByClientKey(m_authenticatedUserId,
+                                                    m_currentDeviceId, clientMessageId);
+        existing.has_value()) {
+        QJsonObject retryData;
+        retryData["messageId"] = existing->id;
+        retryData["conversationId"] = existing->conversationId;
+        retryData["clientMessageId"] = clientMessageId;
+        retryData["status"] = existing->status;
+        retryData["reused"] = true;
+        sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
+                     "Message sent", retryData);
+        return;
+    }
+
+    // M6: fail-closed —— 消息正文必须为合法 E2EE envelope（服务端只见密文）
+    bool envelopeOk = false;
+    const auto entries = XYChat::Security::E2eeCrypto::decodeEnvelope(content, &envelopeOk);
+    if (!envelopeOk) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::E2eeInvalidEnvelope,
+                     "Message content must be a valid E2EE envelope");
+        return;
+    }
+
+    // 逐条校验：无重复设备（自身拷贝与接收方条目分开去重，同一台机器上
+    // 收发双方 deviceId 可能相同）；接收方条目引用的预密钥必须处于 claimed
+    // 状态；发送方自身设备的拷贝条目（prekeyId=0，仅身份密钥加密）无需预密钥
+    QList<qint64> prekeyIds;
+    QSet<QString> seenPeerDevices;
+    bool seenSelfCopy = false;
+    for (const auto &entry : entries) {
+        const bool isSelfCopy = entry.deviceId == m_currentDeviceId
+            && entry.prekeyId == XYChat::Security::E2eeCrypto::SelfCopyPrekeyId;
+        if (isSelfCopy) {
+            if (seenSelfCopy) {
+                sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                             ErrorCode::E2eeInvalidEnvelope, "Duplicate device entry in envelope");
+                return;
+            }
+            seenSelfCopy = true;
+            continue; // 发送方自己设备的密文拷贝，内容对服务端仍不可见
+        }
+        if (seenPeerDevices.contains(entry.deviceId)) {
+            sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                         ErrorCode::E2eeInvalidEnvelope, "Duplicate device entry in envelope");
+            return;
+        }
+        seenPeerDevices.insert(entry.deviceId);
+        if (!m_db->validateClaimedPrekey(targetUserId, entry.deviceId, entry.prekeyId)) {
+            sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                         ErrorCode::E2eeInvalidEnvelope,
+                         "Envelope references invalid or unconsumable prekey");
+            return;
+        }
+        prekeyIds.append(entry.prekeyId);
+    }
+
+    // 至少需要一个接收方设备条目（纯自身拷贝不构成消息投递）
+    if (prekeyIds.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::E2eeInvalidEnvelope,
+                     "Envelope has no recipient device entry");
+        return;
+    }
+
     // 获取或创建会话
     const qint64 convId = m_db->getOrCreatePrivateConversation(m_authenticatedUserId, targetUserId);
     if (convId < 0) {
@@ -703,10 +782,25 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
         return;
     }
 
-    // 存储消息（幂等：重复的 clientMessageId 返回已有消息）
+    // M6 审查修复：消息入库与预密钥消费绑定为原子单元，
+    // 避免消息已投递但预密钥悬挂在 claimed 状态
+    m_db->beginTransaction();
+
+    // 存储消息（幂等：并发重复提交仍由幂等键兜底）
     const qint64 msgId = m_db->sendMessage(convId, m_authenticatedUserId, content,
                                            contentType, clientMessageId, m_currentDeviceId);
     if (msgId < 0) {
+        m_db->rollbackTransaction();
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::InternalError, "Failed to send message");
+        return;
+    }
+
+    // 消息入库后消费预密钥（claimed -> used），保证一次性投递
+    m_db->consumePrekeys(prekeyIds);
+
+    if (!m_db->commitTransaction()) {
+        m_db->rollbackTransaction();
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      ErrorCode::InternalError, "Failed to send message");
         return;
@@ -915,6 +1009,157 @@ void RequestHandler::processSyncEventsRequest(const Packet &packet, const QJsonO
     data["lastSeq"] = events.isEmpty() ? afterSeq : events.last().seq;
     data["hasMore"] = (events.size() >= limit);
     sendResponse(packet.requestId, MessageType::SyncEventsResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
+// ── M6: 密钥注册（身份公钥 + 一次性预密钥公钥） ──────────────────────
+void RequestHandler::processRegisterKeysRequest(const Packet &packet, const QJsonObject &request)
+{
+    // 仅允许注册当前认证设备自己的密钥（deviceId 取自 session，不信任请求参数）
+    const QString identityPub = request.value("identityPub").toString().trimmed();
+    if (identityPub.isEmpty()
+        || QByteArray::fromBase64(identityPub.toLatin1(),
+                                  QByteArray::AbortOnBase64DecodingErrors).size() != 32) {
+        sendResponse(packet.requestId, MessageType::RegisterKeysResponse,
+                     ErrorCode::InvalidRequest,
+                     "identityPub must be a 32-byte Base64 X25519 public key");
+        return;
+    }
+
+    if (!m_db->upsertIdentityKey(m_authenticatedUserId, m_currentDeviceId, identityPub)) {
+        sendResponse(packet.requestId, MessageType::RegisterKeysResponse,
+                     ErrorCode::InternalError, "Failed to store identity key");
+        return;
+    }
+
+    // 可选：批量上传一次性预密钥公钥
+    int uploaded = 0;
+    const QJsonArray prekeyArray = request.value("prekeys").toArray();
+    if (!prekeyArray.isEmpty()) {
+        if (prekeyArray.size() > MaxPrekeysPerBatch) {
+            sendResponse(packet.requestId, MessageType::RegisterKeysResponse,
+                         ErrorCode::InvalidRequest,
+                         QString("At most %1 prekeys per batch").arg(MaxPrekeysPerBatch));
+            return;
+        }
+        const int remaining = m_db->prekeyCount(m_authenticatedUserId, m_currentDeviceId);
+        if (remaining + prekeyArray.size() > MaxPrekeysPerDevice) {
+            sendResponse(packet.requestId, MessageType::RegisterKeysResponse,
+                         ErrorCode::InvalidRequest,
+                         QString("Prekey quota exceeded (%1 unused allowed)")
+                             .arg(MaxPrekeysPerDevice));
+            return;
+        }
+
+        QStringList pubs;
+        bool formatOk = true;
+        for (const QJsonValue &value : prekeyArray) {
+            const QString pub = value.toString().trimmed();
+            if (QByteArray::fromBase64(pub.toLatin1(),
+                                       QByteArray::AbortOnBase64DecodingErrors).size() != 32) {
+                formatOk = false;
+                break;
+            }
+            pubs.append(pub);
+        }
+        if (!formatOk) {
+            sendResponse(packet.requestId, MessageType::RegisterKeysResponse,
+                         ErrorCode::InvalidRequest,
+                         "Each prekey must be a 32-byte Base64 X25519 public key");
+            return;
+        }
+
+        uploaded = m_db->uploadPrekeys(m_authenticatedUserId, m_currentDeviceId, pubs);
+        if (uploaded < 0) {
+            sendResponse(packet.requestId, MessageType::RegisterKeysResponse,
+                         ErrorCode::InternalError, "Failed to store prekeys");
+            return;
+        }
+    }
+
+    QJsonObject data;
+    data["deviceId"] = m_currentDeviceId;
+    data["uploadedPrekeys"] = uploaded;
+    data["remainingPrekeys"] = m_db->prekeyCount(m_authenticatedUserId, m_currentDeviceId);
+    sendResponse(packet.requestId, MessageType::RegisterKeysResponse, ErrorCode::Ok,
+                 "Keys registered", data);
+    qDebug() << "[Handler] User" << m_authenticatedUserId << "registered E2EE keys,"
+             << uploaded << "prekeys uploaded";
+}
+
+// ── M6: 拉取目标用户密钥包（每设备身份公钥 + 一个认领的预密钥） ────────────
+void RequestHandler::processFetchKeysRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 targetUserId = request.value("userId").toVariant().toLongLong();
+    if (targetUserId <= 0 || targetUserId == m_authenticatedUserId) {
+        sendResponse(packet.requestId, MessageType::FetchKeysResponse,
+                     ErrorCode::CannotSendToSelf, "Invalid target user");
+        return;
+    }
+
+    // M6 审查修复：连接级频率限制，防止恶意循环拉取耗尽他人预密钥池
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (now - m_fetchKeysWindowStart >= FetchKeysWindowSeconds) {
+        m_fetchKeysWindowStart = now;
+        m_fetchKeysCount = 0;
+    }
+    if (++m_fetchKeysCount > MaxFetchKeysPerWindow) {
+        qWarning() << "[Handler] FetchKeys rate limited: user" << m_authenticatedUserId;
+        sendResponse(packet.requestId, MessageType::FetchKeysResponse,
+                     ErrorCode::LoginRateLimited,
+                     "Too many key bundle requests, please slow down");
+        return;
+    }
+
+    // 目标用户必须已注册过设备（避免对任意 userId 做密钥探测）
+    if (m_db->getDevicesByUserId(targetUserId).isEmpty()) {
+        sendResponse(packet.requestId, MessageType::FetchKeysResponse,
+                     ErrorCode::AccountNotFound, "Target user has no registered devices");
+        return;
+    }
+
+    // 事务内为每个有库存的设备认领一个预密钥
+    const auto claimed = m_db->claimPrekeys(targetUserId);
+    if (claimed.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::FetchKeysResponse,
+                     ErrorCode::KeyBundleUnavailable,
+                     "Target user has no available prekeys");
+        return;
+    }
+
+    // 组装密钥包：跳过未注册身份公钥的设备（无法加密）
+    QHash<QString, QString> identityByDevice;
+    for (const auto &key : m_db->getIdentityKeysByUser(targetUserId)) {
+        identityByDevice.insert(key.deviceId, key.identityPub);
+    }
+
+    QJsonArray bundles;
+    for (const auto &c : claimed) {
+        const QString identityPub = identityByDevice.value(c.deviceId);
+        if (identityPub.isEmpty()) {
+            qDebug() << "[Handler] FetchKeys: device" << c.deviceId
+                     << "of user" << targetUserId << "has no identity key, skipped";
+            continue;
+        }
+        QJsonObject obj;
+        obj["deviceId"] = c.deviceId;
+        obj["identityPub"] = identityPub;
+        obj["prekeyId"] = c.prekeyId;
+        obj["prekeyPub"] = c.prekeyPub;
+        bundles.append(obj);
+    }
+
+    if (bundles.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::FetchKeysResponse,
+                     ErrorCode::KeyBundleUnavailable,
+                     "Target user devices have no identity keys");
+        return;
+    }
+
+    QJsonObject data;
+    data["userId"] = targetUserId;
+    data["bundles"] = bundles;
+    sendResponse(packet.requestId, MessageType::FetchKeysResponse, ErrorCode::Ok,
                  "OK", data);
 }
 

@@ -167,6 +167,7 @@ Rectangle {
                 content: model.content
                 time: model.displayTime
                 status: model.status || ""
+                undecryptable: model.undecryptable === true
             }
         }
 
@@ -311,7 +312,8 @@ Rectangle {
                 dateKeyStr: key,
                 messageId: 0, clientMessageId: "", senderId: 0,
                 senderUsername: "", content: "", contentType: "text",
-                createdAt: "", displayTime: "", status: "", isMine: false
+                createdAt: "", displayTime: "", status: "", isMine: false,
+                undecryptable: false
             })
         }
     }
@@ -330,7 +332,9 @@ Rectangle {
             createdAt: msg.createdAt || "",
             displayTime: formatTime(msg.createdAt || ""),
             status: msg.status || "",
-            isMine: (msg.senderId == chatView.myUserId)
+            isMine: (msg.senderId == chatView.myUserId),
+            // M6: 无法解密的端到端加密消息显示占位样式
+            undecryptable: msg.undecryptable === true
         }
     }
 
@@ -368,7 +372,8 @@ Rectangle {
             createdAt: now,
             displayTime: formatTime(now),
             status: "sending",
-            isMine: true
+            isMine: true,
+            undecryptable: false
         })
         scrollToBottom()
     }

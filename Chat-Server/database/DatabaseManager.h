@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QJsonObject>
 #include <QSqlDatabase>
 
@@ -75,6 +76,21 @@ struct SyncEventInfo
     QString eventType; // "message", "contact_added", "receipt"
     QString payload;   // JSON
     QString createdAt;
+};
+
+// M6: 端到端加密密钥
+struct DeviceIdentityKey
+{
+    QString deviceId;
+    QString identityPub; // Base64 编码的 X25519 公钥
+};
+
+// M6: 认领后的一次性预密钥（每设备一个）
+struct ClaimedPrekey
+{
+    QString deviceId;
+    qint64 prekeyId = 0;
+    QString prekeyPub; // Base64 编码的 X25519 公钥
 };
 
 // ── DatabaseManager ──────────────────────────────────────────────────────────
@@ -167,6 +183,29 @@ public:
     qint64 appendSyncEvent(qint64 userId, const QString &eventType, const QString &payloadJson);
     QList<SyncEventInfo> getSyncEvents(qint64 userId, qint64 afterSeq, int limit = 200);
 
+    // ── M6: 端到端加密密钥管理 ─────────────────────────────────────────────
+    // 注册/更新设备身份公钥（仅公钥，私钥永不离开客户端）
+    bool upsertIdentityKey(qint64 userId, const QString &deviceId, const QString &identityPub);
+    QList<DeviceIdentityKey> getIdentityKeysByUser(qint64 userId);
+
+    // 批量上传一次性预密钥公钥，返回上传数量（失败返回 -1）
+    int uploadPrekeys(qint64 userId, const QString &deviceId, const QStringList &prekeyPubs);
+    // 设备剩余未认领预密钥数量
+    int prekeyCount(qint64 userId, const QString &deviceId);
+    // 事务内为指定用户每个有库存的设备原子认领一个 unused 预密钥
+    QList<ClaimedPrekey> claimPrekeys(qint64 userId);
+    // 校验 envelope 中的预密钥属于接收方且处于 claimed 状态
+    bool validateClaimedPrekey(qint64 userId, const QString &deviceId, qint64 prekeyId);
+    // 消息入库后消费预密钥（claimed -> used），返回实际消费的条数
+    int consumePrekeys(const QList<qint64> &prekeyIds);
+    // 删除设备全部密钥材料（身份密钥 + 预密钥）
+    bool removeDeviceKeys(qint64 userId, const QString &deviceId);
+
+    // 手动事务包装（供调用方将多个写操作绑定为原子单元）
+    bool beginTransaction();
+    bool commitTransaction();
+    bool rollbackTransaction();
+
 private:
     bool openDatabase();
     void closeDatabase();
@@ -175,6 +214,8 @@ private:
     bool migrateToV2();
     bool migrateToV3();
     bool migrateToV4();
+    bool migrateToV5();
+    bool migrateToV6();
 
     QString m_connectionName;
 };
