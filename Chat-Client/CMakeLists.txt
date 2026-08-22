@@ -10,7 +10,11 @@ set(CMAKE_AUTORCC ON)
 
 # 向编译器添加编译选项
 if (MSVC)
-    add_compile_options(/W3 /utf-8)
+    add_compile_options(
+        /W3 /utf-8
+        $<$<CONFIG:Debug>:/Od>
+        $<$<CONFIG:Release>:/O2>
+    )
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()

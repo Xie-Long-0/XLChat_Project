@@ -124,3 +124,37 @@ add_custom_command(TARGET TestLocalStore POST_BUILD
         ${OPENSSL_RUNTIME_DLLS}
         $<TARGET_FILE_DIR:TestLocalStore>
 )
+
+# ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
+add_executable(TestGroupRepro
+    "e2e/TestGroupRepro.cpp"
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/NetworkManager.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/LocalStore.h
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/KeyStorage.cpp
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core/KeyStorage.h
+)
+
+target_include_directories(TestGroupRepro PRIVATE
+    ${CMAKE_SOURCE_DIR}/Chat-Client/core
+)
+
+target_link_libraries(TestGroupRepro PRIVATE
+    Qt6::Network
+    Qt6::Sql
+    XYChatCommon
+)
+
+if (WIN32)
+    target_link_libraries(TestGroupRepro PRIVATE crypt32)
+endif()
+
+add_custom_command(TARGET TestGroupRepro POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENSSL_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:TestGroupRepro>
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        $<TARGET_FILE_DIR:Chat-Server>/certs
+        $<TARGET_FILE_DIR:TestGroupRepro>/certs
+)

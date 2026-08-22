@@ -265,11 +265,9 @@ Rectangle {
             }
         }
 
-        // 新消息动画
-        add: Transition {
-            NumberAnimation { property: "opacity"; from: 0; to: 1; duration: Theme.animationNormal }
-            NumberAnimation { property: "y"; from: y + 20; duration: Theme.animationNormal }
-        }
+        // 审查修复：移除 add 过渡动画。群聊下消息/系统消息/同步批量插入频繁，
+        // 动画运行中 delegate 被 clear() 销毁会留下悬空通知端点（崩溃于
+        // QQmlNotifierEndpoint::disconnect），动画收益小于稳定性风险
 
         // 内容高度变化时若已贴近底部则自动跟随（新消息到达场景）
         onContentHeightChanged: {
@@ -508,7 +506,8 @@ Rectangle {
     function updateMessageStatus(messageId, status) {
         for (var i = 0; i < msgModel.count; i++) {
             var item = msgModel.get(i)
-            if (!item.isDivider && item.messageId === messageId) {
+            // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+            if (!item.isDivider && item.messageId == messageId) {
                 msgModel.setProperty(i, "status", status)
                 return
             }

@@ -66,13 +66,43 @@ bool LocalStore::open(const QString &username, const QString &deviceId)
     if (username.isEmpty() || deviceId.isEmpty()) {
         return false;
     }
+    // 审查修复：驱动不可用时早退并给出明确日志（避免后续 addDatabase
+    // 静默返回无效句柄，错误延后到首次 SQL 执行才暴露）
+    if (!QSqlDatabase::isDriverAvailable("QSQLITE")) {
+        qWarning() << "[LocalStore] QSQLITE driver unavailable, local cache disabled";
+        return false;
+    }
 
     if (!ensureStorageKey(username, deviceId)) {
         qWarning() << "[LocalStore] Storage key unavailable, local cache disabled";
         return false;
     }
 
-    const QString path = dbFilePath(username, deviceId);
+    m_username = username;
+    m_deviceId = deviceId;
+    if (!connectDatabase()) {
+        SecureMemory::wipe(m_storageKey);
+        m_storageKey.clear();
+        m_username.clear();
+        m_deviceId.clear();
+        return false;
+    }
+
+    if (!ensureSchema()) {
+        closeDatabase();
+        return false;
+    }
+
+    // 历史缺陷自愈（必须在置 m_open 前完成，避免缓存先行展示泄漏行）
+    healEnvelopeLeaks();
+
+    m_open = true;
+    return true;
+}
+
+bool LocalStore::connectDatabase()
+{
+    const QString path = dbFilePath(m_username, m_deviceId);
     QDir().mkpath(QFileInfo(path).absolutePath());
 
     // 每次打开使用独立连接名，避免登出销毁后重新打开命中陈旧句柄
@@ -84,8 +114,7 @@ bool LocalStore::open(const QString &username, const QString &deviceId)
         qWarning() << "[LocalStore] Failed to open database:" << db.lastError().text();
         db = QSqlDatabase();
         QSqlDatabase::removeDatabase(m_connectionName);
-        SecureMemory::wipe(m_storageKey);
-        m_storageKey.clear();
+        m_connectionName.clear();
         return false;
     }
     m_db = db;
@@ -94,18 +123,39 @@ bool LocalStore::open(const QString &username, const QString &deviceId)
         QSqlQuery pragma(m_db);
         pragma.exec("PRAGMA busy_timeout = 5000");
     }
+    return true;
+}
 
-    if (!ensureSchema()) {
+bool LocalStore::ensureUsableDb()
+{
+    if (!m_open) {
+        return false;
+    }
+    if (m_db.isValid() && m_db.isOpen()) {
+        return true;
+    }
+
+    // 连接意外失效（如陈旧句柄/驱动异常）：释放旧句柄后按原参数重开。
+    // removeDatabase 前必须先释放全部 QSqlDatabase 拷贝，否则行为未定义
+    qWarning() << "[LocalStore] Database connection lost, attempting to reopen";
+    {
+        QSqlDatabase stale = m_db;
+        m_db = QSqlDatabase();
+        if (stale.isOpen()) {
+            stale.close();
+        }
+    }
+    if (!m_connectionName.isEmpty()) {
+        QSqlDatabase::removeDatabase(m_connectionName);
+        m_connectionName.clear();
+    }
+
+    if (!connectDatabase() || !ensureSchema()) {
+        qWarning() << "[LocalStore] Reopen failed, local cache disabled";
         closeDatabase();
         return false;
     }
-
-    // 历史缺陷自愈（必须在置 m_open 前完成，避免缓存先行展示泄漏行）
     healEnvelopeLeaks();
-
-    m_username = username;
-    m_deviceId = deviceId;
-    m_open = true;
     return true;
 }
 
@@ -118,7 +168,7 @@ void LocalStore::close()
 
 bool LocalStore::clearUserData()
 {
-    if (!m_open) {
+    if (!ensureUsableDb()) {
         return false;
     }
     // 只清除用户可见数据；decrypt_cache 与存储密钥属 E2EE 密钥材料，
@@ -342,7 +392,8 @@ bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
                                const QString &plaintext, qint64 conversationId)
 {
     // 私聊需有效接收者；群聊需有效会话 ID（两者至少一个）
-    if (!m_open || clientMessageId.isEmpty() || (toUserId <= 0 && conversationId <= 0)) {
+    if (!ensureUsableDb() || clientMessageId.isEmpty()
+        || (toUserId <= 0 && conversationId <= 0)) {
         return false;
     }
     const QString enc = encryptText(plaintext);
@@ -370,7 +421,7 @@ bool LocalStore::addOutboxItem(const QString &clientMessageId, qint64 toUserId,
 
 bool LocalStore::removeOutboxItem(const QString &clientMessageId)
 {
-    if (!m_open || clientMessageId.isEmpty()) {
+    if (!ensureUsableDb() || clientMessageId.isEmpty()) {
         return false;
     }
     QSqlQuery query(m_db);
@@ -428,7 +479,7 @@ QString LocalStore::loadMessageContent(qint64 messageId) const
 
 bool LocalStore::upsertMessage(const QJsonObject &msg)
 {
-    if (!m_open) {
+    if (!ensureUsableDb()) {
         return false;
     }
     const qint64 messageId = msg.value("messageId").toVariant().toLongLong();
@@ -556,7 +607,7 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
 
 bool LocalStore::updateMessageStatus(qint64 messageId, const QString &status)
 {
-    if (!m_open || messageId <= 0 || status.isEmpty()) {
+    if (!ensureUsableDb() || messageId <= 0 || status.isEmpty()) {
         return false;
     }
     QSqlQuery query(m_db);
@@ -572,7 +623,7 @@ bool LocalStore::updateMessageStatus(qint64 messageId, const QString &status)
 
 bool LocalStore::upsertConversation(const QJsonObject &conv)
 {
-    if (!m_open) {
+    if (!ensureUsableDb()) {
         return false;
     }
     const qint64 conversationId = conv.value("conversationId").toVariant().toLongLong();
@@ -658,7 +709,7 @@ QJsonArray LocalStore::loadConversations() const
 bool LocalStore::bumpConversationPreview(qint64 conversationId, const QString &preview,
                                          bool incrementUnread)
 {
-    if (!m_open || conversationId <= 0) {
+    if (!ensureUsableDb() || conversationId <= 0) {
         return false;
     }
     QString enc;
@@ -697,7 +748,7 @@ QString LocalStore::loadDecryptedContent(qint64 messageId) const
 
 bool LocalStore::saveDecryptedContent(qint64 messageId, const QString &plaintext)
 {
-    if (!m_open || messageId <= 0 || plaintext.isEmpty()) {
+    if (!ensureUsableDb() || messageId <= 0 || plaintext.isEmpty()) {
         return false;
     }
     const QString enc = encryptText(plaintext);
@@ -750,7 +801,7 @@ qint64 LocalStore::syncCursor() const
 
 bool LocalStore::setSyncCursor(qint64 seq)
 {
-    if (!m_open || seq < 0) {
+    if (!ensureUsableDb() || seq < 0) {
         return false;
     }
     QSqlQuery query(m_db);

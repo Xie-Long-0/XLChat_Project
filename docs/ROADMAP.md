@@ -15,6 +15,8 @@
 > **2026-08-21 更新（三）**：**M7a 子任务二（群组业务处理器与 fan-out）已完成并通过自动化测试与代码审查**：`RequestHandler` 新增建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息五个处理器；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后小群直推 fan-out + 全员 sync_events 兜底；成员变更产生系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合修复为按接收用户人数（新增 `receiptUserCount` 多设备去重计数），`MessageStatusUpdate` 携带送达/已读计数；审查修复了 QString→QByteArray 类型错误与系统消息事件流覆盖不全两项问题。TestDatabaseManager 新增 2 个用例（共 41 个），5 组测试套件全部通过；子任务三（客户端 UI）待实施。
 >
 > **2026-08-21 更新（四）**：**M7a 子任务三（客户端接入与群聊 UI）已完成并通过构建验证与代码审查**：`NetworkManager` 新增群组五接口与群消息发送（outbox 分流：群消息明文直发不依赖 E2EE 引导，持久化 outbox 新增 conversationId 目标），`GroupChangedNotification`/系统消息接入；`LocalStore` 会话缓存新增群名/成员数字段（存量库幂等补列）；QML 新增建群/群信息/邀请三个对话框，会话列表群样式，聊天区系统消息胶囊与“群聊暂未端到端加密”横幅；审查修复了群横幅高度不折叠、确定性错误无限重试两项问题。qmllint 零错误，5 组测试套件全部通过（TestLocalStore 新增群 outbox/群会话缓存用例），服务端启动冒烟正常；M7a 验收标准待双客户端联调确认。
+>
+> **2026-08-21 更新（五）**：**M7a.3 热修复（联调崩溃）**：用户反馈创建群聊后群成员发送消息时客户端崩溃（WER 记录崩溃于 `Qt6Qmld.dll QQmlNotifierEndpoint::disconnect` 与 `Qt6Cored.dll` 原子引用计数，0xc0000005 悬空访问），另伴随 `clearUserData` 报 “Driver not loaded”。定位为群消息高频触发会话列表 `clear()+全量重建` 与消息列表 add 过渡动画叠加，delegate 销毁时通知端点悬空。修复：① `ConversationList` 会话刷新改为按 conversationId 就地差分更新（set/append/remove/move 复用 delegate）；② 移除 `ChatView` 消息列表 add 过渡动画；③ `LocalStore` 加固：QSQLITE 驱动可用性早退检查、写路径统一 `ensureUsableDb()` 校验，连接意外失效时按原参数自愈重开、失败则 fail-closed 禁用缓存（消除 “database not open / Driver not loaded” 报错链）。新增临时端到端诊断工具 `tests/e2e/M7aGroupRepro`（双账号建群/收发/登出重登全链路，不纳入 CTest，需手动启动服务端）；5 组测试套件全部通过，qmllint 零错误。
 
 ## 1. 当前基础盘点
 

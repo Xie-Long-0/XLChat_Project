@@ -331,15 +331,39 @@ Rectangle {
         return d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate()
     }
 
+    // 将 conversationId 统一为 Number，避免 QJsonArray/QML 模型中 number/string 混用导致 === 匹配失败
+    function normalizeConversationId(id) {
+        var n = Number(id)
+        return isNaN(n) ? 0 : n
+    }
+
+    function findIndexByConversationId(conversationId) {
+        var target = normalizeConversationId(conversationId)
+        for (var i = 0; i < convModel.count; i++) {
+            if (normalizeConversationId(convModel.get(i).conversationId) === target) {
+                return i
+            }
+        }
+        return -1
+    }
+
     function updateConversations(conversations) {
-        convModel.clear()
+        if (!conversations || conversations.length === undefined) {
+            return
+        }
+        var seen = {}
         for (var i = 0; i < conversations.length; i++) {
             var conv = conversations[i]
+            if (!conv || conv.conversationId === undefined) {
+                continue
+            }
+            var convId = normalizeConversationId(conv.conversationId)
+            seen[convId] = true
             var type = conv.type || "private"
-            convModel.append({
-                conversationId: conv.conversationId || 0,
+            var entry = {
+                conversationId: convId,
                 type: type,
-                peerUserId: conv.peerUserId || 0,
+                peerUserId: normalizeConversationId(conv.peerUserId),
                 peerUsername: conv.peerUsername || "",
                 // M7a: 群会话显示群名与成员数
                 name: conv.name || "",
@@ -349,7 +373,32 @@ Rectangle {
                 lastMessage: conv.lastMessage || "",
                 lastMessageTime: formatConvTime(conv.lastMessageAt || ""),
                 unreadCount: conv.unreadCount || 0
-            })
+            }
+            var pos = findIndexByConversationId(convId)
+            if (pos >= 0) {
+                convModel.set(pos, entry)
+            } else {
+                convModel.append(entry)
+            }
+        }
+        // 移除服务端已不存在的会话（退群/被移出后列表同步消失）
+        for (var j = convModel.count - 1; j >= 0; j--) {
+            if (!(normalizeConversationId(convModel.get(j).conversationId) in seen)) {
+                // Qt 部分版本 ListModel.remove 要求显式 count
+                convModel.remove(j, 1)
+            }
+        }
+        // 按服务端顺序重排当前列表（插入排序式单步移动，k 递增且 move 目标 <= k 可保证正确性）
+        for (var k = 0; k < conversations.length; k++) {
+            var convK = conversations[k]
+            if (!convK || convK.conversationId === undefined) {
+                continue
+            }
+            var idx = findIndexByConversationId(normalizeConversationId(convK.conversationId))
+            if (idx >= 0 && idx !== k) {
+                // Qt 部分版本 ListModel.move 要求三个参数，显式传入 count=1
+                convModel.move(idx, k, 1)
+            }
         }
     }
 
@@ -362,9 +411,10 @@ Rectangle {
 
     // M4.5: 按会话 ID 选中（会话刷新后恢复高亮）
     function setSelectedByConversationId(conversationId) {
+        var target = normalizeConversationId(conversationId)
         selectedIndex = -1
         for (var i = 0; i < convModel.count; i++) {
-            if (convModel.get(i).conversationId === conversationId) {
+            if (normalizeConversationId(convModel.get(i).conversationId) === target) {
                 selectedIndex = i
                 return
             }
@@ -373,8 +423,9 @@ Rectangle {
 
     // M4.5: 按对方用户 ID 查找既有会话（搜索发起对话时复用）
     function findConversationByPeerId(peerUserId) {
+        var target = normalizeConversationId(peerUserId)
         for (var i = 0; i < convModel.count; i++) {
-            if (convModel.get(i).peerUserId === peerUserId) {
+            if (normalizeConversationId(convModel.get(i).peerUserId) === target) {
                 return convModel.get(i)
             }
         }
@@ -383,8 +434,9 @@ Rectangle {
 
     // M4.5: 新消息到达时本地更新预览与未读角标（当前打开的会话不计未读）
     function updateForNewMessage(conversationId, preview, timeStr, incrementUnread) {
+        var target = normalizeConversationId(conversationId)
         for (var i = 0; i < convModel.count; i++) {
-            if (convModel.get(i).conversationId === conversationId) {
+            if (normalizeConversationId(convModel.get(i).conversationId) === target) {
                 convModel.setProperty(i, "lastMessage", preview)
                 convModel.setProperty(i, "lastMessageTime", timeStr)
                 if (incrementUnread) {

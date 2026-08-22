@@ -87,6 +87,11 @@ private:
     // M7a: 列存在性检查（存量库幂等补列）
     bool hasColumn(const QString &table, const QString &column) const;
     bool ensureStorageKey(const QString &username, const QString &deviceId);
+    // 建立 SQLite 连接（open 与失效自愈共用；前置：存储密钥已就绪）
+    bool connectDatabase();
+    // 审查修复：写路径入口统一校验连接；连接意外失效（陈旧句柄/驱动异常）
+    // 时按原参数重开，重开失败则 fail-closed 禁用缓存，绝不带病执行 SQL
+    bool ensureUsableDb();
     // 历史缺陷自愈：旧版本曾把 envelope 密文误存为正文，打开时检出并
     // 清空为 undecryptable（正文由后续重新同步 + 解密缓存恢复）
     void healEnvelopeLeaks();

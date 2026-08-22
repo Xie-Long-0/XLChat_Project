@@ -136,7 +136,8 @@ Window {
         }
 
         function onMessagesSynced(conversationId, messages, hasMore) {
-            if (conversationId === mainPage.currentConversationId) {
+            // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+            if (conversationId == mainPage.currentConversationId) {
                 var msgs = []
                 for (var i = 0; i < messages.length; i++) {
                     msgs.push(messages[i])
@@ -149,7 +150,8 @@ Window {
 
         function onNewMessageReceived(message) {
             var convId = message.conversationId
-            if (convId === mainPage.currentConversationId) {
+            // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+            if (convId == mainPage.currentConversationId) {
                 mainPage.appendMessage(message)
                 // M4.5: 会话打开期间收到新消息，发送已读回执
                 var msgId = message.messageId || 0

@@ -640,7 +640,8 @@ Rectangle {
 
                         Label {
                             Layout.fillWidth: true
-                            text: model.username + (model.userId === mainPage.myUserId ? "（我）" : "")
+                            // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+                            text: model.username + (model.userId == mainPage.myUserId ? "（我）" : "")
                             font.pixelSize: Theme.fontSizeMedium
                             color: Theme.textPrimary
                             elide: Text.ElideRight
@@ -975,7 +976,8 @@ Rectangle {
 
     // M4.5: 首条消息发送成功后绑定服务端返回的会话 ID
     function bindNewConversation(conversationId) {
-        if (currentConversationId === 0 && conversationId > 0) {
+        // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+        if (currentConversationId == 0 && conversationId > 0) {
             currentConversationId = conversationId
             convList.setSelectedByConversationId(conversationId)
         }
@@ -1002,7 +1004,8 @@ Rectangle {
             // M7a: 当前群会话的成员数/群名变化同步到聊天区
             for (var i = 0; i < conversations.length; i++) {
                 var conv = conversations[i]
-                if ((conv.conversationId || 0) === currentConversationId) {
+                // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+                if ((conv.conversationId || 0) == currentConversationId) {
                     if ((conv.type || "private") === "group") {
                         currentGroupMemberCount = conv.memberCount || 0
                         chatView.chatTitle = conv.name || "未命名群组"
@@ -1101,7 +1104,8 @@ Rectangle {
 
     // M7a: 退群/被移出后若当前正在该群，关闭聊天区
     function closeGroupIfCurrent(conversationId) {
-        if (currentConversationId === conversationId) {
+        // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+        if (currentConversationId == conversationId) {
             currentConversationId = 0
             currentConversationType = "private"
             currentGroupMemberCount = 0
