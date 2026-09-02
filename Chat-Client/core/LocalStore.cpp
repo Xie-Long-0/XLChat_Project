@@ -301,6 +301,19 @@ bool LocalStore::ensureSchema()
         "CREATE TABLE IF NOT EXISTS meta ("
                        "key TEXT PRIMARY KEY,"
                        "value TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS sender_keys ("
+                       "group_id INTEGER NOT NULL,"
+                       "sender_user_id INTEGER NOT NULL,"
+                       "sender_device_id TEXT NOT NULL,"
+                       "key_id TEXT NOT NULL,"
+                       "chain_key_enc TEXT NOT NULL,"
+                       "public_signing_key TEXT NOT NULL,"
+                       "private_signing_key_enc TEXT NOT NULL,"
+                       "iteration INTEGER NOT NULL DEFAULT 0,"
+                       "updated_at TEXT NOT NULL DEFAULT '',"
+                       "PRIMARY KEY (group_id, sender_user_id, sender_device_id, key_id))",
+        "CREATE INDEX IF NOT EXISTS idx_sender_keys_lookup "
+                       "ON sender_keys(group_id, sender_user_id, sender_device_id)",
     };
 
     QSqlQuery query(m_db);
@@ -328,6 +341,13 @@ bool LocalStore::ensureSchema()
         && !query.exec("ALTER TABLE outbox "
                        "ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0")) {
         qWarning() << "[LocalStore] Add outbox.conversation_id failed:" << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("sender_keys", "private_signing_key_enc")
+        && !query.exec("ALTER TABLE sender_keys "
+                       "ADD COLUMN private_signing_key_enc TEXT NOT NULL DEFAULT ''")) {
+        qWarning() << "[LocalStore] Add sender_keys.private_signing_key_enc failed:"
+                   << query.lastError().text();
         return false;
     }
 
@@ -809,6 +829,118 @@ bool LocalStore::setSyncCursor(qint64 seq)
         "INSERT INTO meta(key, value) VALUES ('sync_seq', ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value");
     query.addBindValue(QString::number(seq));
+    return query.exec();
+}
+
+// M7b: 群聊 Sender Key 本地持久化
+
+bool LocalStore::saveSenderKey(qint64 groupId, qint64 senderUserId, const QString &senderDeviceId,
+                               const QString &keyId, const QByteArray &chainKey,
+                               const QByteArray &publicSigningKey,
+                               const QByteArray &privateSigningKey, int iteration)
+{
+    if (!ensureUsableDb() || groupId <= 0 || senderUserId <= 0 || senderDeviceId.isEmpty()
+        || keyId.isEmpty() || chainKey.isEmpty() || publicSigningKey.isEmpty()) {
+        return false;
+    }
+    const QString chainEnc = encryptText(QString::fromLatin1(chainKey.toBase64()));
+    const QString privateEnc = privateSigningKey.isEmpty()
+        ? QString()
+        : encryptText(QString::fromLatin1(privateSigningKey.toBase64()));
+    if (chainEnc.isEmpty()) {
+        qWarning() << "[LocalStore] Refusing to save sender key without encryption";
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "INSERT OR REPLACE INTO sender_keys"
+        "(group_id, sender_user_id, sender_device_id, key_id, chain_key_enc,"
+        " public_signing_key, private_signing_key_enc, iteration, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    query.addBindValue(groupId);
+    query.addBindValue(senderUserId);
+    query.addBindValue(senderDeviceId);
+    query.addBindValue(keyId);
+    query.addBindValue(chainEnc);
+    query.addBindValue(QString::fromLatin1(publicSigningKey.toBase64()));
+    query.addBindValue(privateEnc.isEmpty() ? QString("") : privateEnc);
+    query.addBindValue(iteration);
+    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+    if (!query.exec()) {
+        qWarning() << "[LocalStore] saveSenderKey failed:" << query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+bool LocalStore::loadSenderKey(qint64 groupId, qint64 senderUserId, const QString &senderDeviceId,
+                               const QString &keyId, QByteArray &chainKey,
+                               QByteArray &publicSigningKey,
+                               QByteArray &privateSigningKey, int &iteration) const
+{
+    chainKey.clear();
+    publicSigningKey.clear();
+    privateSigningKey.clear();
+    iteration = 0;
+    if (!m_open || groupId <= 0 || senderUserId <= 0 || senderDeviceId.isEmpty() || keyId.isEmpty()) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "SELECT chain_key_enc, public_signing_key, private_signing_key_enc, iteration "
+        "FROM sender_keys "
+        "WHERE group_id = ? AND sender_user_id = ? AND sender_device_id = ? AND key_id = ?");
+    query.addBindValue(groupId);
+    query.addBindValue(senderUserId);
+    query.addBindValue(senderDeviceId);
+    query.addBindValue(keyId);
+    if (!query.exec() || !query.next()) {
+        return false;
+    }
+    const QString chainB64 = decryptText(query.value(0).toString());
+    if (chainB64.isEmpty()) {
+        return false;
+    }
+    chainKey = QByteArray::fromBase64(chainB64.toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
+    publicSigningKey = QByteArray::fromBase64(query.value(1).toString().toLatin1(),
+                                              QByteArray::AbortOnBase64DecodingErrors);
+    const QString privateB64 = decryptText(query.value(2).toString());
+    if (!privateB64.isEmpty()) {
+        privateSigningKey = QByteArray::fromBase64(privateB64.toLatin1(),
+                                                   QByteArray::AbortOnBase64DecodingErrors);
+    }
+    iteration = query.value(3).toInt();
+    return chainKey.size() == 32 && publicSigningKey.size() == 32;
+}
+
+QString LocalStore::latestSenderKeyId(qint64 groupId, qint64 senderUserId,
+                                      const QString &senderDeviceId) const
+{
+    if (!m_open || groupId <= 0 || senderUserId <= 0 || senderDeviceId.isEmpty()) {
+        return {};
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "SELECT key_id FROM sender_keys "
+        "WHERE group_id = ? AND sender_user_id = ? AND sender_device_id = ? "
+        "ORDER BY updated_at DESC, key_id DESC LIMIT 1");
+    query.addBindValue(groupId);
+    query.addBindValue(senderUserId);
+    query.addBindValue(senderDeviceId);
+    if (!query.exec() || !query.next()) {
+        return {};
+    }
+    return query.value(0).toString();
+}
+
+bool LocalStore::removeSenderKeysForGroup(qint64 groupId)
+{
+    if (!ensureUsableDb() || groupId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("DELETE FROM sender_keys WHERE group_id = ?");
+    query.addBindValue(groupId);
     return query.exec();
 }
 

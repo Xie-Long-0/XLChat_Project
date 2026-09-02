@@ -3,6 +3,7 @@
 #include "database/DatabaseManager.h"
 #include "E2eeCrypto.h"
 #include "EncryptionManager.h"
+#include "GroupE2eeCrypto.h"
 #include "LogSanitizer.h"
 #include "SecureMemory.h"
 
@@ -18,6 +19,7 @@
 
 using namespace XYChat::Protocol;
 using XYChat::Security::LogSanitizer;
+using XYChat::Security::GroupE2eeCrypto;
 
 // 构造 / 析构
 RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
@@ -299,6 +301,10 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     if (packet.messageType == MessageType::GetGroupInfoRequest || type == "get_group_info") {
         processGetGroupInfoRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::FetchGroupKeysRequest || type == "fetch_group_keys") {
+        processFetchGroupKeysRequest(packet, json);
         return;
     }
 
@@ -1621,6 +1627,86 @@ void RequestHandler::processGetGroupInfoRequest(const Packet &packet, const QJso
                  "OK", data);
 }
 
+// M7b: 拉取群内所有成员（含发送方自己）的 E2EE 密钥包，
+// 供客户端通过 pairwise E2EE 分发 Sender Key
+void RequestHandler::processFetchGroupKeysRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 convId = request.value("conversationId").toVariant().toLongLong();
+    if (convId <= 0) {
+        sendResponse(packet.requestId, MessageType::FetchGroupKeysResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+
+    auto conv = m_db->getConversation(convId);
+    if (!conv.has_value() || conv->type != "group") {
+        sendResponse(packet.requestId, MessageType::FetchGroupKeysResponse,
+                     ErrorCode::ConversationNotFound, "Group not found");
+        return;
+    }
+
+    // 先授权：仅群成员可拉取群内密钥包
+    if (!m_db->isConversationMember(convId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::FetchGroupKeysResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this group");
+        return;
+    }
+
+    // M6 审查修复：连接级频率限制（与 fetch_keys 共享窗口），
+    // 防止恶意循环拉取耗尽他人预密钥池
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    if (now - m_fetchKeysWindowStart >= FetchKeysWindowSeconds) {
+        m_fetchKeysWindowStart = now;
+        m_fetchKeysCount = 0;
+    }
+    if (++m_fetchKeysCount > MaxFetchKeysPerWindow) {
+        qWarning() << "[Handler] FetchGroupKeys rate limited: user" << m_authenticatedUserId;
+        sendResponse(packet.requestId, MessageType::FetchGroupKeysResponse,
+                     ErrorCode::LoginRateLimited,
+                     "Too many key bundle requests, please slow down");
+        return;
+    }
+
+    const QList<qint64> memberIds = m_db->getGroupMemberIds(convId);
+
+    QJsonObject bundlesByUser;
+    for (qint64 userId : memberIds) {
+        // 事务内为每个有库存的设备认领一个预密钥
+        const auto claimed = m_db->claimPrekeys(userId);
+        if (claimed.isEmpty()) {
+            continue;
+        }
+
+        QHash<QString, QString> identityByDevice;
+        for (const auto &key : m_db->getIdentityKeysByUser(userId)) {
+            identityByDevice.insert(key.deviceId, key.identityPub);
+        }
+
+        QJsonArray bundles;
+        for (const auto &c : claimed) {
+            const QString identityPub = identityByDevice.value(c.deviceId);
+            if (identityPub.isEmpty()) {
+                continue;
+            }
+            QJsonObject obj;
+            obj["deviceId"] = c.deviceId;
+            obj["identityPub"] = identityPub;
+            obj["prekeyId"] = c.prekeyId;
+            obj["prekeyPub"] = c.prekeyPub;
+            bundles.append(obj);
+        }
+        if (!bundles.isEmpty()) {
+            bundlesByUser[QString::number(userId)] = bundles;
+        }
+    }
+
+    QJsonObject data;
+    data["conversationId"] = convId;
+    data["bundles"] = bundlesByUser;
+    sendResponse(packet.requestId, MessageType::FetchGroupKeysResponse, ErrorCode::Ok,
+                 "OK", data);
+}
+
 // M7a: 群消息发送（明文入库 + fan-out；E2EE 在 M7b 用 Sender Keys 补齐）
 void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonObject &request,
                                              qint64 conversationId, const QString &clientMessageId)
@@ -1657,11 +1743,46 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
                      ErrorCode::InvalidRequest, "Message content too long");
         return;
     }
-    if (contentType != "text") {
+    if (contentType != "text"
+        && contentType != "sender_key_distribution"
+        && contentType != "e2ee_group") {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      ErrorCode::InvalidRequest,
-                     "Group messages only support text content in M7a");
+                     "Unsupported group message content type");
         return;
+    }
+
+    // M7b fail-closed：群 E2EE 消息入库前必须是合法 envelope 密文（与单聊 decodeEnvelope
+    // 强校验一致），拒绝明文或结构非法的 blob 伪装成密文入库与 fan-out
+    if (contentType == "e2ee_group") {
+        GroupE2eeCrypto::EncryptedMessage probe;
+        QString senderDeviceId;
+        if (!GroupE2eeCrypto::decodeGroupMessage(content, probe, &senderDeviceId)
+            || senderDeviceId.isEmpty()) {
+            qWarning() << "[Handler] Rejected invalid group e2ee envelope: user"
+                       << m_authenticatedUserId << "conv" << conversationId;
+            sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                         ErrorCode::E2eeInvalidEnvelope,
+                         "Group e2ee content is not a valid envelope");
+            return;
+        }
+    } else if (contentType == "sender_key_distribution") {
+        qint64 distGroupId = 0;
+        qint64 distSenderId = 0;
+        QString distDeviceId;
+        GroupE2eeCrypto::SenderKey distKey;
+        QList<GroupE2eeCrypto::DistributionEntry> distEntries;
+        if (!GroupE2eeCrypto::decodeDistribution(content, distGroupId, distSenderId,
+                                                 distDeviceId, distKey, distEntries)
+            || distEntries.isEmpty()
+            || distGroupId != conversationId) {
+            qWarning() << "[Handler] Rejected invalid sender key distribution: user"
+                       << m_authenticatedUserId << "conv" << conversationId;
+            sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                         ErrorCode::E2eeInvalidEnvelope,
+                         "sender_key_distribution content is not a valid envelope");
+            return;
+        }
     }
 
     // M5.5 幂等重试优先：同键消息已存在时直接返回

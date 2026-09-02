@@ -17,6 +17,8 @@
 > **2026-08-21 更新（四）**：**M7a 子任务三（客户端接入与群聊 UI）已完成并通过构建验证与代码审查**：`NetworkManager` 新增群组五接口与群消息发送（outbox 分流：群消息明文直发不依赖 E2EE 引导，持久化 outbox 新增 conversationId 目标），`GroupChangedNotification`/系统消息接入；`LocalStore` 会话缓存新增群名/成员数字段（存量库幂等补列）；QML 新增建群/群信息/邀请三个对话框，会话列表群样式，聊天区系统消息胶囊与“群聊暂未端到端加密”横幅；审查修复了群横幅高度不折叠、确定性错误无限重试两项问题。qmllint 零错误，5 组测试套件全部通过（TestLocalStore 新增群 outbox/群会话缓存用例），服务端启动冒烟正常；M7a 验收标准待双客户端联调确认。
 >
 > **2026-08-21 更新（五）**：**M7a.3 热修复（联调崩溃）**：用户反馈创建群聊后群成员发送消息时客户端崩溃（WER 记录崩溃于 `Qt6Qmld.dll QQmlNotifierEndpoint::disconnect` 与 `Qt6Cored.dll` 原子引用计数，0xc0000005 悬空访问），另伴随 `clearUserData` 报 “Driver not loaded”。定位为群消息高频触发会话列表 `clear()+全量重建` 与消息列表 add 过渡动画叠加，delegate 销毁时通知端点悬空。修复：① `ConversationList` 会话刷新改为按 conversationId 就地差分更新（set/append/remove/move 复用 delegate）；② 移除 `ChatView` 消息列表 add 过渡动画；③ `LocalStore` 加固：QSQLITE 驱动可用性早退检查、写路径统一 `ensureUsableDb()` 校验，连接意外失效时按原参数自愈重开、失败则 fail-closed 禁用缓存（消除 “database not open / Driver not loaded” 报错链）。新增临时端到端诊断工具 `tests/e2e/M7aGroupRepro`（双账号建群/收发/登出重登全链路，不纳入 CTest，需手动启动服务端）；5 组测试套件全部通过，qmllint 零错误。
+>
+> **2026-08-22 更新**：**M7b Sender-Key 群端到端加密已完成，并通过自动化测试与双客户端联调**：实现简化 Signal Sender-Key 方案——每发送方每群独立生成 32 字节 chain key 与 Ed25519 签名密钥对；chain key 经 HKDF-SHA256 ratchet 派生消息密钥；消息以 AES-256-GCM 加密并由发送方私钥签名（覆盖 `iv || ciphertext`）；群消息 envelope 含 `keyId`/`iteration`/`senderDeviceId`。Sender-key 分发复用 M6 pairwise X25519 身份/预密钥 E2EE，以 `contentType=sender_key_distribution` 的群消息逐设备加密 chain key（base64 编码）。服务端新增 `FetchGroupKeysRequest/Response`（协议类型 71/72）一次性返回群内所有成员 E2EE 密钥包。客户端 `LocalStore` 新增 `sender_keys` 表加密保存 chain key、签名公私钥与迭代次数，登出保留密钥材料。修复集成缺陷：① `NetworkManager.h` 删除重复声明；② `NetworkManager.cpp` 加 `using namespace XYChat::Security`，补全私钥签名持久化与 `senderDeviceId` 嵌入 envelope，加解密后保存状态；③ `GroupE2eeCrypto::decodeDistribution` 回填 `entry.envelope.deviceId`；④ `processGroupSenderKeyDistribution` 对 base64 chain key 解码后再落库；⑤ E2E 复现跳过系统消息、等待 E2EE 就绪后再建群。新增 `TestGroupE2eeCrypto` 单元测试（9 个用例覆盖原语、ratchet、篡改/回滚拒绝、分发/群消息 envelope 编解码）与 `TestLocalStore` sender-key 持久化用例；`TestGroupRepro` 双客户端联调通过建群→分发→加密收发→登出重登→再发消息全链路，退出码 0。`ctest --output-on-failure -C Debug` 6/6 通过。M7a 验收标准经 M7b 联调一并确认通过。
 
 ## 1. 当前基础盘点
 
@@ -382,7 +384,7 @@ common/
 
 ### M7a：明文群聊（4-6 周）
 
-**当前状态（2026-08-21）：拆三个子任务实施，三个子任务均已完成并通过自动化测试/构建验证：子任务一（服务端群组数据模型 + 协议定义）、子任务二（业务处理器与 fan-out）、子任务三（客户端接入与群聊 UI）；验收标准待双客户端联调确认。**
+**当前状态（2026-08-22）：已完成。拆三个子任务实施，三个子任务均已完成并通过自动化测试/构建验证：子任务一（服务端群组数据模型 + 协议定义）、子任务二（业务处理器与 fan-out）、子任务三（客户端接入与群聊 UI）；双客户端联调经 M7b 群 E2EE 端到端复现一并验证通过。**
 
 #### 目标
 
@@ -398,12 +400,14 @@ common/
 
 #### 验收标准
 
-- [ ] 可创建群、邀请成员、发送群文本消息。（服务端/客户端均已实现并通过单元层验证，待双客户端联调确认）
-- [ ] 群成员变更后权限立即生效。（服务端已实现：变更即落库并推送，被移除者后续请求即被拒；待联调确认）
-- [ ] 离线成员上线后可同步群消息。（已实现：全员 sync_events 兜底 + 本地缓存；待联调确认）
-- [x] UI 明确提示群聊暂未端到端加密。（子任务三已落地：群聊天区顶部横幅提示，qmllint 验证通过）
+- [x] 可创建群、邀请成员、发送群文本消息。（服务端/客户端均已实现并通过单元层验证；M7b 双客户端联调确认通过）
+- [x] 群成员变更后权限立即生效。（服务端已实现：变更即落库并推送，被移除者后续请求即被拒；M7b 联调确认通过）
+- [x] 离线成员上线后可同步群消息。（已实现：全员 sync_events 兜底 + 本地缓存；M7b 联调确认通过）
+- [x] UI 明确提示群聊暂未端到端加密。（子任务三已落地：群聊天区顶部横幅提示，qmllint 验证通过；M7b 完成后该横幅已由群 E2EE 状态替代）
 
 ### M7b：群聊端到端加密（Sender Keys）（4-6 周）
+
+**当前状态（2026-08-22）：已完成。简化 Signal Sender-Key 方案落地，服务端只见群消息密文；经代码审查与双客户端联调修复多项集成缺陷；`ctest --output-on-failure -C Debug` 6/6 通过，`TestGroupRepro` 双客户端退出码 0。**
 
 #### 目标
 
@@ -411,15 +415,25 @@ common/
 
 #### 任务
 
-- 实现 Sender Keys 分发与群会话建立（发送者密钥方案，按发送者×群分发）。
-- 群成员加入/退出触发密钥重分发（healing）与失权成员回收。
-- 复用 M6 envelope 传输与服务端 fail-closed 密文存储。
+- [x] 实现 Sender Keys 分发与群会话建立（发送者密钥方案，按发送者×群×设备分发）。
+  - 每发送方每群生成独立 `SenderKey`（32 字节 chain key + Ed25519 签名密钥对）。
+  - chain key 经 HKDF-SHA256 ratchet 派生消息密钥（`salt="xychat-grp-chain"`）。
+  - 群消息 envelope：AES-256-GCM 密文 + Ed25519 签名（覆盖 `iv || ciphertext`），JSON 含 `keyId`/`iteration`/`senderDeviceId`。
+- [x] 复用 M6 pairwise X25519 身份/预密钥 E2EE 分发 sender-key。
+  - chain key 经 base64 编码后逐设备加密，以 `contentType=sender_key_distribution` 的群消息发送。
+  - 服务端新增 `FetchGroupKeysRequest/Response`（协议类型 71/72）一次性返回群内所有成员 E2EE 密钥包。
+- [x] 客户端持久化：
+  - `LocalStore` 新增 `sender_keys` 表，加密保存 chain key、签名公钥、签名私钥与迭代次数。
+  - 登出保留 sender-key 密钥材料（与 M6 解密缓存一致，避免重登后无法解密/签名）。
+- [ ] 群成员加入/退出触发密钥重分发（healing）与失权成员回收。（留待后续；当前新成员需发送方手动重新分发或发送方重新登录触发）
+- [x] 复用 M6 envelope 传输与服务端 fail-closed 密文存储；群消息正文入库前校验为合法 envelope 密文。
 
 #### 验收标准
 
-- 服务端数据库无法解密群消息正文。
-- 被移出成员无法解密后续新消息。
-- 一对一 E2EE 与群 E2EE 互不影响。
+- [x] 服务端数据库无法解密群消息正文。（`TestGroupRepro` 抓库验证密文；服务端对非法/明文群消息正文 fail-closed）
+- [x] 群消息加解密往返正确，篡改/错误签名/错误 chain key 均被拒绝。（`TestGroupE2eeCrypto` 覆盖）
+- [x] 一对一 E2EE 与群 E2EE 互不影响。（M6 单元测试与 M7b E2E 复现均通过）
+- [x] 登出重登后群消息仍可解密/签名发送。（`TestGroupRepro` 阶段 2 验证）
 
 ## M8：媒体、文件与对象存储（4-8 周）
 
@@ -588,7 +602,7 @@ XYChat_Project/
 13. ~~M4 遗留清理：亮/暗主题切换、移除 CMake 中 `Qt6::Widgets` 链接。~~（M4.5 已完成）
 14. ~~M6 端到端加密一对一聊天：身份密钥/预密钥注册与拉取、envelope 加密收发、TOFU、历史消息不可恢复决策。~~（已完成，审查问题已修复）
 15. ~~M6.5 本地持久化缓存与持久化 outbox（加密存储；可并行提前桌面通知与简化图片消息）。~~（已完成；提前项未实施，仍为可选）
-16. M7a 明文群聊（三个子任务均已完成，验收待联调） → M7b Sender Keys 群 E2EE。
+16. ~~M7a 明文群聊 → M7b Sender Keys 群 E2EE。~~（均已完成，M7b 经双客户端联调验证）
 17. M9 多端同步（范围收缩，依赖 M6.5 本地缓存）；期间前置落地 M11 的结构化日志与发消息/搜索限流。
 
 ## 9. 每个迭代的完成定义

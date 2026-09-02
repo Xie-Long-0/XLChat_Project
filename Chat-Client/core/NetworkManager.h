@@ -12,6 +12,7 @@
 
 #include "protocol/PacketCodec.h"
 #include "encryption/E2eeCrypto.h"
+#include "encryption/GroupE2eeCrypto.h"
 #include "KeyStorage.h"
 #include "LocalStore.h"
 
@@ -161,6 +162,8 @@ private:
     void sendFetchKeysRequest(qint64 toUserId);
     void handleRegisterKeysResponse(const XYChat::Protocol::Packet &packet);
     void handleFetchKeysResponse(const XYChat::Protocol::Packet &packet);
+    // M7b: 群 E2EE 密钥包拉取
+    void handleFetchGroupKeysResponse(const XYChat::Protocol::Packet &packet);
     // M6: 对指定用户加密正文（拉取的密钥包逐设备加密），失败返回空
     QString encryptForUser(qint64 toUserId, const QJsonArray &bundles, const QString &plaintext);
     // M6: 解密接收到的消息正文；非 envelope（存量明文）原样返回；
@@ -168,6 +171,15 @@ private:
     QString decryptIncomingContent(const QString &content, bool *undecryptable);
     // M6: 在接收 JSON 上就地解密 content 字段（含预览占位替换）
     void decryptMessageObject(QJsonObject &msg);
+    // M7b: 群聊 E2EE  Sender Key 管理
+    bool ensureGroupSenderKey(qint64 conversationId,
+                              XYChat::Security::GroupE2eeCrypto::SenderKey &key);
+    void sendFetchGroupKeysRequest(qint64 conversationId);
+    QString buildGroupSenderKeyDistribution(qint64 conversationId,
+                                            const QJsonObject &bundlesByUser);
+    bool processGroupSenderKeyDistribution(const QJsonObject &msg);
+    QString encryptGroupMessage(qint64 conversationId, const QString &plaintext);
+    bool decryptGroupMessageObject(QJsonObject &msg);
     // M6.5: 本地持久化缓存
     // 登录后打开本地加密库：加载持久化 outbox、立即展示缓存会话、游标增量同步
     void openLocalStore();
@@ -219,6 +231,11 @@ private:
     quint64 m_pendingLeaveGroupRequestId = 0;
     quint64 m_pendingKickGroupRequestId = 0;
     quint64 m_pendingGetGroupInfoRequestId = 0;
+    // M7b: 群 E2EE 引导状态
+    quint64 m_pendingFetchGroupKeysRequestId = 0;
+    qint64 m_fetchGroupKeysTargetConvId = 0;
+    QSet<QString> m_pendingGroupDistributions; // clientMessageId 集合：等待 ACK 的分发消息
+    QHash<qint64, XYChat::Security::GroupE2eeCrypto::SenderKey> m_groupSenderKeys; // 内存缓存
 
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem

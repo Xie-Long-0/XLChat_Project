@@ -15,8 +15,11 @@
 #include "EncryptionManager.h"
 #include "TlsHelper.h"
 #include "SecureMemory.h"
+#include "GroupE2eeCrypto.h"
 
 using namespace XYChat::Protocol;
+using namespace XYChat::Security;
+using XYChat::Security::GroupE2eeCrypto;
 
 NetworkManager::NetworkManager(QObject *parent) :
     QObject(parent),
@@ -147,6 +150,11 @@ void NetworkManager::onDisconnected()
     m_pendingRegisterKeysRequestId = 0;
     m_pendingFetchKeysRequestId = 0;
     m_fetchKeysTargetUserId = 0;
+    // M7b: 群 E2EE 引导状态与内存缓存重置（Sender Key 保留在 LocalStore）
+    m_pendingFetchGroupKeysRequestId = 0;
+    m_fetchGroupKeysTargetConvId = 0;
+    m_pendingGroupDistributions.clear();
+    m_groupSenderKeys.clear();
     setState(ConnectionState::Disconnected);
 
     if (shouldRelogin) {
@@ -409,6 +417,10 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::FetchKeysResponse:
         handleFetchKeysResponse(packet);
         break;
+    // M7b: 群 E2EE 密钥包拉取
+    case MessageType::FetchGroupKeysResponse:
+        handleFetchGroupKeysResponse(packet);
+        break;
     // M7a: 群组响应与推送
     case MessageType::CreateGroupResponse:
         handleCreateGroupResponse(packet);
@@ -568,6 +580,10 @@ void NetworkManager::resetAuthState()
     m_serverPrekeyRemaining = -1;
     m_decryptCache.clear();
     m_decryptCacheLoaded = false;
+    m_pendingFetchGroupKeysRequestId = 0;
+    m_fetchGroupKeysTargetConvId = 0;
+    m_pendingGroupDistributions.clear();
+    m_groupSenderKeys.clear();
     XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
     m_identityKey = {};
     for (auto &pk : m_localPrekeys) {
@@ -732,6 +748,12 @@ void NetworkManager::flushOutbox()
         return;
     }
 
+    // M6/M7b: 身份密钥尚未注册时先引导，完成后会再次 flush
+    if (!m_e2eeReady) {
+        bootstrapE2ee();
+        return;
+    }
+
     // 已在途的 clientMessageId 不重复发
     QSet<QString> inFlight;
     for (auto it = m_pendingSendByRequestId.constBegin();
@@ -739,31 +761,38 @@ void NetworkManager::flushOutbox()
         inFlight.insert(it.value());
     }
 
-    // M7a: 群消息明文直发，不依赖 E2EE 引导（与私聊路径分流）
+    // M7b: 群消息使用 Sender Key E2EE
     for (const OutboxItem &item : std::as_const(m_outbox)) {
         if (item.conversationId <= 0 || inFlight.contains(item.clientMessageId)) {
             continue;
         }
-        QJsonObject json;
-        json["type"] = "send_message";
-        json["conversationId"] = item.conversationId;
-        json["content"] = item.content;
-        json["contentType"] = "text";
-        json["clientMessageId"] = item.clientMessageId;
-        addReplayProtection(json);
+        GroupE2eeCrypto::SenderKey key;
+        if (ensureGroupSenderKey(item.conversationId, key)) {
+            const QString envelope = encryptGroupMessage(item.conversationId, item.content);
+            if (envelope.isEmpty()) {
+                qWarning() << "[NetMgr] Failed to encrypt group message"
+                           << item.clientMessageId;
+                continue;
+            }
+            QJsonObject json;
+            json["type"] = "send_message";
+            json["conversationId"] = item.conversationId;
+            json["content"] = envelope;
+            json["contentType"] = "e2ee_group";
+            json["clientMessageId"] = item.clientMessageId;
+            addReplayProtection(json);
 
-        Packet groupPacket;
-        groupPacket.messageType = MessageType::SendMessageRequest;
-        groupPacket.requestId = nextRequestId();
-        groupPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-        m_pendingSendByRequestId.insert(groupPacket.requestId, item.clientMessageId);
-        sendPacket(groupPacket);
-    }
-
-    // M6: 身份密钥尚未注册时先引导，完成后会再次 flush
-    if (!m_e2eeReady) {
-        bootstrapE2ee();
-        return;
+            Packet groupPacket;
+            groupPacket.messageType = MessageType::SendMessageRequest;
+            groupPacket.requestId = nextRequestId();
+            groupPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+            m_pendingSendByRequestId.insert(groupPacket.requestId, item.clientMessageId);
+            sendPacket(groupPacket);
+        } else if (m_pendingFetchGroupKeysRequestId == 0) {
+            // 本群尚无 Sender Key：先拉取成员密钥包，响应后继续 flush
+            sendFetchGroupKeysRequest(item.conversationId);
+            return;
+        }
     }
 
     // 按目标用户汇总待发消息，逐用户拉取密钥包（每次 FetchKeys 的预密钥
@@ -1248,9 +1277,24 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
         }
     }
 
+    const QString content = msg.value("content").toString();
+
+    // M7b: 群聊 Sender Key 分发消息
+    if (GroupE2eeCrypto::looksLikeDistribution(content)) {
+        processGroupSenderKeyDistribution(msg);
+        msg["content"] = QStringLiteral("[Sender key updated]");
+        msg["contentType"] = QStringLiteral("system");
+        return;
+    }
+
+    // M7b: 群聊 E2EE 消息
+    if (GroupE2eeCrypto::looksLikeGroupMessage(content)) {
+        decryptGroupMessageObject(msg);
+        return;
+    }
+
     bool undecryptable = false;
-    const QString plain = decryptIncomingContent(msg.value("content").toString(),
-                                                 &undecryptable);
+    const QString plain = decryptIncomingContent(content, &undecryptable);
     if (undecryptable) {
         msg["undecryptable"] = true;
     } else {
@@ -1267,6 +1311,364 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
             }
         }
     }
+}
+
+// M7b: 确保本机在该群有 Sender Key；返回 true 表示 key 已可用
+bool NetworkManager::ensureGroupSenderKey(qint64 conversationId,
+                                          GroupE2eeCrypto::SenderKey &key)
+{
+    key = GroupE2eeCrypto::SenderKey{};
+    if (conversationId <= 0 || m_userId <= 0 || m_localDeviceId.isEmpty()) {
+        return false;
+    }
+
+    auto it = m_groupSenderKeys.find(conversationId);
+    if (it != m_groupSenderKeys.end() && it->valid) {
+        key = it.value();
+        return true;
+    }
+
+    if (m_localStore.isOpen()) {
+        const QString keyId = m_localStore.latestSenderKeyId(conversationId, m_userId, m_localDeviceId);
+        if (!keyId.isEmpty()) {
+            QByteArray chainKey;
+            QByteArray publicSigningKey;
+            QByteArray privateSigningKey;
+            int iteration = 0;
+            if (m_localStore.loadSenderKey(conversationId, m_userId, m_localDeviceId,
+                                           keyId, chainKey, publicSigningKey,
+                                           privateSigningKey, iteration)) {
+                GroupE2eeCrypto::SenderKey stored;
+                stored.keyId = keyId;
+                stored.chainKey = chainKey;
+                stored.publicSigningKey = publicSigningKey;
+                stored.privateSigningKey = privateSigningKey;
+                stored.iteration = iteration;
+                stored.valid = !keyId.isEmpty() && chainKey.size() == 32
+                    && publicSigningKey.size() == 32 && privateSigningKey.size() == 32;
+                if (stored.valid) {
+                    m_groupSenderKeys.insert(conversationId, stored);
+                    key = stored;
+                    return true;
+                }
+            }
+        }
+    }
+    key = GroupE2eeCrypto::SenderKey{};
+    return false;
+}
+
+void NetworkManager::sendFetchGroupKeysRequest(qint64 conversationId)
+{
+    if (m_state != ConnectionState::Authenticated || conversationId <= 0) {
+        return;
+    }
+    QJsonObject json;
+    json["type"] = "fetch_group_keys";
+    json["conversationId"] = conversationId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::FetchGroupKeysRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingFetchGroupKeysRequestId = packet.requestId;
+    m_fetchGroupKeysTargetConvId = conversationId;
+    sendPacket(packet);
+}
+
+void NetworkManager::handleFetchGroupKeysResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingFetchGroupKeysRequestId) {
+        return;
+    }
+    const qint64 convId = m_fetchGroupKeysTargetConvId;
+    m_pendingFetchGroupKeysRequestId = 0;
+    m_fetchGroupKeysTargetConvId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt();
+    if (code != static_cast<int>(ErrorCode::Ok) || convId <= 0) {
+        qWarning() << "[NetMgr] FetchGroupKeys failed:" << response.value("message").toString();
+        // 保持 outbox，稍后由重连或下一条消息触发重试
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    const QJsonObject bundlesByUser = data.value("bundles").toObject();
+    const QString distribution = buildGroupSenderKeyDistribution(convId, bundlesByUser);
+    if (distribution.isEmpty()) {
+        qWarning() << "[NetMgr] Failed to build group sender key distribution for" << convId;
+        return;
+    }
+
+    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    QJsonObject json;
+    json["type"] = "send_message";
+    json["conversationId"] = convId;
+    json["content"] = distribution;
+    json["contentType"] = "sender_key_distribution";
+    json["clientMessageId"] = clientMessageId;
+    addReplayProtection(json);
+
+    Packet distPacket;
+    distPacket.messageType = MessageType::SendMessageRequest;
+    distPacket.requestId = nextRequestId();
+    distPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingSendByRequestId.insert(distPacket.requestId, clientMessageId);
+    m_pendingGroupDistributions.insert(clientMessageId);
+    sendPacket(distPacket);
+}
+
+QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
+                                                        const QJsonObject &bundlesByUser)
+{
+    if (conversationId <= 0 || bundlesByUser.isEmpty()) {
+        return {};
+    }
+
+    GroupE2eeCrypto::SenderKey key = GroupE2eeCrypto::generateSenderKey();
+    if (!key.valid) {
+        return {};
+    }
+
+    QList<GroupE2eeCrypto::DistributionEntry> entries;
+    const QString chainKeyB64 = QString::fromLatin1(key.chainKey.toBase64());
+
+    for (auto it = bundlesByUser.constBegin(); it != bundlesByUser.constEnd(); ++it) {
+        const qint64 userId = it.key().toLongLong();
+        if (userId <= 0) {
+            continue;
+        }
+        const QJsonArray bundles = it.value().toArray();
+        if (bundles.isEmpty()) {
+            continue;
+        }
+        // 复用 pairwise E2EE 加密 chainKey，然后解析出各设备条目
+        const QString envelope = encryptForUser(userId, bundles, chainKeyB64);
+        if (envelope.isEmpty()) {
+            continue;
+        }
+        bool ok = false;
+        const auto deviceEntries = E2eeCrypto::decodeEnvelope(envelope, &ok);
+        if (!ok) {
+            continue;
+        }
+        for (const auto &entry : deviceEntries) {
+            GroupE2eeCrypto::DistributionEntry distEntry;
+            distEntry.userId = userId;
+            distEntry.deviceId = entry.deviceId;
+            distEntry.envelope = entry;
+            entries.append(distEntry);
+        }
+    }
+
+    if (entries.isEmpty()) {
+        SecureMemory::wipe(key.chainKey);
+        SecureMemory::wipe(key.privateSigningKey);
+        return {};
+    }
+
+    // 保存发送方 Sender Key（chainKey 与私钥经 LocalStore 存储密钥加密）
+    if (m_localStore.isOpen()) {
+        m_localStore.saveSenderKey(conversationId, m_userId, m_localDeviceId,
+                                   key.keyId, key.chainKey,
+                                   key.publicSigningKey, key.privateSigningKey,
+                                   key.iteration);
+    }
+    m_groupSenderKeys.insert(conversationId, key);
+
+    const QJsonObject distJson = GroupE2eeCrypto::encodeDistribution(
+        conversationId, m_userId, m_localDeviceId, key, entries);
+    return QString::fromUtf8(QJsonDocument(distJson).toJson(QJsonDocument::Compact));
+}
+
+// 解密单个 pairwise envelope 条目（用于提取 group Sender Key 的 chainKey）
+static QByteArray decryptEnvelopeEntry(const XYChat::Security::E2eeCrypto::EnvelopeEntry &entry,
+                                       const XYChat::Security::E2eeCrypto::KeyPair &identityKey,
+                                       QList<KeyStorage::PrekeyEntry> &localPrekeys,
+                                       const QString &username,
+                                       const QString &deviceId)
+{
+    using namespace XYChat::Security;
+    if (!identityKey.valid || entry.deviceId != deviceId) {
+        return {};
+    }
+
+    if (entry.prekeyId == E2eeCrypto::SelfCopyPrekeyId) {
+        QByteArray dh = E2eeCrypto::ecdh(identityKey.privateKey, entry.ephemeralPublicKey);
+        if (dh.size() != 32) {
+            return {};
+        }
+        QByteArray shared = dh + dh;
+        SecureMemory::wipe(dh);
+        QByteArray key = E2eeCrypto::deriveMessageKey(shared);
+        SecureMemory::wipe(shared);
+        const QByteArray plain = E2eeCrypto::aesGcmDecrypt(key, entry.iv, entry.ciphertext);
+        SecureMemory::wipe(key);
+        return plain;
+    }
+
+    for (int i = 0; i < localPrekeys.size(); ++i) {
+        QByteArray shared = E2eeCrypto::ecdh(localPrekeys.at(i).privateKey,
+                                             entry.ephemeralPublicKey);
+        shared += E2eeCrypto::ecdh(identityKey.privateKey, entry.ephemeralPublicKey);
+        QByteArray key = E2eeCrypto::deriveMessageKey(shared);
+        SecureMemory::wipe(shared);
+        const QByteArray plain = E2eeCrypto::aesGcmDecrypt(key, entry.iv, entry.ciphertext);
+        SecureMemory::wipe(key);
+        if (!plain.isEmpty()) {
+            localPrekeys.removeAt(i);
+            KeyStorage::savePrekeys(username, deviceId, localPrekeys);
+            return plain;
+        }
+    }
+    return {};
+}
+
+bool NetworkManager::processGroupSenderKeyDistribution(const QJsonObject &msg)
+{
+    const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
+    const QString content = msg.value("content").toString();
+    if (convId <= 0 || content.isEmpty()) {
+        return false;
+    }
+
+    qint64 groupId = 0;
+    qint64 senderUserId = 0;
+    QString senderDeviceId;
+    GroupE2eeCrypto::SenderKey key;
+    QList<GroupE2eeCrypto::DistributionEntry> entries;
+    if (!GroupE2eeCrypto::decodeDistribution(content, groupId, senderUserId,
+                                             senderDeviceId, key, entries)) {
+        return false;
+    }
+
+    if (groupId != convId || senderUserId <= 0 || senderDeviceId.isEmpty()) {
+        return false;
+    }
+
+    QByteArray decryptedChainKeyB64;
+    for (const auto &entry : entries) {
+        if (entry.userId == m_userId && entry.deviceId == m_localDeviceId) {
+            decryptedChainKeyB64 = decryptEnvelopeEntry(entry.envelope, m_identityKey, m_localPrekeys,
+                                                        m_username, m_localDeviceId);
+            break;
+        }
+    }
+    if (decryptedChainKeyB64.isEmpty()) {
+        qWarning() << "[NetMgr] Failed to decrypt sender key distribution for group" << convId;
+        return false;
+    }
+
+    const QByteArray chainKey = QByteArray::fromBase64(decryptedChainKeyB64,
+                                                       QByteArray::AbortOnBase64DecodingErrors);
+    if (chainKey.size() != 32) {
+        qWarning() << "[NetMgr] Decoded sender key has wrong length" << chainKey.size()
+                   << "for group" << convId;
+        return false;
+    }
+
+    if (m_localStore.isOpen()) {
+        m_localStore.saveSenderKey(convId, senderUserId, senderDeviceId, key.keyId,
+                                   chainKey, key.publicSigningKey,
+                                   QByteArray(), key.iteration);
+    }
+    qInfo() << "[NetMgr] Installed group sender key for group" << convId
+            << "from user" << senderUserId << "keyId" << key.keyId;
+    return true;
+}
+
+QString NetworkManager::encryptGroupMessage(qint64 conversationId, const QString &plaintext)
+{
+    GroupE2eeCrypto::SenderKey key;
+    if (!ensureGroupSenderKey(conversationId, key) || !key.valid) {
+        return {};
+    }
+
+    // 从内存缓存中取出可修改的副本（ratchet 会修改 chainKey/iteration）
+    GroupE2eeCrypto::SenderKey mutableKey = m_groupSenderKeys.value(conversationId);
+    if (!mutableKey.valid) {
+        return {};
+    }
+
+    const auto encrypted = GroupE2eeCrypto::encryptMessage(mutableKey, plaintext.toUtf8());
+    if (!encrypted.valid) {
+        return {};
+    }
+
+    // 保存 ratchet 后的状态
+    if (m_localStore.isOpen()) {
+        m_localStore.saveSenderKey(conversationId, m_userId, m_localDeviceId,
+                                   mutableKey.keyId, mutableKey.chainKey,
+                                   mutableKey.publicSigningKey,
+                                   mutableKey.privateSigningKey, mutableKey.iteration);
+    }
+    m_groupSenderKeys.insert(conversationId, mutableKey);
+
+    const QJsonObject envelope = GroupE2eeCrypto::encodeGroupMessage(encrypted, m_localDeviceId);
+    return QString::fromUtf8(QJsonDocument(envelope).toJson(QJsonDocument::Compact));
+}
+
+bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
+{
+    const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
+    const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
+    const QString content = msg.value("content").toString();
+
+    GroupE2eeCrypto::EncryptedMessage encrypted;
+    QString senderDeviceId;
+    if (!GroupE2eeCrypto::decodeGroupMessage(content, encrypted, &senderDeviceId)) {
+        return false;
+    }
+
+    const qint64 senderUserId = msg.value("senderId").toVariant().toLongLong();
+
+    QByteArray chainKey;
+    QByteArray publicSigningKey;
+    QByteArray privateSigningKey;
+    int iteration = 0;
+    bool loaded = false;
+    if (m_localStore.isOpen()) {
+        loaded = m_localStore.loadSenderKey(convId, senderUserId, senderDeviceId,
+                                            encrypted.keyId, chainKey, publicSigningKey,
+                                            privateSigningKey, iteration);
+    }
+    if (!loaded) {
+        qWarning() << "[NetMgr] No sender key for group" << convId
+                   << "sender" << senderUserId << "device" << senderDeviceId
+                   << "keyId" << encrypted.keyId;
+        msg["content"] = QString();
+        msg["undecryptable"] = true;
+        return false;
+    }
+
+    const QByteArray plain = GroupE2eeCrypto::decryptMessage(chainKey, iteration,
+                                                             publicSigningKey, encrypted);
+    if (plain.isEmpty()) {
+        qWarning() << "[NetMgr] Group message decryption failed for group" << convId
+                   << "sender" << senderUserId << "keyId" << encrypted.keyId
+                   << "iteration" << encrypted.iteration;
+        msg["content"] = QString();
+        msg["undecryptable"] = true;
+        return false;
+    }
+
+    msg["content"] = QString::fromUtf8(plain);
+    if (msgId > 0) {
+        m_decryptCache.insert(msgId, QString::fromUtf8(plain));
+        if (m_decryptCache.size() > 2000) {
+            m_decryptCache.clear();
+        }
+        if (!m_localStore.saveDecryptedContent(msgId, QString::fromUtf8(plain))) {
+            KeyStorage::saveDecryptCache(m_username, m_localDeviceId, m_decryptCache);
+        }
+    }
+
+    // 保存 ratchet 后的 chainKey/iteration
+    m_localStore.saveSenderKey(convId, senderUserId, senderDeviceId, encrypted.keyId,
+                               chainKey, publicSigningKey, QByteArray(), iteration);
+    return true;
 }
 
 // M3: 确认消息
@@ -1408,6 +1810,20 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
         const QJsonObject data = response.value("data").toObject();
         // 确认后从 outbox 移除（以服务端回传的幂等键为准）
         const QString ackedId = data.value("clientMessageId").toString(clientMessageId);
+
+        // M7b: 群聊 Sender Key 分发消息 ACK：不展示、不落库，触发后续群消息发送
+        if (m_pendingGroupDistributions.remove(ackedId)) {
+            for (int i = m_outbox.size() - 1; i >= 0; --i) {
+                if (m_outbox.at(i).clientMessageId == ackedId) {
+                    m_localStore.removeOutboxItem(ackedId);
+                    m_outbox.removeAt(i);
+                    break;
+                }
+            }
+            flushOutbox();
+            return;
+        }
+
         QString sentContent;
         for (int i = 0; i < m_outbox.size(); ++i) {
             if (m_outbox.at(i).clientMessageId == ackedId) {
@@ -1477,12 +1893,21 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
         const QJsonObject data = response.value("data").toObject();
         // M6: 逐条解密同步到的消息正文
         QJsonArray messages = data.value("messages").toArray();
+        QJsonArray visibleMessages;
         for (QJsonValueRef value : messages) {
             QJsonObject msg = value.toObject();
+            const QString ct = msg.value("contentType").toString();
+            const QString c = msg.value("content").toString();
+            // M7b: 群聊 Sender Key 分发消息只处理、不展示、不落库
+            if (ct == QLatin1String("sender_key_distribution")
+                || GroupE2eeCrypto::looksLikeDistribution(c)) {
+                processGroupSenderKeyDistribution(msg);
+                continue;
+            }
             decryptMessageObject(msg);
             // M6.5: 写入本地缓存（加密存储）
             m_localStore.upsertMessage(msg);
-            value = msg;
+            visibleMessages.append(msg);
         }
         emit messagesSynced(
             data.value("conversationId").toVariant().toLongLong(),
@@ -1494,6 +1919,16 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
 void NetworkManager::handleNewMessageNotification(const Packet &packet)
 {
     QJsonObject msg = QJsonDocument::fromJson(packet.payload).object();
+
+    // M7b: 群聊 Sender Key 分发消息只处理、不展示、不落库
+    const QString contentType = msg.value("contentType").toString();
+    const QString content = msg.value("content").toString();
+    if (contentType == QLatin1String("sender_key_distribution")
+        || GroupE2eeCrypto::looksLikeDistribution(content)) {
+        processGroupSenderKeyDistribution(msg);
+        return;
+    }
+
     // M6: 实时推送的消息先解密再交给 UI
     decryptMessageObject(msg);
     // M6.5: 新消息写入本地缓存，并更新会话预览/未读数（仅更新已存在会话）
@@ -1563,7 +1998,15 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
             QJsonObject event = value.toObject();
             if (event.value("type").toString() == "message") {
                 QJsonObject payload = event.value("payload").toObject();
-                decryptMessageObject(payload);
+                const QString ct = payload.value("contentType").toString();
+                const QString c = payload.value("content").toString();
+                // M7b: 分发消息直接处理，不需要解密展示
+                if (ct == QLatin1String("sender_key_distribution")
+                    || GroupE2eeCrypto::looksLikeDistribution(c)) {
+                    processGroupSenderKeyDistribution(payload);
+                } else {
+                    decryptMessageObject(payload);
+                }
                 event["payload"] = payload;
                 value = event;
             }
@@ -1643,6 +2086,14 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
 
         if (type == "message") {
             QJsonObject msg = payload;
+            // M7b: 分发消息不入库
+            const QString ct = msg.value("contentType").toString();
+            const QString c = msg.value("content").toString();
+            if (ct == QLatin1String("sender_key_distribution")
+                || GroupE2eeCrypto::looksLikeDistribution(c)) {
+                processGroupSenderKeyDistribution(msg);
+                continue;
+            }
             // 事件流无状态字段：按发送方推导初始状态
             const bool fromSelf = msg.value("senderId").toVariant().toLongLong() == m_userId;
             msg["status"] = fromSelf ? "sent"

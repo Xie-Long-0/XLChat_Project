@@ -125,6 +125,24 @@ add_custom_command(TARGET TestLocalStore POST_BUILD
         $<TARGET_FILE_DIR:TestLocalStore>
 )
 
+# ── TestGroupE2eeCrypto (M7b 群聊 Sender-Key E2EE 原语) ──
+add_executable(TestGroupE2eeCrypto
+    unit/TestGroupE2eeCrypto.cpp
+)
+
+target_link_libraries(TestGroupE2eeCrypto PRIVATE
+    Qt6::Test
+    XYChatCommon
+)
+
+add_test(NAME TestGroupE2eeCrypto COMMAND TestGroupE2eeCrypto)
+
+add_custom_command(TARGET TestGroupE2eeCrypto POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OPENSSL_RUNTIME_DLLS}
+        $<TARGET_FILE_DIR:TestGroupE2eeCrypto>
+)
+
 # ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
 add_executable(TestGroupRepro
     "e2e/TestGroupRepro.cpp"

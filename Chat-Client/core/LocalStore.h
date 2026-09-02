@@ -80,6 +80,20 @@ public:
     qint64 syncCursor() const;
     bool setSyncCursor(qint64 seq);
 
+    // M7b: 群聊 Sender Key 本地持久化（chainKey 经存储密钥加密）
+    bool saveSenderKey(qint64 groupId, qint64 senderUserId, const QString &senderDeviceId,
+                       const QString &keyId, const QByteArray &chainKey,
+                       const QByteArray &publicSigningKey,
+                       const QByteArray &privateSigningKey, int iteration);
+    bool loadSenderKey(qint64 groupId, qint64 senderUserId, const QString &senderDeviceId,
+                       const QString &keyId, QByteArray &chainKey,
+                       QByteArray &publicSigningKey,
+                       QByteArray &privateSigningKey, int &iteration) const;
+    // 按 groupId + senderUserId + senderDeviceId 返回最新的 keyId（若无返回空）
+    QString latestSenderKeyId(qint64 groupId, qint64 senderUserId,
+                              const QString &senderDeviceId) const;
+    bool removeSenderKeysForGroup(qint64 groupId);
+
     static QString dbFilePath(const QString &username, const QString &deviceId);
 
 private:

@@ -1,8 +1,8 @@
 # XYChat 架构概览
 
-> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新；2026-08-21 完成 M6.5（本地持久化缓存与持久化 outbox，含代码审查修复）后再次更新；同日完成 M7a 子任务一（群聊协议定义与服务端数据模型，数据库迁移至 V7）、子任务二（群组业务处理器与 fan-out）与子任务三（客户端接入与群聊 UI）后再次更新。
+> 2026-08-03 依据代码审查结果重写，并于同日完成 M5.5 安全加固后再次更新；2026-08-04 完成 M4.5（M4 遗留清理与一对一聊天完善）后再次更新；2026-08-17 完成 M6（端到端加密一对一聊天，含代码审查修复）后再次更新；2026-08-21 完成 M6.5（本地持久化缓存与持久化 outbox，含代码审查修复）后再次更新；同日完成 M7a 子任务一（群聊协议定义与服务端数据模型，数据库迁移至 V7）、子任务二（群组业务处理器与 fan-out）与子任务三（客户端接入与群聊 UI）后再次更新；2026-08-22 完成 M7b（Sender-Key 群端到端加密，含联调修复）后再次更新。
 
-## 当前组件（M6.5 完成后）
+## 当前组件（M7b 完成后）
 
 ```text
 Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
@@ -12,14 +12,14 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
-- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
-- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out），管理 session 路由与在线状态，访问 SQLite。
+- `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
+- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包），管理 session 路由与在线状态，访问 SQLite。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；
-  - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）；
+  - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）、`GroupE2eeCrypto`（M7b：Sender-Key 生成/chain-key ratchet/群消息 AES-256-GCM + Ed25519 签名/分发消息 pairwise envelope 编解码）；
   - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）。
 - `docs`：路线图、协议、安全和架构说明。
-- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层与 V7 迁移）、Security、LocalStore）。
+- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层与 V7 迁移）、Security、LocalStore、GroupE2eeCrypto（M7b 新增））；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
 
 ## 服务端运行模型
 
@@ -65,8 +65,8 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - M4.5 客户端体验完善：搜索用户直接发起对话（虚拟会话 + 首条消息 ACK 后绑定 conversationId）、发送乐观显示（发送中→已发送→已送达→已读实时流转）、显式已读回执、日期分隔线、会话选中高亮与未读角标本地实时更新、侧边栏用户信息栏与登出入口、亮/暗主题切换（`Theme.qml` darkMode 驱动 + `ThemeSettings` QSettings 持久化）。
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
-- M7a 群聊（明文，服务端与客户端均已落地）：服务端建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。客户端（子任务三）：`NetworkManager` 群组五接口 + 群消息 outbox 分流（明文直发不依赖 E2EE 引导，确定性错误移除待发项避免无限重试）；`LocalStore` 会话缓存群名/成员数（存量库幂等补列）；QML 建群（联系人多选）/群信息（成员列表/层级踢人/退群）/邀请（搜索多选）三个对话框，会话列表群样式与成员数标识，系统消息居中胶囊渲染，群聊天区顶部“暂未端到端加密”横幅。
-- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式），群消息无发送限流（留待 M11 前置项）；M7a 验收标准待双客户端联调确认。
+- M7a 群聊（明文，服务端与客户端均已落地）：服务端建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。客户端（子任务三）：`NetworkManager` 群组五接口 + 群消息 outbox 分流（明文直发不依赖 E2EE 引导，确定性错误移除待发项避免无限重试）；`LocalStore` 会话缓存群名/成员数（存量库幂等补列）；QML 建群（联系人多选）/群信息（成员列表/层级踢人/退群）/邀请（搜索多选）三个对话框，会话列表群样式与成员数标识，系统消息居中胶囊渲染。M7b 完成后群聊天区顶部“暂未端到端加密”横幅已改为群 E2EE 状态提示。
+- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式），群消息无发送限流（留待 M11 前置项）；成员加入/退出的 Sender-Key 自动 healing 与失权成员回收未实现（M7b 当前需发送方手动重新分发或重新登录触发）。
 
 ### 端到端加密（M6）
 
@@ -77,6 +77,16 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 私钥存储：`KeyStorage`（AppData/e2ee，Windows DPAPI 保护，临时文件+替换原子写入）；TOFU 指纹存于 `e2ee/trust.json`，变更时 `peerIdentityChanged` 告警；解密缓存自 M6.5 起归口本地加密库 `LocalStore`（遗留 `e2ee/<account>_<device>.cache` 首次登录时自动迁入并删除，本地库不可用时回退旧文件兼容路径）。
 - 产品取舍：历史消息不可恢复仅限真正丢失密钥材料的场景（更换设备/清数据）；同一设备登出重登由自身拷贝 + 解密缓存兜底；M6 前存量明文保持可读。
 - **限制**：仅一对一文本消息；TOFU 无带外验证；无密钥备份/设备间迁移。
+
+### 群端到端加密（M7b）
+
+- 简化 Signal Sender-Key 方案：每个发送方在每个群中独立生成一个 `SenderKey`，包含 32 字节 chain key 与 Ed25519 签名密钥对（`publicSigningKey`/`privateSigningKey`）。chain key 通过 HKDF-SHA256  ratchet 派生消息密钥（`salt="xychat-grp-chain"`），消息密钥与当前迭代次数绑定。
+- 发送链路：发送群消息前 `NetworkManager` 调用 `ensureGroupSenderKey()` 生成或加载本群 sender-key；`GroupE2eeCrypto::encryptMessage()` 用当前 chain key 派生 AES-256-GCM 消息密钥，加密明文后对 `iv || ciphertext` 做 Ed25519 签名；`encodeGroupMessage()` 将密文、IV、keyId、iteration、`senderDeviceId` 编码为 JSON envelope，经 `send_message` 以 `conversationId` 为目标发送。发送后 chain key 前 ratchet 到新值并持久化。
+- 分发链路：首次发送或 chain key 不存在时，`NetworkManager` 通过 `FetchGroupKeysRequest`（协议类型 71）获取群内所有成员 E2EE 密钥包，再为每个成员设备生成 pairwise envelope：用 M6 X25519 身份密钥/预密钥 ECDH 协商对称密钥，加密 base64 编码的 chain key；`encodeDistribution()` 将所有 pairwise 条目与发送方公钥打包为 `contentType=sender_key_distribution` 的群消息发送。接收方 `processGroupSenderKeyDistribution()` 用本机私钥解密对应条目，base64 解码后得到 32 字节 chain key，连同公钥一起存入 `LocalStore::saveSenderKey()`。
+- 接收链路：`decryptGroupMessageObject()` 解析群消息 envelope 得到 `senderDeviceId`、keyId、iteration；从 `LocalStore` 加载对应发送方的 chain key 与公钥；`GroupE2eeCrypto::decryptMessage()` 用 chain key ratchet 到消息迭代派生消息密钥，AES-256-GCM 解密并验证 Ed25519 签名；解密成功后将更新后的 chain key/iteration 写回 `LocalStore`。解密失败时 content 清空并标记 `undecryptable`，禁止 envelope 原文入库。
+- 持久化：`LocalStore` 新增 `sender_keys` 表，字段包括 `group_id`、`sender_user_id`、`sender_device_id`、`key_id`、`chain_key`、`public_signing_key`、`private_signing_key`、`iteration`，所有密钥材料以 AES-256-GCM 加密后落库。登出时保留 sender-key 材料（与 M6 解密缓存策略一致），避免重登后无法解密或签名。
+- 安全属性：服务端数据库中群消息正文为密文；篡改、错误 chain key、错误签名均导致解密失败；一对一 E2EE 与群 E2EE 使用独立密钥路径，互不影响。
+- **限制**：成员加入/退出的 Sender-Key 自动 healing 与失权成员回收未实现；当前新成员接收群 E2EE 消息需发送方手动重新分发或发送方重新登录触发。
 
 ### 客户端本地加密持久化缓存（M6.5）
 
@@ -93,7 +103,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 客户端校验服务端证书，证书错误时断开；CA 缺失拒绝连接（`XYCHAT_ALLOW_PLAINTEXT=1` 显式开发开关）。
 - 业务请求强制携带 timestamp/nonce（缺失/格式错误/超时/重复一律拒绝），nonce 由服务端全局 TTL 缓存（`NonceCache`）跨连接去重。
 - 日志脱敏；敏感内存清零。
-- **限制**：nonce 缓存为单服务器内存（重启清空）；群聊/媒体消息尚未 E2EE（M7/M8）。
+- **限制**：nonce 缓存为单服务器内存（重启清空）；媒体消息尚未 E2EE（M8）。
 
 ## 数据库 Schema（V7，M7a 迁移）
 
@@ -110,6 +120,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - `sync_events`（V4 新增）：账号级同步事件流（seq 自增, user_id, event_type, payload），索引 (user_id, seq)
 - `device_identity_keys`（V5 新增）：设备身份公钥（user_id, device_id, identity_pub, UNIQUE(user_id, device_id)）——仅存公钥
 - `prekeys`（V5 新增）：一次性预密钥公钥（user_id, device_id, pub, status: unused/claimed/used, claimed_at）——仅存公钥，认领超时回退靠 `claimed_at`（V6 迁移兼容补齐该列）
+- `sender_keys`（M7b 新增，客户端 `LocalStore` 本地表）：群 Sender-Key 本地加密存储（group_id, sender_user_id, sender_device_id, key_id, chain_key, public_signing_key, private_signing_key, iteration）——chain key 与签名密钥对经 `LocalStore` 存储密钥加密后落库，登出保留
 
 messages 表幂等唯一约束：`UNIQUE(sender_id, sender_device_id, client_message_id)`（部分索引，仅对非空幂等键生效，存量旧数据不受影响）。
 
@@ -123,9 +134,9 @@ Chat-Client
   │     ├── components/（TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton）
   │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册）
   ├── C++ 后端层
-  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密；M6.5 起接入 LocalStore 缓存与持久化 outbox；M7a 起提供群组五接口与 sendGroupMessage（outbox 分流，群消息明文直发））
+  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密；M6.5 起接入 LocalStore 缓存与持久化 outbox；M7a 起提供群组五接口与 sendGroupMessage（outbox 分流，群消息明文直发）；M7b 起实现 ensureGroupSenderKey/buildGroupSenderKeyDistribution/encryptGroupMessage/decryptGroupMessageObject 等群 Sender-Key E2EE 接口与 FetchGroupKeys 协议交互）
   │     ├── core/KeyStorage（M6：身份/预密钥私钥持久化，Windows DPAPI 保护；TOFU 指纹存储；M6.5：LocalStore 存储密钥）
-  │     ├── core/LocalStore（M6.5：按账号+设备隔离的 SQLite 加密本地缓存，M7a 含群会话字段，见上文）
+  │     ├── core/LocalStore（M6.5：按账号+设备隔离的 SQLite 加密本地缓存，M7a 含群会话字段，M7b 新增 sender_keys 表保存 chain key 与 Ed25519 签名密钥对，见上文）
   │     ├── core/ThemeSettings（QSettings 主题持久化，注册为 QML 上下文对象）
   │     └── models/User
   └── QWindowKit（QWK::Quick WindowAgent：无边框、拖拽、Snap Layout；标题栏自定义按钮需 setHitTestVisible 注册）
@@ -142,7 +153,7 @@ M7a 群聊 UI（子任务三新增）：
 
 - `ConversationList` 侧边栏新增建群按钮；会话模型携带 type/name/memberCount，群会话显示群名、成员数与圆角方形头像。
 - `MainPage` 新增三个对话框：建群（群名 + 联系人多选，打开时拉取联系人）、群信息（成员列表/角色/层级踢人/邀请入口/退群，由 get_group_info 响应驱动）、邀请（搜索用户多选，搜索结果按 searchMode 路由）。
-- `ChatView` 群会话顶部显示“群聊暂未端到端加密”横幅（高度随可见性折叠，避免私聊下锚点链残留空隙），系统消息（contentType=system）以居中胶囊渲染，发送按会话类型分流（群聊走 sendGroupMessage）。
+- `ChatView` 群会话顶部显示群 E2EE 状态横幅（M7a 阶段为“暂未端到端加密”，M7b 完成后更新为加密状态提示；高度随可见性折叠，避免私聊下锚点链残留空隙），系统消息（contentType=system）以居中胶囊渲染，发送按会话类型分流（群聊走 sendGroupMessage，M7b 启用群 E2EE 后走加密路径）。
 
 与旧文档的差异说明：
 
@@ -230,4 +241,4 @@ M6 首次实现后经代码审查发现并修复：
 2. **M4.5 已完成**：亮/暗主题切换、CMake Widgets 残留清理、搜索发起对话、乐观发送与状态流转、已读回执、会话列表/聊天对话框交互完善，并经 E2E 验证。
 3. **M6 已完成**：端到端加密一对一聊天（X25519 身份密钥/预密钥、每消息临时密钥、AES-GCM 认证加密、envelope fail-closed、TOFU、历史消息不可恢复），含审查后修复（见上表）。
 4. **M6.5 已完成**：客户端本地加密持久化缓存与持久化 outbox（`LocalStore`），重启后历史消息即刻可见、未发送消息不丢失，登出清除本地数据，含审查后修复（见上表）。
-5. **M7+**：群聊（M7a 明文群聊三个子任务均已完成，验收待双客户端联调；随后 M7b Sender Keys 群 E2EE）、媒体、搜索与通知、设备信任带外验证与密钥备份策略。
+5. **M7 已完成**：M7a 明文群聊三个子任务均已完成，M7b Sender-Key 群 E2EE 已完成并经双客户端联调验证。后续重点：媒体（M8）、搜索与通知（M10）、多端同步冲突处理（M9）、设备信任带外验证与密钥备份策略、M7b 遗留的 Sender-Key 自动 healing 与失权成员回收。

@@ -15,6 +15,8 @@ add_library(XYChatCommon STATIC
     CommonModule/encryption/EncryptionManager.h
     CommonModule/encryption/E2eeCrypto.cpp
     CommonModule/encryption/E2eeCrypto.h
+    CommonModule/encryption/GroupE2eeCrypto.cpp
+    CommonModule/encryption/GroupE2eeCrypto.h
     CommonModule/protocol/Packet.h
     CommonModule/protocol/PacketCodec.cpp
     CommonModule/protocol/PacketCodec.h

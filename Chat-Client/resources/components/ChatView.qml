@@ -13,7 +13,7 @@ Rectangle {
     property bool hasConversation: false
     // M4.5: 当前登录用户 ID，用于判断消息归属
     property int myUserId: 0
-    // M7a: 群会话状态（未端到端加密提示、成员数副标题、群信息入口）
+    // M7a: 群会话状态（E2EE 状态提示、成员数副标题、群信息入口）
     property bool isGroup: false
     property int groupMemberCount: 0
 
@@ -162,8 +162,8 @@ Rectangle {
         }
     }
 
-    // M7a: 群聊未端到端加密提示（验收要求：UI 明确提示）；
-    // 高度随可见性折叠，避免私聊下锚点链残留空隙
+    // M7b: 群聊端到端加密状态提示（M7a 阶段为“暂未端到端加密”，Sender Keys
+    // 落地后改为加密状态）；高度随可见性折叠，避免私聊下锚点链残留空隙
     Rectangle {
         id: groupBanner
         anchors.top: chatHeader.bottom
@@ -176,7 +176,7 @@ Rectangle {
 
         Label {
             anchors.centerIn: parent
-            text: "群聊暂未端到端加密，消息内容对服务端可见（M7b 将支持 Sender Keys 加密）"
+            text: "群聊消息已启用端到端加密（Sender Keys），服务端仅存储密文"
             font.pixelSize: Theme.fontSizeSmall - 1
             color: Theme.dateDividerTextColor
         }

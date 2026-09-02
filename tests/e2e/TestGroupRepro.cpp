@@ -2,8 +2,11 @@
 // 场景：A 建群并拉入 B -> A 发群消息 -> B 收到并回复（“群成员发送消息”）-> A 收到
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QElapsedTimer>
+#include <QFile>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QTextStream>
 #include <QTimer>
 #include <QDebug>
 
@@ -11,20 +14,49 @@
 
 namespace
 {
+void logLine(const QString &line)
+{
+    QFile f("M7bRepro.log");
+    if (f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        QTextStream s(&f);
+        s << QDateTime::currentDateTime().toString(Qt::ISODateWithMs)
+          << " " << line << "\n";
+    }
+}
+
+void messageHandler(QtMsgType type, const QMessageLogContext &,
+                    const QString &msg)
+{
+    const char *prefix = "[Qt]";
+    switch (type) {
+    case QtDebugMsg: prefix = "[QtDebug]"; break;
+    case QtInfoMsg: prefix = "[QtInfo]"; break;
+    case QtWarningMsg: prefix = "[QtWarning]"; break;
+    case QtCriticalMsg: prefix = "[QtCritical]"; break;
+    case QtFatalMsg: prefix = "[QtFatal]"; break;
+    }
+    logLine(QString("%1 %2").arg(prefix).arg(msg));
+}
+
 void step(const QString &text)
 {
-    qInfo().noquote() << "[Repro]" << text;
+    const QString line = "[Repro] " + text;
+    qInfo().noquote() << line;
+    logLine(line);
 }
 
 [[noreturn]] void finish(int code, const QString &text)
 {
-    qInfo().noquote() << "[Repro] RESULT:" << text;
+    const QString line = "[Repro] RESULT: " + text;
+    qInfo().noquote() << line;
+    logLine(line);
     std::exit(code);
 }
 } // namespace
 
 int main(int argc, char *argv[])
 {
+    qInstallMessageHandler(messageHandler);
     QCoreApplication app(argc, argv);
     app.setOrganizationName("XYChat");
     app.setApplicationName("XYChat");
@@ -79,11 +111,21 @@ int main(int argc, char *argv[])
         bobLoggedIn = true;
         step("bob logged in, id=" + QString::number(bob.userId()));
     });
-    // 双方都登录后再搜索建群（避免未认证时 searchUsers 被静默丢弃）
+    // 双方都登录并留出 E2EE 身份/预密钥注册时间后再搜索建群
     QTimer searchPoller;
+    QElapsedTimer loginElapsed;
+    bool loginTimerStarted = false;
     searchPoller.setInterval(200);
     QObject::connect(&searchPoller, &QTimer::timeout, [&]() {
-        if (aliceLoggedIn && bobLoggedIn && !searchStarted) {
+        if (!aliceLoggedIn || !bobLoggedIn) {
+            return;
+        }
+        if (!loginTimerStarted) {
+            loginTimerStarted = true;
+            loginElapsed.start();
+            return;
+        }
+        if (!searchStarted && loginElapsed.elapsed() > 2000) {
             searchStarted = true;
             alice.searchUsers(bobName);
         }
@@ -138,9 +180,15 @@ int main(int argc, char *argv[])
     QObject::connect(&bob, &NetworkManager::newMessageReceived, [&](const QJsonObject &msg) {
         const qint64 msgId = msg.value("messageId").toVariant().toLongLong();
         const qint64 convId = msg.value("conversationId").toVariant().toLongLong();
+        const QString contentType = msg.value("contentType").toString();
         step("bob received message id=" + QString::number(msgId)
+             + " type=" + contentType
              + " content=" + msg.value("content").toString());
         bob.ackMessage(msgId, "delivered");
+        // 系统消息不触发回复；等待收到群主的第一条 E2EE 消息后再回复
+        if (contentType == "system") {
+            return;
+        }
         if (!bobReplied) {
             bobReplied = true;
             const QString cmid = bob.sendGroupMessage(convId, "member hello");

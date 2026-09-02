@@ -16,6 +16,7 @@
 #include "KeyStorage.h"
 #include "LocalStore.h"
 #include "encryption/E2eeCrypto.h"
+#include "encryption/GroupE2eeCrypto.h"
 
 namespace
 {
@@ -186,6 +187,76 @@ private slots:
         }
         QVERIFY(foundPrivate);
 
+        store.closeAndDestroy();
+    }
+
+    // M7b: 群聊 Sender Key 持久化（chainKey、签名公私钥、iteration）
+    void senderKeyPersistsAcrossReopen()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        const auto key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        QVERIFY(key.valid);
+        QVERIFY(store.saveSenderKey(100, 7, "deviceA", key.keyId,
+                                    key.chainKey, key.publicSigningKey,
+                                    key.privateSigningKey, key.iteration));
+
+        const QString latest = store.latestSenderKeyId(100, 7, "deviceA");
+        QCOMPARE(latest, key.keyId);
+
+        QByteArray chainKey;
+        QByteArray publicKey;
+        QByteArray privateKey;
+        int iteration = -1;
+        QVERIFY(store.loadSenderKey(100, 7, "deviceA", key.keyId,
+                                  chainKey, publicKey, privateKey, iteration));
+        QCOMPARE(chainKey, key.chainKey);
+        QCOMPARE(publicKey, key.publicSigningKey);
+        QCOMPARE(privateKey, key.privateSigningKey);
+        QCOMPARE(iteration, key.iteration);
+        store.close();
+
+        // 重启后仍能读取（chainKey 与私钥经存储密钥加密落库）
+        QVERIFY(store.open(user, DeviceId));
+        QVERIFY(store.loadSenderKey(100, 7, "deviceA", key.keyId,
+                                  chainKey, publicKey, privateKey, iteration));
+        QCOMPARE(iteration, key.iteration);
+        store.closeAndDestroy();
+    }
+
+    void senderKeyLatestSelectsMostRecent()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        const auto key1 = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        const auto key2 = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        QVERIFY(store.saveSenderKey(200, 8, "deviceB", key1.keyId,
+                                    key1.chainKey, key1.publicSigningKey,
+                                    key1.privateSigningKey, 1));
+        QVERIFY(store.saveSenderKey(200, 8, "deviceB", key2.keyId,
+                                    key2.chainKey, key2.publicSigningKey,
+                                    key2.privateSigningKey, 2));
+
+        QCOMPARE(store.latestSenderKeyId(200, 8, "deviceB"), key2.keyId);
+        store.closeAndDestroy();
+    }
+
+    void senderKeyRemoveForGroupIsolated()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        const auto key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        QVERIFY(store.saveSenderKey(300, 9, "deviceC", key.keyId,
+                                    key.chainKey, key.publicSigningKey,
+                                    key.privateSigningKey, 0));
+        QVERIFY(store.removeSenderKeysForGroup(300));
+        QVERIFY(store.latestSenderKeyId(300, 9, "deviceC").isEmpty());
         store.closeAndDestroy();
     }
 

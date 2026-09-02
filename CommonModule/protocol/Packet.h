@@ -66,6 +66,9 @@ enum class MessageType : quint16
     GetGroupInfoRequest = 68,
     GetGroupInfoResponse = 69,
     GroupChangedNotification = 70, // 服务端推送：群成员变更/系统消息通知
+    // M7b - 群聊端到端加密
+    FetchGroupKeysRequest = 71,
+    FetchGroupKeysResponse = 72,
 };
 
 enum class ErrorCode : int
