@@ -1,6 +1,6 @@
 # XYChat Project
 
-XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含桌面客户端 `Chat-Client` 与 TCP 服务端 `Chat-Server`。本仓库现阶段的目标是提供稳定的工程基线，后续按 `docs/ROADMAP.md` 逐步演进协议、认证、消息与安全能力。
+XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含桌面客户端 `Chat-Client` 与 TCP 服务端 `Chat-Server`。已具备账户体系、TLS 传输安全、一对一聊天端到端加密（M6）、群聊与群聊端到端加密（M7a/M7b，Sender Keys 方案，服务端仅存储密文）、本地加密缓存与增量同步等能力。本仓库现阶段的目标是提供稳定的工程基线，后续按 `docs/ROADMAP.md` 逐步演进协议、认证、消息与安全能力。
 
 ## 环境要求
 
@@ -63,10 +63,25 @@ cmake --build build -j
 
 ## 测试
 
-配置并构建后运行：
+配置并构建后运行全部单元测试（CTest 纳入 6 套）：
 
 ```bash
 ctest --test-dir build --output-on-failure
+```
+
+| 套件 | 覆盖范围 |
+| --- | --- |
+| `TestPacketCodec` | 帧协议编解码 |
+| `TestEncryptionManager` | PBKDF2 / Token 生成 |
+| `TestDatabaseManager` | 服务端数据层（含群组与 V1-V7 迁移） |
+| `TestSecurity` | TLS 辅助 / 日志脱敏 / NonceCache 重放保护 |
+| `TestLocalStore` | 客户端本地加密缓存与持久化 outbox |
+| `TestGroupE2eeCrypto` | 群 Sender-Key 加密原语（M7b） |
+
+另有 `tests/e2e/TestGroupRepro`：双客户端群 E2EE 端到端复现工具，**不纳入 CTest**，需先启动 `Chat-Server` 后手动运行：
+
+```bash
+./build/tests/TestGroupRepro
 ```
 
 ## 开发约定

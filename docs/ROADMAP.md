@@ -1,543 +1,226 @@
 # XYChat 长期实现路线图
 
-本文档面向当前的 Qt/C++ Client + Server 基础框架，目标是逐步演进为一个“类 Telegram”的安全即时通信系统。路线图按“先稳定基础，再做通信能力，再做安全与规模化”的顺序拆分，便于长期迭代、验收和回滚。
+本文档面向 Qt/C++ Client + Server 基础框架，目标是逐步演进为一个"类 Telegram"的安全即时通信系统。路线图按"先稳定基础，再做通信能力，再做安全与规模化"的顺序推进，便于长期迭代、验收和回滚。
 
-> **2026-08-03 更新**：更正了 M3（本地缓存）、M4（亮暗主题切换）和 M5（TLS/重放保护可降级/可绕过）中被提前标记为完成的条目，并新增 **M5.5 安全加固** 里程碑；**同日 M5.5 全部任务已完成并通过自动化测试**（见下文勾选状态）。修复方向参考 Telegram（MTProto random_id 幂等、差分同步、killSession）、WhatsApp（per-recipient 回执）与 Signal（预密钥协商）的公开技术方案。
->
-> **2026-08-17 更新**：**M6 端到端加密一对一聊天已完成并通过自动化测试与代码审查**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以 envelope 密文传输且服务端 fail-closed 只存密文；设备信任采用 TOFU，历史消息明确不可恢复；审查发现的预密钥泄漏/耗尽、身份轮换静默丢消息等问题已修复并附回归测试。
->
-> **2026-08-20 更新**：双客户端同机联调发现并修复 M6 两项运行期缺陷：① 对方未上线（未注册密钥）时发送的消息被永久丢弃——改为保留 outbox 定期重试，对方首次登录后送达；② 登出重登后自己与对方的消息均无法解密——发送时追加仅身份密钥加密的自身拷贝条目（prekeyId=0），并将解密缓存按账号+设备持久化（DPAPI 保护）；另新增 V6 迁移兼容中间版本数据库。详见 ARCHITECTURE.md 修复记录。
->
-> **2026-08-21 更新**：完成路线图完成度核查（M0–M6 勾选状态与代码抽查一致，无超前虚标），并据此调整：① 新增 **M6.5 本地持久化缓存与持久化 outbox**（E2EE 下本地存储必须加密，越晚补改造成本越高，故在 M7 前落地）；② M7 群聊拆两期：**M7a 明文群聊** + **M7b Sender Keys 群 E2EE**；③ M9 范围收缩（`sync_events` 事件流与账号游标基础已在 M5.5 落地）；④ 桌面通知、简化图片消息从 M10/M8 提前，可随 M6.5 并行；⑤ M11 的结构化日志与发消息/搜索限流部分前置到 M6.5/M7 期间；⑥ 第 5 节目录结构与实际仓库同步（`CommonModule/`、仅 `tests/unit/`、暂无 `docs/DATABASE.md`）。**同日 M6.5 全部任务已完成并通过自动化测试与代码审查**（新增 LocalStore 加密本地库与持久化 outbox，见下文勾选状态与 ARCHITECTURE.md 实施记录）。
->
-> **2026-08-21 更新（二）**：**M7a 明文群聊开始实施，按约定拆为三个子任务：子任务一（服务端群组数据模型 + 协议消息定义）已完成并通过自动化测试与代码审查**（数据库迁移 V7：`conversations.name` + `conversation_members.role`；协议新增消息类型 60-70 与错误码 3009-3012；`DatabaseManager` 新增群组数据访问方法，TestDatabaseManager 新增 6 个群组用例，5 组测试套件全部通过）；子任务二（建群/成员管理/群消息收发业务与 fan-out）与子任务三（客户端 UI）待后续实施。前置项（发消息/搜索限流、结构化日志）不随本期实施。
->
-> **2026-08-21 更新（三）**：**M7a 子任务二（群组业务处理器与 fan-out）已完成并通过自动化测试与代码审查**：`RequestHandler` 新增建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息五个处理器；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后小群直推 fan-out + 全员 sync_events 兜底；成员变更产生系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合修复为按接收用户人数（新增 `receiptUserCount` 多设备去重计数），`MessageStatusUpdate` 携带送达/已读计数；审查修复了 QString→QByteArray 类型错误与系统消息事件流覆盖不全两项问题。TestDatabaseManager 新增 2 个用例（共 41 个），5 组测试套件全部通过；子任务三（客户端 UI）待实施。
->
-> **2026-08-21 更新（四）**：**M7a 子任务三（客户端接入与群聊 UI）已完成并通过构建验证与代码审查**：`NetworkManager` 新增群组五接口与群消息发送（outbox 分流：群消息明文直发不依赖 E2EE 引导，持久化 outbox 新增 conversationId 目标），`GroupChangedNotification`/系统消息接入；`LocalStore` 会话缓存新增群名/成员数字段（存量库幂等补列）；QML 新增建群/群信息/邀请三个对话框，会话列表群样式，聊天区系统消息胶囊与“群聊暂未端到端加密”横幅；审查修复了群横幅高度不折叠、确定性错误无限重试两项问题。qmllint 零错误，5 组测试套件全部通过（TestLocalStore 新增群 outbox/群会话缓存用例），服务端启动冒烟正常；M7a 验收标准待双客户端联调确认。
->
-> **2026-08-21 更新（五）**：**M7a.3 热修复（联调崩溃）**：用户反馈创建群聊后群成员发送消息时客户端崩溃（WER 记录崩溃于 `Qt6Qmld.dll QQmlNotifierEndpoint::disconnect` 与 `Qt6Cored.dll` 原子引用计数，0xc0000005 悬空访问），另伴随 `clearUserData` 报 “Driver not loaded”。定位为群消息高频触发会话列表 `clear()+全量重建` 与消息列表 add 过渡动画叠加，delegate 销毁时通知端点悬空。修复：① `ConversationList` 会话刷新改为按 conversationId 就地差分更新（set/append/remove/move 复用 delegate）；② 移除 `ChatView` 消息列表 add 过渡动画；③ `LocalStore` 加固：QSQLITE 驱动可用性早退检查、写路径统一 `ensureUsableDb()` 校验，连接意外失效时按原参数自愈重开、失败则 fail-closed 禁用缓存（消除 “database not open / Driver not loaded” 报错链）。新增临时端到端诊断工具 `tests/e2e/M7aGroupRepro`（双账号建群/收发/登出重登全链路，不纳入 CTest，需手动启动服务端）；5 组测试套件全部通过，qmllint 零错误。
->
-> **2026-08-22 更新**：**M7b Sender-Key 群端到端加密已完成，并通过自动化测试与双客户端联调**：实现简化 Signal Sender-Key 方案——每发送方每群独立生成 32 字节 chain key 与 Ed25519 签名密钥对；chain key 经 HKDF-SHA256 ratchet 派生消息密钥；消息以 AES-256-GCM 加密并由发送方私钥签名（覆盖 `iv || ciphertext`）；群消息 envelope 含 `keyId`/`iteration`/`senderDeviceId`。Sender-key 分发复用 M6 pairwise X25519 身份/预密钥 E2EE，以 `contentType=sender_key_distribution` 的群消息逐设备加密 chain key（base64 编码）。服务端新增 `FetchGroupKeysRequest/Response`（协议类型 71/72）一次性返回群内所有成员 E2EE 密钥包。客户端 `LocalStore` 新增 `sender_keys` 表加密保存 chain key、签名公私钥与迭代次数，登出保留密钥材料。修复集成缺陷：① `NetworkManager.h` 删除重复声明；② `NetworkManager.cpp` 加 `using namespace XYChat::Security`，补全私钥签名持久化与 `senderDeviceId` 嵌入 envelope，加解密后保存状态；③ `GroupE2eeCrypto::decodeDistribution` 回填 `entry.envelope.deviceId`；④ `processGroupSenderKeyDistribution` 对 base64 chain key 解码后再落库；⑤ E2E 复现跳过系统消息、等待 E2EE 就绪后再建群。新增 `TestGroupE2eeCrypto` 单元测试（9 个用例覆盖原语、ratchet、篡改/回滚拒绝、分发/群消息 envelope 编解码）与 `TestLocalStore` sender-key 持久化用例；`TestGroupRepro` 双客户端联调通过建群→分发→加密收发→登出重登→再发消息全链路，退出码 0。`ctest --output-on-failure -C Debug` 6/6 通过。M7a 验收标准经 M7b 联调一并确认通过。
+> 本文档于 2026-09-02 完全重构：已完成里程碑压缩为能力摘要（逐项勾选清单与实施流水账不再保留，历史细节经 `git log` 与 `docs/ARCHITECTURE.md` 追溯）；新增集中管理的欠账清单；M8-M11 规划按代码现状重写；原头部 11 条更新块与原 Sprint 看板合并入文末"变更记录"表。
 
-## 1. 当前基础盘点
+## 0. 文档定位与维护约定
 
-当前仓库已经具备最小化的客户端/服务端雏形：
+- **状态标注**：里程碑状态取 `已完成` / `未开始` / `进行中`；节内未实施项以"未实现"文字标注，不使用悬挂的空复选框。
+- **更新方式**：里程碑完成时同步更新四处——① 状态总表；② 已完成能力摘要；③ 欠账清单（新增或销账）；④ 变更记录表。**禁止**再向文档头部追加流水账式更新引用块。
+- **一致性要求**：涉及协议/安全/架构事实的表述必须与 `docs/PROTOCOL.md`、`docs/SECURITY.md`、`docs/ARCHITECTURE.md` 及代码一致；发现文档与代码不符时，以代码为准并在当期修正文档。
+- **完成定义**：见第 9 节；里程碑勾选"已完成"前必须通过对应自动化测试与代码审查。
 
-- 顶层工程通过 CMake 同时构建 `Chat-Client` 与 `Chat-Server` 两个子项目。
-- 客户端已经有登录窗口、主窗口、网络管理器和密码摘要工具。
-- 服务端已经有 TCP 监听、每连接请求线程、SQLite 用户表和登录校验。
-- 当前通信使用 JSON 文本直接通过 `QTcpSocket` 发送；客户端登录后发送 `type=username=password` 类 JSON 请求，服务端按 `type == "login"` 处理。
-- 当前“加密”主要是对密码做 SHA-256 摘要，尚未形成端到端加密、传输层加密、会话密钥协商、重放保护或消息级安全模型。
+## 1. 项目现状总览（截至 2026-09-02）
 
-> 结论：现阶段适合作为原型，但在协议边界、账户体系、数据库连接管理、安全存储、消息持久化、多端同步、推送与高并发方面还需要系统化重构。
+### 1.1 里程碑状态总表
 
-## 2. 总体产品目标
+| 里程碑 | 名称 | 状态 | 完成日期 | 交付摘要 |
+| --- | --- | --- | --- | --- |
+| M0 | 工程基线与可维护性 | 已完成 | 2026-07-01 | README/构建说明、`.gitignore`、`docs/` 四文档、CI、Qt Test 引入、CMake 工程统一 |
+| M1 | 网络协议层重构 | 已完成 | 2026-07-01 | `Packet`/`PacketCodec` 长度前缀帧协议、requestId 匹配、统一错误码、ping/pong 心跳与空闲超时 |
+| M2 | 账户体系与认证安全 | 已完成 | 2026-07-29 | 注册、PBKDF2-HMAC-SHA256 密码存储、session token、多设备管理、登录限流、版本化数据库迁移 |
+| M3 | 一对一文本聊天 MVP | 已完成 | 2026-07-29 | 用户搜索/联系人、会话模型、消息收发/状态/离线同步接口、客户端聊天界面 |
+| M4 | 客户端 QML UI 重构 | 已完成 | 2026-07-29 | QWindowKit 无边框窗口、Telegram 风格 QML 全套页面组件、NetworkManager QML 适配 |
+| M4.5 | M4 遗留清理与聊天完善 | 已完成 | 2026-08-04 | 亮/暗主题切换、搜索直接发起对话、乐观发送、显式已读回执，及 8 项 E2E 验证期缺陷修复 |
+| M5 | 传输层加密与会话安全 | 已完成 | 2026-08-03 | TLS 1.2+（QSslSocket）、重放保护字段、日志脱敏、安全内存 |
+| M5.5 | 安全加固（审查修复） | 已完成 | 2026-08-03 | TLS fail-closed、timestamp/nonce 强制 + 全局 TTL 去重、会话/消息先授权再查询、`clientMessageId` 幂等、per-recipient 回执模型、账号级 `sync_events` 游标 |
+| M6 | 端到端加密一对一聊天 | 已完成 | 2026-08-17 | 简化 Signal 方案：X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM envelope；服务端 fail-closed 只存密文；TOFU（2026-08-20 追加修复离线发送丢失与重登解密两项联调缺陷） |
+| M6.5 | 本地持久化缓存与 outbox | 已完成 | 2026-08-21 | `LocalStore` 按账号+设备隔离的加密本地库（会话/消息/持久化 outbox/解密缓存/同步游标），缓存先行展示 + 游标增量同步 |
+| M7a | 明文群聊 | 已完成 | 2026-08-21 | 群管理五接口（建群/邀请/退群自动转让/踢人层级保护/群信息）、群消息 fan-out + sync_events 兜底、系统消息与群变更通知、按人数回执聚合、客户端群聊 UI（2026-08-22 热修复联调崩溃：QML 会话列表差分更新、移除 add 动画、LocalStore 连接自愈） |
+| M7b | 群聊端到端加密（Sender Keys） | 已完成 | 2026-09-02 | 每发送方每群独立 chain key + Ed25519 签名，HKDF ratchet 派生消息密钥，AES-256-GCM 加密；sender-key 经 M6 pairwise E2EE 分发；`fetch_group_keys`（类型 71/72）；服务端群 envelope fail-closed 校验；DoS 上限防护（`MaxRatchetSteps=2000`/`MaxMessageIteration=1e8`）；双客户端联调通过 |
+| M8 | 媒体、文件与对象存储 | 未开始 | — | 见第 4.1 节 |
+| M9 | 多端同步与离线一致性 | 未开始 | — | 范围已按现状收缩，见第 4.2 节 |
+| M10 | 搜索、通知与体验完善 | 未开始 | — | 见第 4.3 节 |
+| M11 | 稳定性、可观测性与运维 | 未开始 | — | 登录限流已在 M2 落地，密钥拉取连接级限流已在 M6/M7b 落地，其余见第 4.4 节 |
 
-最终目标可以拆成 6 条主线：
+### 1.2 能力矩阵
 
-1. **账户与身份**：注册、登录、设备管理、会话续期、注销、找回/重置、双因素认证。
-2. **即时通信核心**：一对一聊天、群聊、消息状态、离线消息、历史同步、撤回/编辑/引用/转发。
-3. **安全通信**：TLS 传输保护、密码安全存储、设备密钥、端到端加密、密钥轮换、前向安全。
-4. **媒体与文件**：图片、语音、视频、文件、缩略图、断点续传、对象存储、内容扫描策略。
-5. **客户端体验**：联系人、会话列表、搜索、通知、主题、多语言、无障碍、崩溃恢复。
-6. **服务端工程化**：协议版本化、数据库迁移、日志监控、限流风控、测试、CI/CD、水平扩展。
+| 能力域 | 现状 |
+| --- | --- |
+| 账户与认证 | 注册/登录/登出/token 续期/`terminate_session`（仅本人其他会话）；PBKDF2 密码存储；登录失败限流（IP 5min/10 次、用户 5min/5 次）；多设备识别（`deviceId` 取自机器唯一 ID）。**未实现**：逐包验 token、`validateSession()` 回查 DB、双因素认证、注销/找回 |
+| 一对一聊天 | E2EE（envelope 密文，服务端 fail-closed）、`clientMessageId` 幂等、乐观发送 UI、per-recipient 回执（delivered/read）、消息状态实时推送、离线 outbox（加密持久化，跨重启重发） |
+| 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：成员变更密钥 healing 与失权回收、大群拉取模式、改群名接口（数据层已就绪） |
+| 本地存储 | `LocalStore`（SQLite，按账号+设备隔离）：消息/会话预览/outbox/解密缓存 AES-256-GCM 加密落库，存储密钥 DPAPI 保护；M7b 起含 `sender_keys` 表；登出清用户可见数据、保留密钥材料 |
+| 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）。**未实现**：已读状态向已读者自身其他设备同步、服务端事件保留清理、编辑/删除/置顶/静音 |
+| 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer） |
+| 客户端 UI | QML/Qt Quick + QWindowKit 无边框双窗口（登录/主窗口独立）；Telegram 风格主题（亮/暗切换持久化）；群聊三对话框（建群/群信息/邀请）；群 E2EE 状态横幅 |
 
-## 3. 架构演进原则
+## 2. 已完成能力摘要
 
-### 3.1 先定义协议，再扩展功能
+各里程碑的目标、关键交付、验证证据与已知限制。实施细节（逐项任务清单、审查修复过程）经 `git log` 与 `docs/ARCHITECTURE.md` 追溯。
 
-当前 JSON 直接 `readAll()`/`write()` 的方式在 TCP 中存在粘包、拆包和版本兼容问题。下一阶段应先建立统一协议层：
+### M0：工程基线（2026-07-01）
 
-- 每个包增加固定头：`magic`、`version`、`messageType`、`requestId`、`payloadLength`。
-- Payload 初期仍可用 JSON，后续可切换到 Protobuf/FlatBuffers。
-- 所有请求都必须有 `requestId`，便于客户端匹配响应和重试。
-- 所有服务端响应统一为 `code/message/data`。
-- 协议需要保留 `clientVersion`、`platform`、`deviceId` 字段，避免以后破坏兼容。
-
-### 3.2 客户端与服务端共享协议定义
-
-建议新增共享模块，例如：
-
-```text
-common/
-  protocol/
-    MessageTypes.h
-    Packet.h
-    PacketCodec.cpp
-    PacketCodec.h
-  crypto/
-  models/
-```
-
-这样可以避免 Client 与 Server 各自手写 JSON 字段，降低协议漂移风险。（2026-08-21：已落地为 `CommonModule/`，含 protocol/encryption/security，实际结构见第 5 节）
-
-### 3.3 安全模型分层实现
-
-不要一开始直接实现完整 Telegram 级别的加密模型，应分层推进：
-
-1. **传输层安全**：TCP 之上先启用 TLS 或改用 `QSslSocket`。
-2. **密码安全**：服务端只保存带盐、慢哈希后的密码验证数据，例如 Argon2id/bcrypt/scrypt/PBKDF2，而不是普通 SHA-256。
-3. **设备身份密钥**：每个设备生成长期身份密钥。
-4. **会话密钥协商**：登录后为设备会话建立短期密钥。
-5. **端到端加密**：一对一消息先做 E2EE，再扩展到群组。
-6. **密钥轮换与恢复**：支持新设备登录、旧设备删除、密钥备份策略。
-
-## 4. 里程碑规划
-
-## M0：工程基线与可维护性（1-2 周）
-
-**当前状态（2026-07-01）：已完成工程基线补强。**
-
-### 目标
-
-让项目能被稳定构建、运行、调试和测试，为后续重构提供安全网。
-
-### 任务
-
-- [x] 修复 README 编码，补充构建方式、运行方式、依赖版本、目录说明。
-- [x] 明确 Qt 版本、OpenSSL 版本、CMake 版本和目标平台。
-- [x] 增加 `docs/` 目录，放置架构、协议、安全文档和迭代计划。
-- [x] 增加 `.gitignore`，排除构建目录、数据库文件、临时日志、IDE 文件。
-- [x] 建立基础 CI：GitHub Actions 执行 CMake configure/build/test。
-- [x] 引入 Qt Test 单元测试框架，并覆盖公共密码摘要模块。
-- [x] 统一 CMake 工程基线：顶层公共模块、C++20、编译警告选项、测试开关。
-
-### 验收标准
-
-- [x] 新开发者按 README 可在本机配置、构建并启动服务端和客户端。
-- [x] CI 能完成一次干净 configure/build/test 流程。
-- [x] 有最少一组基础单元测试（`TestEncryptionManager`）。
-
-## M1：网络协议层重构（2-4 周）
-
-**当前状态（2026-07-01）：已完成基础协议层重构，可进入 M2 账户体系与认证安全。**
-
-### 目标
-
-解决 TCP 粘包/拆包、错误码不统一、请求响应无法匹配等基础问题。
-
-### 任务
-
-- [x] 新增 `Packet` 数据结构与 `PacketCodec`。
-- [x] 实现长度前缀帧协议，禁止直接假设一次 `readyRead` 就是一个完整 JSON。
-- [x] 增加协议版本字段。
-- [x] 增加请求 ID、响应 ID、统一错误码。
-- [x] 客户端 `NetworkManager` 改为连接状态机：未连接、连接中、已连接、登录中、已认证、断线重连。
-- [x] 服务端 `RequestHandler` 改为可处理多个连续包。
-- [x] 增加 ping/pong 心跳与空闲超时。
-
-### 验收标准
-
-- [x] 连续发送 1000 个小包不会解析错乱。
-- [x] 单个大包拆成多次到达时仍可正确解析。
-- [x] 客户端能根据 `requestId` 匹配登录响应。
-
-## M2：账户体系与认证安全（3-5 周）
-
-**当前状态（2026-07-29）：已完成账户体系与认证安全基础。**
-
-### 目标
-
-把当前演示性质的 admin 登录升级为可生产演进的账户基础。
-
-### 任务
-
-- [x] 增加注册接口：用户名/手机号/邮箱至少选择一种主标识。
-- [x] 服务端密码存储改为"随机盐 + 慢哈希 + 参数版本"（PBKDF2-HMAC-SHA256，100K 迭代）。
-- [x] 登录成功后签发 session token 或 refresh/access token。
-- [x] 服务端维护在线 session、设备 ID、登录 IP、最近活跃时间。
-- [x] 增加退出登录、强制下线、token 续期。
-- [x] 增加登录失败次数限制和冷却策略（IP 5min/10次，用户 5min/5次）。
-- [x] 数据库表拆分：`users`、`devices`、`sessions`、`login_audit`。
-- [x] 增加数据库迁移机制，禁止在运行路径里隐式创建不可控 schema。
-
-### 验收标准
-
-- [x] 不再保存或比较简单 SHA-256 密码值。
-- [x] 注册、登录、续期、退出登录都有自动化测试。
-- [x] 多设备登录可被服务端识别和管理。
-
-## M3：一对一文本聊天 MVP（4-6 周）
-
-**当前状态（2026-07-29）：已完成一对一文本聊天 MVP。**
-
-### 目标
-
-实现真正的即时通信最小闭环：用户 A 能向用户 B 发消息，B 在线即时收到，离线后上线可补收。
-
-### 任务
-
-- [x] 新增用户搜索/联系人关系。
-- [x] 新增会话模型：`conversation`、`conversation_member`。
-- [x] 新增消息表：`messages`，包含全局消息 ID、会话 ID、发送者、时间戳、状态、内容类型、内容。
-- [x] 服务端实现 `send_message`、`ack_message`、`sync_messages`。
-- [x] 客户端实现会话列表、聊天窗口、消息气泡。
-- [x] 增加消息状态：发送中、已发送、已送达、已读、失败。
-- [ ] ~~增加本地缓存，避免每次启动都全量拉取。~~（2026-08-03 审查更正：客户端无本地缓存/离线 outbox；2026-08-21 调整：移至 M6.5；同日已在 M6.5 落地，本条验收由 M6.5 承接）
-- [x] 设计消息 ID：服务端递增 ID。
-
-### 验收标准
-
-- [x] A/B 两个客户端可实时收发文本。
-- [x] B 离线时 A 发送消息，B 上线后可通过 sync 同步。
-- [ ] ~~客户端重启后仍能显示历史消息。~~（2026-08-03 审查更正：当前依赖重启后重新拉取，非本地持久化；2026-08-21 随 M6.5 本地持久化缓存落地，验收已在 M6.5 通过）
-
-## M4：客户端 QML UI 重构（4-6 周）
-
-**当前状态（2026-07-29）：已完成 QML UI 重构。**
-
-### 目标
-
-将客户端 UI 从 Qt Widgets 全面迁移到 QML，参照 Telegram 的界面风格与交互体验，使用 QWindowKit 实现跨平台无边框自定义窗口，打造现代化、流畅、美观的聊天客户端。
-
-### 技术选型
-
-- **UI 框架**：QML + Qt Quick Controls 2（替代 Qt Widgets）
-- **无边框窗口**：QWindowKit（`QWK::Quick` 模块），实现自定义标题栏、窗口拖拽、Snap Layout、系统阴影
-- **架构模式**：C++ 后端（NetworkManager / 业务逻辑）+ QML 前端（声明式 UI），通过 `Q_PROPERTY` / `Q_INVOKABLE` / `QQmlContext` 桥接
-- **样式方案**：自定义 Telegram 风格主题（配色、圆角、间距、动画）
-- **参考设计**：Telegram Desktop 的布局与交互
-
-### 任务
-
-- [x] 集成 QWindowKit 第三方库（`git clone --recursive`，CMake `find_package(QWindowKit COMPONENTS Core Quick REQUIRED)`）。
-- [x] 客户端 CMake 配置迁移：`find_package(Qt6 COMPONENTS Qml Quick REQUIRED)`，替换 `Widgets`。
-- [x] 重构 `main.cpp`：使用 `QQmlApplicationEngine` 加载 QML，注册 QWindowKit `WindowAgent`，注册 C++ 上下文属性（NetworkManager 等）。
-- [x] 实现自定义无边框窗口组件（`TitleBar.qml`）：自定义标题栏、拖拽区域、最小化/最大化/关闭按钮、窗口阴影。
-- [x] 实现登录/注册页面（`LoginPage.qml`）：Telegram 风格渐变背景、圆角输入框、登录/注册切换动画。
-- [x] 实现主界面布局（`MainPage.qml`）：左侧导航栏（头像 + 会话列表 + 搜索）+ 右侧聊天区域。
-- [x] 实现会话列表组件（`ConversationList.qml`）：头像、名称、最后消息预览、时间、未读角标、选中高亮。
-- [x] 实现聊天窗口组件（`ChatView.qml`）：消息气泡（自己/对方不同样式）、时间分隔线、滚动加载历史消息。
-- [x] 实现消息输入组件（`MessageInput.qml`）：多行输入框、发送按钮、输入状态指示。
-- [x] 实现联系人搜索与添加功能界面。
-- [x] 建立 QML 主题系统（`Theme.qml`）：集中管理颜色、字体、间距、圆角等设计 Token。（2026-08-03 审查更正：亮/暗切换未实现，仅单一 `Theme.qml`；`DarkTheme.qml`/`LightTheme.qml` 待补）
-- [x] 添加过渡动画：页面切换、消息出现、会话列表更新。
-- [x] 将现有 `NetworkManager`（C++）适配为 QML 可用的上下文对象，保持所有信号/槽兼容。
-- [x] 删除旧 Qt Widgets UI 文件（`ui/*.ui`、`views/LoginWindow.*`、`views/MainWindow.*`）。
-
-### 验收标准
-
-- [x] 客户端窗口无边框，标题栏自定义样式，支持拖拽移动、缩放、Snap Layout。
-- [x] 登录/注册流程在 QML 界面正常运行，与现有后端协议完全兼容。
-- [x] 会话列表展示、聊天消息气泡、消息发送与接收功能完整。
-- [x] 界面风格接近 Telegram：圆角气泡、合理间距、平滑动画。
-- [ ] ~~支持亮色/暗色主题切换。~~（2026-08-03 审查更正：未实现，遗留项，已移入 M4.5 阶段一执行）
-- [x] 所有现有功能（M1-M3）在 QML 界面下正常工作。
-
-## M4.5：M4 遗留清理与一对一聊天完善（1-2 周）
-
-**当前状态（2026-08-04）：已完成。清理 2026-08-03 审查遗留项，补齐 QML 客户端一对一聊天体验短板，并经 E2E 与人工验证修复全部缺陷。**
-
-### 目标
-
-清理 M4 审查遗留（亮/暗主题切换、CMake Widgets 残留），并把一对一聊天闭环提升到类 Telegram 的可用性：搜索用户直接发起对话、消息状态实时反馈、已读回执、会话列表与聊天对话框交互完善。
-
-### 阶段一：M4 遗留清理
-
-- [x] 亮/暗主题切换：`Theme.qml` 改为 `darkMode` 驱动的双配色，新增 `ThemeSettings`（QSettings 持久化），标题栏增加切换按钮。
-- [x] 移除 `Chat-Server/CMakeLists.txt` 中 `Qt6Widgets_INCLUDE_DIRS` 残留，清理 `Chat-Client/CMakeLists.txt` 对应过时注释。
-
-### 阶段二：搜索用户发起对话
-
-- [x] 点击搜索结果直接打开与该用户的聊天窗口（无既有会话时建立 conversationId=0 的虚拟会话）。
-- [x] 首条消息发送成功后绑定服务端返回的 conversationId，并刷新会话列表。
-
-### 阶段三：消息收发完善
-
-- [x] 发送乐观显示：本地立即展示“发送中”状态，随服务端 ACK 与 `MessageStatusUpdate` 推送更新为已发送/已送达/已读。
-- [x] 已读回执：打开会话、会话打开期间收到新消息时显式发送 `ack_message(read)`。
-- [x] QML 处理 `messageStatusChanged` 信号，实时更新消息气泡状态。
-
-### 阶段四：会话列表与聊天对话框设计
-
-- [x] 修复会话列表选中高亮（当前判断条件错误）。
-- [x] 消息列表增加日期分隔线。
-- [x] 侧边栏底部增加用户信息栏与登出入口。
-- [x] 新消息到达时本地更新对应会话预览与未读角标。
-
-### 验收标准
-
-- [x] 主题切换按钮可切换亮/暗主题，重启后设置保留。
-- [x] 搜索新用户点击即可进入聊天，首条消息发送成功并出现在会话列表。
-- [x] A→B 发消息：状态依次 发送中→已发送→已送达→已读；B 打开会话后 A 侧显示已读。
-- [x] 当前选中会话正确高亮；消息列表有日期分隔线；登出入口可用。
-- [x] 所有现有功能（M1-M3、M5/M5.5）在改动后正常工作。
-
-### 验证期补充修复（2026-08-04，E2E 与人工验证发现）
-
-- [x] 消息气泡渲染空白：ListView delegate 改用 Column 内联条件实例化（Loader 加载组件内 `model.*` 角色绑定会失效）。
-- [x] 会话列表时间为空：客户端读取服务端 `lastMessageAt`（ISO）字段并本地格式化（原误读不存在的 `lastMessageTime`）。
-- [x] 标题栏主题切换按钮被拖拽区吞掉点击：补 `windowAgent.setHitTestVisible()` 注册。
-- [x] 消息列表不可滚动：去掉外层 ScrollView 包 `height: contentHeight` ListView 的结构，ListView 直接填充可视区域。
-- [x] 发送消息不自动滚动到底部：50ms Timer 等待布局 + `stayAtBottom` 贴底跟随 + 手动上滚暂停贴底（`programmaticScroll` 区分程序/手动滚动）。
-- [x] 气泡宽度不自适应：MessageBubble 改为内容驱动宽度（短消息包裹文字、长消息在 `messageMaxWidth` 内自动换行）。
-- [x] 头像颜色绑定报错 `Unable to assign [undefined] to QColor`：改按 `peerUserId` 取色（delegate 移除时 `index` 为 undefined）。
-- [x] 主窗口不在系统任务栏显示：主窗口改为 `main.cpp` 独立 `engine.load()` 加载的根窗口（声明在登录窗口 QML 内会成为 transient 子窗口），按 `objectName` 查找后注入登录窗口交互。
-
-## M5：传输层加密与会话安全（2-4 周）
-
-**当前状态（2026-08-03）：TLS 与重放保护基础能力 + M5.5 强制化加固均已完成（fail-closed、必填校验、全局 TTL 去重）。**
-
-### 目标
-
-先让所有 Client-Server 通信避免明文传输，为端到端加密打基础。
-
-### 任务
-
-- [x] 服务端启用 TLS 证书，客户端启用证书校验。
-- [x] 开发环境支持自签证书，生产环境支持正式证书。
-- [x] 所有登录与消息接口迁移到 TLS 连接。
-- [x] 增加重放保护：请求时间戳、nonce、session 绑定。（M5 实现基础字段，M5.5 完成强制校验与全局 TTL 去重）
-- [x] 增加敏感日志脱敏，禁止输出密码、token、密钥和完整消息正文。
-- [x] 密钥材料使用安全内存/最小生命周期策略。
-
-### 验收标准
-
-- [x] 抓包不能直接看到登录凭据或消息正文。（M5.5 fail-closed 后重新验收：不存在静默降级路径，开发明文需显式开关）
-- [x] 证书错误时客户端明确拒绝连接或提示用户。
-- [x] 日志中不存在明文密码、token、私钥。
-
-## M5.5：安全加固（审查问题修复）（3-5 周）
-
-**当前状态（2026-08-03）：已完成。依据审查结果设立；全部 P0 与大部分 P1 修复已落地，构建通过且 4 组自动化测试全部通过；遗留项：其余命令逐包验 token；本地持久化 outbox 已在 M6.5 落地。**
-
-### 目标
-
-消除审查发现的 P0 越权与可绕过缺陷，修复 P1 的会话/同步模型问题，使已实现的账户与消息能力具备可验收的安全基线。
-
-### P0 任务
-
-- [x] 会话/消息授权：新增 `isConversationMember()` / `canAccessMessage()`，`sync_messages`、`ack_message` 及所有会话/历史接口先授权再查询，越权返回 `PermissionDenied (3006)`。
-- [x] 移除越权注销：`force_logout` 改为 `terminate_session`（仅本人其他设备/session，被终止连接由服务端断开）；管理员能力独立鉴权。
-- [x] TLS fail-closed：生产模式下 TLS 初始化失败拒绝启动、客户端无 CA 拒绝连接；开发明文模式改为显式、默认关闭的开关（服务端 `--allow-plaintext` / 客户端 `XYCHAT_ALLOW_PLAINTEXT=1`）。
-- [x] 重放保护强制化：timestamp/nonce 必填，拒绝缺失/格式错误/超时/重复请求（`ReplayRejected (1002)`）；nonce 由服务端全局 `NonceCache`（TTL 600s）跨连接去重。
-
-### P1 任务
-
-- [x] 认证语义统一（部分）：token 续期接口真正校验携带的 token；其余命令逐包验 token / TLS channel 绑定留待后续。
-- [x] 线程模型修复：发送统一投递到 handler 线程内的发送代理 QObject，消除 `sendRawData` 跨线程访问 `QSslSocket` 的风险。
-- [x] 消息幂等：发送请求新增必填 `clientMessageId`，数据库部分唯一索引 `(sender_id, sender_device_id, client_message_id)`，重试返回同一消息；客户端增加内存 outbox 与登录成功后自动重发（本地持久化 outbox 已在 M6.5 落地）。
-- [x] 回执模型：新增 `message_receipts(message_id, user_id/device_id, delivered_at, read_at)` 与只前进的成员读游标，`messages.status` 改为回执聚合展示值，并向发送方推送 `MessageStatusUpdate`。
-- [x] 同步模型：新增 `sync_events` + 账号游标接口（`sync_events` 请求/响应，消息/联系人/回执事件），实时推送仅作通知、离线由事件流兜底。
-
-### 验收标准（全部需自动化测试）
-
-- [x] 非成员访问任意会话历史/修改任意消息状态被拒绝（`conversationMembershipAuthorization` / `messageAccessAuthorization`）。
-- [x] 禁用 TLS 时服务端拒绝启动、客户端拒绝连接（fail-closed 逻辑在 `Server::start` / `NetworkManager::connectToServer`，由代码评审与启动开关验收；端到端 TLS 集成测试留待后续）。
-- [x] 缺失、重复、超时的 timestamp/nonce 请求被拒绝（`TestSecurity` nonce 系列用例）。
-- [x] 断线重试不产生重复消息（`clientMessageIdDeduplicates` + 客户端 outbox）。
-- [x] 多设备送达/已读回执正确聚合，同步游标可恢复（`receiptsAggregatePerRecipient` / `readCursorOnlyMovesForward` / `syncEventsCursorWorks`）。
-
-## M6：端到端加密一对一聊天（6-10 周）
-
-**当前状态（2026-08-17）：已完成。简化 Signal 方案落地，服务端只见密文；经代码审查后修复预密钥生命周期与并发问题，全部自动化测试通过。2026-08-20 追加修复两项联调缺陷（离线发送丢失、登出重登后无法解密，含自身拷贝条目与持久化解密缓存）。**
-
-### 目标
-
-让服务端只能转发密文，无法读取一对一消息正文。
-
-### 任务
-
-- [x] 每台设备生成身份密钥对，并向服务端注册公钥。（X25519；`register_keys` 接口，deviceId 取自 session）
-- [x] 设计设备信任模型：首次信任、二维码验证或安全码比对。（已实现 TOFU 首次信任 + 指纹变更告警；二维码/安全码带外验证留待后续）
-- [x] 实现预密钥机制：离线收信方也能建立加密会话。（批量一次性预密钥公钥，服务端认领即消费，10 分钟未消费自动回退）
-- [x] 消息使用对称密钥加密，密钥通过非对称/密钥协商建立。（每消息临时 X25519 密钥 ECDH + HKDF-SHA256 → AES-256-GCM）
-- [x] 增加消息认证码，防止篡改。（GCM 认证标签，篡改/错误密钥解密必失败，已测试）
-- [x] 增加密钥轮换与会话恢复。（每消息独立临时密钥 + 一次性预密钥实现消息级轮换；身份密钥跨会话持久化复用；主动轮换/备份留待后续）
-- [x] 客户端本地安全存储私钥，服务端只保存公钥和预密钥。（KeyStorage + Windows DPAPI；服务端仅存公钥）
-- [x] 对“新设备登录后如何解密历史消息”做明确产品取舍：不可恢复、云端加密备份或设备间迁移。（已决策：**不可恢复**，仅限更换设备/清数据场景，UI 显示“无法解密此消息”；同一设备登出重登由自身拷贝 + 持久化解密缓存兜底；备份/迁移留待后续）
-
-### 验收标准
-
-- [x] 服务端数据库中的消息正文为密文。（envelope fail-closed：非法/明文正文拒绝入库，返回 3008）
-- [x] 非收发双方设备无法解密消息。（接收方逐本机预密钥试解密；无对应私钥即失败；密钥材料不离开客户端）
-- [x] 删除某设备后，该设备无法继续接收新消息。（`removeDevice` 联动清除身份公钥与全部预密钥，无法再被认领，已测试）
-
-## M6.5：本地持久化缓存与持久化 outbox（2-3 周）
-
-**当前状态（2026-08-21）：已完成。新增 `LocalStore` 加密本地库（会话/消息/持久化 outbox/解密缓存/sync_events 游标），登录后缓存先行展示 + 游标增量同步；经代码审查修复预览覆盖/密钥覆盖/状态回退三项问题；同日联调修复运行期缺陷（登出销毁解密缓存致重登无法解密、envelope 密文伪装成正文泄漏），登出改为只清用户可见数据、解密缓存作为密钥材料保留。5 组自动化测试全部通过。提前项（桌面通知/简化图片消息）未随本期实施，仍为可选并行项。**
-
-### 目标
-
-让客户端具备本地加密持久化存储能力：启动即可离线查看历史消息、重启不丢未发送消息，为后续群聊、多端同步、本地搜索提供统一的本地数据底座。
-
-### 任务
-
-- [x] 新增客户端本地数据库（SQLite、按账号隔离）：会话、消息、联系人、回执缓存；启动后基于 `sync_events` 游标增量同步。（已落地：`LocalStore` 含会话/消息/回执状态缓存；联系人列表仍按需拉取，见遗留；游标持久化且登录后自动增量拉取，hasMore 自动续拉）
-- [x] 内存 outbox 升级为持久化 outbox：未发送消息（含 M6 的对方未注册密钥重试场景）跨重启保留并自动重发。
-- [x] 加密存储：消息明文以设备密钥加密后再落库，密钥管理复用 KeyStorage（DPAPI 保护），磁盘上不存在可读明文。（AES-256-GCM，存储密钥随机生成、DPAPI 保护；加密失败拒绝写入 fail-closed）
-- [x] M6 的解密缓存（按账号+设备持久化）与本地缓存统一归口。（迁入 LocalStore decrypt_cache 表，遗留 .cache 文件首次登录自动导入并删除；本地库不可用时回退旧路径）
-- [x] 登出/切换账号时清除本地数据。（`clearUserData()` 清消息/会话/outbox/游标；解密缓存与存储密钥属 E2EE 密钥材料必须保留，否则登出重登后预密钥已消费无法解密对方消息；`closeAndDestroy()` 仅供彻底销毁）
-- [ ] （可选并行提前项）桌面通知（原 M10）；简化图片消息（原 M8）——未随本期实施，留待后续。
-
-### 验收标准（均需自动化测试）
-
-- [x] 客户端重启后仍能显示历史消息（关闭 M3 遗留验收项）。（缓存先行展示 + 解密缓存兜底；TestLocalStore 覆盖）
-- [x] 断线/重启后 outbox 消息自动补发且不产生重复（`clientMessageId` 幂等）。
-- [x] 本地数据库文件中不存在可读的消息明文。（`messageContentEncryptedOnDisk`/`outboxContentEncryptedOnDisk` 直接校验磁盘字节）
-- [x] 登出清除本地缓存，重新登录可经增量同步恢复。（`logoutClearsUserDataButKeepsDecryptCache`；E2EE 场景下解密缓存作为密钥材料保留，重登后经其恢复明文）
-
-## M7：群聊与群组权限（拆两期）
-
-> **2026-08-21 调整**：群聊拆为 **M7a 明文群聊** 与 **M7b Sender Keys 群 E2EE** 两期——先落地群聊能力，再补端到端加密，降低单期交付风险。
-
-### M7a：明文群聊（4-6 周）
-
-**当前状态（2026-08-22）：已完成。拆三个子任务实施，三个子任务均已完成并通过自动化测试/构建验证：子任务一（服务端群组数据模型 + 协议定义）、子任务二（业务处理器与 fan-out）、子任务三（客户端接入与群聊 UI）；双客户端联调经 M7b 群 E2EE 端到端复现一并验证通过。**
-
-#### 目标
-
-支持基础群聊，并为后续频道、超级群打基础。群消息暂由服务端明文转发（同 M6 之前的一对一形态），E2EE 在 M7b 补齐。
-
-#### 任务
-
-- 增加群组、成员、角色、邀请、退群、踢人。（子任务一落地协议/数据模型，子任务二落地五个服务端处理器：建群/邀请/退群自动转让群主/踢人层级保护/群信息查询，均先授权再操作；子任务三落地客户端建群/群信息/邀请对话框与群变更推送接入）
-- 增加群消息 fan-out 策略：小群直接写成员收件箱，大群使用拉取/游标模式。（子任务二已落地小群直推：逐成员在线推送 + 全员 sync_events 兜底；大群拉取模式随规模需求再引入）
-- 群消息支持送达/已读计数。（子任务二已落地：回执按接收用户人数聚合，多设备去重，`MessageStatusUpdate` 携带 deliveredCount/readCount）
-- 群成员变更产生系统消息。（子任务二已落地：contentType=system 结构化消息 + GroupChangedNotification/group_changed 事件；子任务三客户端以居中胶囊渲染）
-- （并行可选）简化图片消息（若未随 M6.5 完成）；完整媒体能力仍归 M8。
-
-#### 验收标准
-
-- [x] 可创建群、邀请成员、发送群文本消息。（服务端/客户端均已实现并通过单元层验证；M7b 双客户端联调确认通过）
-- [x] 群成员变更后权限立即生效。（服务端已实现：变更即落库并推送，被移除者后续请求即被拒；M7b 联调确认通过）
-- [x] 离线成员上线后可同步群消息。（已实现：全员 sync_events 兜底 + 本地缓存；M7b 联调确认通过）
-- [x] UI 明确提示群聊暂未端到端加密。（子任务三已落地：群聊天区顶部横幅提示，qmllint 验证通过；M7b 完成后该横幅已由群 E2EE 状态替代）
-
-### M7b：群聊端到端加密（Sender Keys）（4-6 周）
-
-**当前状态（2026-08-22）：已完成。简化 Signal Sender-Key 方案落地，服务端只见群消息密文；经代码审查与双客户端联调修复多项集成缺陷；`ctest --output-on-failure -C Debug` 6/6 通过，`TestGroupRepro` 双客户端退出码 0。**
-
-#### 目标
-
-让群消息具备端到端加密，服务端只见密文。
-
-#### 任务
-
-- [x] 实现 Sender Keys 分发与群会话建立（发送者密钥方案，按发送者×群×设备分发）。
-  - 每发送方每群生成独立 `SenderKey`（32 字节 chain key + Ed25519 签名密钥对）。
-  - chain key 经 HKDF-SHA256 ratchet 派生消息密钥（`salt="xychat-grp-chain"`）。
-  - 群消息 envelope：AES-256-GCM 密文 + Ed25519 签名（覆盖 `iv || ciphertext`），JSON 含 `keyId`/`iteration`/`senderDeviceId`。
-- [x] 复用 M6 pairwise X25519 身份/预密钥 E2EE 分发 sender-key。
-  - chain key 经 base64 编码后逐设备加密，以 `contentType=sender_key_distribution` 的群消息发送。
-  - 服务端新增 `FetchGroupKeysRequest/Response`（协议类型 71/72）一次性返回群内所有成员 E2EE 密钥包。
-- [x] 客户端持久化：
-  - `LocalStore` 新增 `sender_keys` 表，加密保存 chain key、签名公钥、签名私钥与迭代次数。
-  - 登出保留 sender-key 密钥材料（与 M6 解密缓存一致，避免重登后无法解密/签名）。
-- [ ] 群成员加入/退出触发密钥重分发（healing）与失权成员回收。（留待后续；当前新成员需发送方手动重新分发或发送方重新登录触发）
-- [x] 复用 M6 envelope 传输与服务端 fail-closed 密文存储；群消息正文入库前校验为合法 envelope 密文。
-
-#### 验收标准
-
-- [x] 服务端数据库无法解密群消息正文。（`TestGroupRepro` 抓库验证密文；服务端对非法/明文群消息正文 fail-closed）
-- [x] 群消息加解密往返正确，篡改/错误签名/错误 chain key 均被拒绝。（`TestGroupE2eeCrypto` 覆盖）
-- [x] 一对一 E2EE 与群 E2EE 互不影响。（M6 单元测试与 M7b E2E 复现均通过）
-- [x] 登出重登后群消息仍可解密/签名发送。（`TestGroupRepro` 阶段 2 验证）
-
-## M8：媒体、文件与对象存储（4-8 周）
-
-> **2026-08-21 调整**：简化图片消息可提前至 M6.5/M7a 并行落地；本里程碑保留完整媒体能力（语音/视频/文件、断点续传、对象存储）。
-
-### 目标
-
-支持图片、语音、视频和文件消息。
-
-### 任务
-
-- 新增文件上传协议：分片、校验、断点续传。
-- 服务端文件元数据表与对象存储接口。
-- 图片缩略图、视频封面、语音时长。
-- 客户端上传/下载进度、失败重试、取消。
-- 大文件不走消息 TCP 主通道，可使用单独 HTTP(S) 上传下载服务。
-- 文件内容可选客户端加密后上传。
-
-### 验收标准
-
-- 发送 1MB 图片和 100MB 文件稳定成功。
-- 断网后恢复可续传。
-- 客户端能清理缓存并重新下载。
-
-## M9：多端同步与离线一致性（2-4 周，范围已收缩）
-
-> **2026-08-21 调整**：`sync_events` 事件流与账号游标基础已在 M5.5 落地，本里程碑收缩为客户端接入（依赖 M6.5 本地缓存）与冲突处理。
-
-### 目标
-
-同一账号多设备登录时，会话、消息、已读状态保持一致。
-
-### 任务
-
-- ~~为每个账号维护全局同步序列号。~~（M5.5 `sync_events` 已实现）
-- ~~每台设备记录最后同步游标。~~（M5.5 账号游标接口已实现；设备级游标持久化随 M6.5 本地缓存落地）
-- ~~消息、会话变更、联系人变更统一抽象为 `sync_event`。~~（M5.5 已实现消息/联系人/回执事件）
-- 客户端启动后先增量同步（复用 M6.5 本地缓存），再进入实时连接。
-- 处理冲突：编辑消息、删除消息、已读状态、置顶/静音。
-
-### 验收标准
-
-- 手机 A 已读消息后，桌面端 B 同步为已读。
-- 离线 24 小时后上线只增量同步缺失事件。
-- 服务端可清理过期事件但不破坏历史拉取。
-
-## M10：搜索、通知与体验完善（4-6 周）
-
-### 目标
-
-把 MVP 从“能用”提升到“好用”。
-
-### 任务
-
-- 客户端本地消息搜索。
-- 服务端联系人/用户名搜索。
-- 桌面通知、声音、未读角标。（2026-08-21 调整：桌面通知可提前至 M6.5 并行落地，本处保留声音/角标等完整通知配置）
-- 草稿、表情、贴纸基础能力。
-- 会话置顶、免打扰、删除会话。
-- 国际化与主题系统。
-
-### 验收标准
-
-- 用户能快速找到联系人、会话和历史消息。
-- 通知行为符合系统习惯且可配置。
-
-## M11：稳定性、可观测性与运维（持续）
-
-> **2026-08-21 调整**：结构化日志与发消息/搜索限流建议前置到 M6.5/M7 期间随功能一并落地（登录限流已在 M2 实现）；本里程碑保留其余项。
-
-### 目标
-
-为真实用户使用做好稳定性基础。
-
-### 任务
-
-- 结构化日志：请求 ID、用户 ID、设备 ID、错误码、耗时。（前置）
-- 指标监控：在线连接数、消息吞吐、失败率、延迟、数据库慢查询。
-- 崩溃捕获与客户端日志上报。
-- 限流：登录、注册、发消息、搜索、文件上传。（发消息/搜索限流前置；登录限流已在 M2 落地）
-- 备份与恢复演练。
-- 压力测试：长连接数、消息吞吐、离线同步峰值。
-
-### 验收标准
-
-- 能回答“当前多少在线用户、消息延迟多少、失败率多少”。
-- 服务端异常重启后不丢已确认消息。
-- 压测报告可指导扩容。
-
-## 5. 目录结构（2026-08-21 已与实际仓库同步）
+- 交付：README（构建/运行/依赖/目录）、`.gitignore`、`docs/` 架构/协议/安全/路线图四文档、GitHub Actions CI（configure/build/test）、Qt Test 框架与 `TestEncryptionManager`、顶层 CMake 统一（C++20、警告选项、`XYCHAT_BUILD_TESTS` 开关）。
+- 验证：新开发者按 README 可构建启动；CI 全流程通过。
+
+### M1：网络协议层（2026-07-01）
+
+- 交付：`CommonModule/protocol` 长度前缀帧协议（magic `XYCP` + version + messageType + requestId + payloadLength，payload 上限 4 MiB）；客户端连接状态机（未连接/连接中/已连接/登录中/已认证/断线重连）；服务端连续包处理；ping/pong 心跳与 90 秒空闲超时。
+- 验证：`TestPacketCodec`（连续 1000 小包、大包分片到达）。
+
+### M2：账户体系（2026-07-29）
+
+- 交付：注册（用户名主标识，邮箱/手机可选）；PBKDF2-HMAC-SHA256（100K 迭代 + 16B 随机盐 + 参数版本 `v1:`）；session token（服务端只存 SHA-256 摘要，7 天有效期）；`users`/`devices`/`sessions`/`login_audit` 表拆分；版本化迁移机制（`schema_version`）；登录限流；token 续期与 `terminate_session`。
+- 验证：`TestDatabaseManager`（注册/session/审计/迁移）、`TestEncryptionManager`（PBKDF2/常数时间比较）。
+
+### M3：一对一聊天 MVP（2026-07-29）
+
+- 交付：用户搜索、双向联系人；`conversations`/`conversation_members`/`messages` 模型；`send_message`/`ack_message`/`sync_messages`；客户端会话列表、聊天窗口、消息气泡、五态消息状态；服务端递增消息 ID。本地缓存项当时未实施，由 M6.5 承接落地。
+- 验证：`TestDatabaseManager` 消息/会话用例；双客户端实时收发与离线补收人工验证。
+
+### M4 + M4.5：QML UI（2026-07-29 / 2026-08-04）
+
+- 交付：QWindowKit 无边框窗口（自定义标题栏/拖拽/Snap Layout）；`LoginPage`/`MainPage`/`ConversationList`/`ChatView`/`MessageInput`/`MessageBubble`/`TitleBar` 组件；`Theme.qml` darkMode 双配色 + `ThemeSettings` 持久化；旧 Widgets UI 删除。M4.5 补齐：搜索直接发起对话（虚拟会话 + 首条消息 ACK 后绑定）、乐观发送、显式已读回执、日期分隔线、未读角标本地更新、登出入口；验证期修复 8 项缺陷（delegate 渲染空白、滚动/贴底、气泡自适应、头像色绑定、主窗口任务栏显示等）。
+- 验证：qmllint；M1-M3 功能在 QML 下回归通过；E2E 人工验证。
+
+### M5 + M5.5：传输安全与加固（2026-08-03）
+
+- 交付：TLS 1.2+（开发自签 CA 自动生成，SAN localhost/127.0.0.1）；fail-closed（无静默降级路径，开发明文需 `--allow-plaintext`/`XYCHAT_ALLOW_PLAINTEXT=1` 显式开关）；timestamp/nonce 强制必填 + 全局 `NonceCache`（TTL 600s、上限 10 万条、跨连接）；会话/消息接口先授权再查询（`isConversationMember`/`canAccessMessage`，越权 3006）；`force_logout` 改 `terminate_session`（仅本人会话）；handler 线程内发送代理（消除跨线程写 socket）；`clientMessageId` 幂等键 + 部分唯一索引 + 内存 outbox；`message_receipts` 回执表 + 成员读游标（只前进）；`sync_events` 账号级游标接口。
+- 验证：`TestSecurity`（nonce 系列）、`TestDatabaseManager`（越权拒绝/幂等去重/回执聚合/读游标单调/sync_events 游标）。
+- 已知限制：逐包验 token 未实施；nonce 缓存单服务器内存态；端到端 TLS 集成测试缺失。
+
+### M6：一对一 E2EE（2026-08-17，08-20 联调修复）
+
+- 交付：每设备 X25519 身份密钥 + 批量一次性预密钥（`register_keys`/`fetch_keys`，服务端只存公钥）；每消息临时密钥 ECDH + HKDF-SHA256（salt `xychat-e2ee-v1`）+ AES-256-GCM envelope（逐设备条目 + 发送方自身拷贝 `prekeyId=0`）；服务端 fail-closed（非法/明文正文拒绝入库，3008；入库与预密钥消费同事务）；预密钥生命周期（认领即消费、10 分钟超时回退、身份变更废弃旧世代、`fetch_keys` 连接级限流 60s/20 次）；TOFU 指纹 + 变更告警；私钥 `KeyStorage`（Windows DPAPI，临时文件+替换原子写入）；解密缓存持久化。产品决策：历史消息不可恢复（仅限丢失密钥材料场景），UI 显示"无法解密此消息"。
+- 验证：`TestEncryptionManager`（原语/envelope/协商全流程）、`TestDatabaseManager`（密钥管理）；双客户端联调（08-20 修复：对方未注册密钥时 outbox 保留重试不丢弃；自身拷贝 + 持久化解密缓存解决登出重登解密）。
+- 已知限制：TOFU 无带外验证；无密钥备份/设备间迁移；非 Windows 平台私钥明文回退。
+
+### M6.5：本地持久化缓存（2026-08-21）
+
+- 交付：`LocalStore`（AppData/localstore，`<username>_<deviceId>.db`）：消息/会话/持久化 outbox/解密缓存（归口替代 M6 `.cache` 文件，遗留自动迁入）/sync_events 游标；全部正文 AES-256-GCM 加密落库（存储密钥随机生成、DPAPI 保护、加密失败拒写 fail-closed）；登录后缓存先行展示 + 游标增量同步（hasMore 自动续拉）；登出清用户可见数据、保留解密缓存与存储密钥（E2EE 密钥材料，重登解密兜底）；连接失效自愈（`ensureUsableDb()` 重开，失败则禁用缓存）。
+- 验证：`TestLocalStore`（磁盘字节级密文校验、outbox 幂等、登出语义、群字段）。
+
+### M7a：明文群聊（2026-08-21，08-22 热修复）
+
+- 交付：协议消息类型 60-70 与错误码 3009-3012；数据库 V7（`conversations.name` + `conversation_members.role`）；服务端五处理器（建群：创建者 owner、成员上限 200；邀请：单批 ≤100、已在群拒绝；退群：群主自动转让最早入群成员；踢人：owner 可移除 admin/member、admin 仅 member；群信息：仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息 fan-out（在线直推 + 全员 sync_events 兜底）；成员变更系统消息（`contentType=system`）与 `GroupChangedNotification`/`group_changed` 事件；回执按接收用户人数聚合（`receiptUserCount` 多设备去重，`MessageStatusUpdate` 携带 deliveredCount/readCount）。客户端：群组五接口 + 群消息 outbox 分流、LocalStore 群字段、建群/群信息/邀请三对话框、群样式会话列表、系统消息胶囊、"暂未端到端加密"横幅（M7b 后改为已加密提示）。
+- 验证：`TestDatabaseManager` 群组 8 用例；qmllint 零错误；08-22 热修复联调崩溃（QML delegate 悬空通知端点，见变更记录）后双客户端联调通过。
+- 已知限制：大群拉取模式未实现；改群名接口未开放（`setGroupName` 数据层就绪）。
+
+### M7b：群聊 E2EE（2026-09-02 提交）
+
+- 交付：`CommonModule/encryption/GroupE2eeCrypto`（简化 Signal Sender Keys）——每发送方每群独立 `SenderKey`（32B chain key + Ed25519 签名密钥对，`keyId` = SHA-256(签名公钥) hex 前 32 字符）；chain key 经 HKDF-SHA256 ratchet（salt `xychat-grp-chain`）派生消息密钥；群消息 AES-256-GCM 加密 + Ed25519 签名（覆盖 `iv || ciphertext`）；群消息 envelope（`contentType=e2ee_group`）含 `keyId`/`iteration`/`senderDeviceId`；sender-key 分发（`contentType=sender_key_distribution`）复用 M6 pairwise E2EE 逐设备加密 chain key（base64）；服务端 `fetch_group_keys`（类型 71/72）一次性返回全群成员密钥包（共享 fetch_keys 限流窗口）；服务端对两类群正文 fail-closed 校验（非法返回 3008）；客户端 `LocalStore.sender_keys` 表加密保存 chain key/签名密钥对/迭代数，登出保留；分发消息只处理不展示不落库。安全修复：ratchet DoS 上限（`MaxRatchetSteps=2000`、`MaxMessageIteration=1e8`）。
+- 验证：`TestGroupE2eeCrypto` 20 用例（原语/ratchet/篡改与回滚拒绝/DoS 上限/envelope 编解码/fail-closed）；`tests/e2e/TestGroupRepro` 双客户端全链路（建群→分发→加密收发→登出重登→再发）退出码 0；`ctest` 6/6 通过；M7a 验收标准一并经联调确认。
+- 已知限制：成员加入/退出的密钥 healing 与失权成员回收未实现（新成员需发送方手动重新分发或重新登录触发；被移除成员未被轮换出局）。
+
+## 3. 已知欠账与风险清单
+
+集中管理所有已识别但未实施的修复/功能项；销账或新增时更新本表（优先级 P1 最高）。
+
+| 优先级 | 类别 | 条目 | 来源 | 影响/说明 |
+| --- | --- | --- | --- | --- |
+| P1 | 安全 | `RequestHandler::validateSession()` 仅查内存态（`m_currentSessionId`/`m_authenticatedUserId`），不回查 `sessions` 表 | 2026-09-02 周度审查 | token 被 `terminate_session`/过期/登出后，存量连接在其生命周期内仍可能通过校验；修复方向：逐请求回查 DB（带短 TTL 缓存）或结合逐包验 token |
+| P1 | 安全 | 除续期外命令未逐包验 token / TLS channel 绑定 | M5.5 遗留 | 认证依赖连接级内存状态，断线重连必须重新登录；与上一条同根源，宜一并设计 |
+| P1 | 功能 | 群成员变更 Sender-Key healing 与失权回收 | M7b 遗留 | 新成员可能收不到既有发送方密钥（需手动重分发/重登触发）；被移除成员保留旧 chain key（缺乏后向安全）；需设计成员变更触发的重分发与轮换 |
+| P2 | 工程 | `sync_events` 无保留清理机制 | M9 盘点 | 事件表无限增长；清理需保证落后设备可回退全量拉取（`sync_messages`/`get_conversations`）不破坏历史 |
+| P2 | 功能 | 已读状态多端同步缺失 | M9 盘点 | receipt 聚合事件只写发送方事件流；已读者自身其他设备无事件源，未读数/已读态不同步 |
+| P2 | 工程 | 发消息/搜索限流未实施 | M11 前置项（2026-08-21 曾建议随 M6.5/M7 落地，未实施） | `send_message`（私聊/群聊）与 `search_users` 无每用户频率限制 |
+| P2 | 工程 | 结构化日志未实施 | M11 前置项（同上） | 现为分散 `qDebug`/`qWarning` 文本日志，缺请求 ID/用户/设备/错误码/耗时的结构化字段（LogSanitizer 脱敏已在用） |
+| P2 | 工程 | 端到端 TLS 集成测试缺失 | M5.5 遗留 | `tests/e2e/TestGroupRepro` 为手动工具（不纳入 CTest，需手动启动服务端），无自动化 TLS 双端集成测试 |
+| P2 | 安全 | nonce 去重为单服务器内存态 | M5.5 | 服务端重启清空；多服务器部署需持久化/共享存储 |
+| P2 | 安全 | TOFU 无带外验证；无密钥备份/设备间迁移 | M6 | 首次通信无法抵抗服务端中间人；更换设备/清数据后历史消息不可恢复（产品已决策接受） |
+| P2 | 安全 | 非 Windows 平台私钥/存储密钥明文回退 | M6/M6.5 | DPAPI 仅 Windows；Linux/macOS 部署需接平台密钥环（libsecret/Keychain） |
+| P3 | 功能 | 消息编辑/删除/撤回、会话置顶/免打扰 | M9 规划 | 全新特性栈（协议 + 迁移 + 服务端 + 客户端 + UI），需单独立项 |
+| P3 | 功能 | 大群拉取/游标模式；改群名接口 | M7a 遗留 | 当前仅小群直推；`setGroupName` 数据层就绪、接口层未开放 |
+| P3 | 功能 | 桌面通知；简化图片消息 | M6.5 提前项（未实施） | 分别归属 M10/M8 完整实现 |
+| P3 | 工程 | `GroupE2eeCrypto.cpp` 使用 `QStringLiteral`，违反项目代码风格约定 | 2026-09-02 文档重构盘点 | 风格不一致（项目约定禁用该宏）；随下次触碰该文件的代码任务顺手修正 |
+
+## 4. 未来里程碑规划
+
+### 4.1 M8：媒体、文件与对象存储（4-8 周）
+
+- **目标**：支持图片、语音、视频和文件消息。
+- **依赖**：M3/M7a 消息通道（已完成）；媒体 E2EE 依赖 M6/M7b 加密基础（已完成）。
+- **任务**：
+  - 文件上传协议：分片、校验、断点续传。
+  - 服务端文件元数据表（`files`）与对象存储接口。
+  - 图片缩略图、视频封面、语音时长。
+  - 客户端上传/下载进度、失败重试、取消。
+  - 大文件不走消息 TCP 主通道，使用独立 HTTP(S) 上传下载服务。
+  - 文件内容客户端加密后上传（复用 envelope/Sender-Key 体系）。
+- **验收标准**：
+  - 发送 1MB 图片和 100MB 文件稳定成功。
+  - 断网后恢复可续传。
+  - 客户端能清理缓存并重新下载。
+
+### 4.2 M9：多端同步与离线一致性（2-4 周，范围按现状收缩）
+
+- **目标**：同一账号多设备登录时，会话、消息、已读状态保持一致。
+- **依赖**：M5.5 `sync_events`（已完成）、M6.5 本地缓存与游标（已完成）。
+- **已提前落地（不在本里程碑范围）**：
+  - 账号级全局同步序列号与设备游标（M5.5/M6.5）。
+  - 消息/联系人/回执/群变更统一 `sync_event` 抽象（M5.5/M7a）。
+  - 客户端启动后先增量同步再进入实时（M6.5：`openLocalStore` 缓存先行展示 + `syncEvents(cursor)` 增量拉取 + hasMore 自动续拉）。
+- **剩余任务**：
+  - 已读状态多端同步：成员在设备 A 已读后，其设备 B 实时同步（现状缺口：`ack_message(read)` 仅向发送方推送/写事件；方案方向：向已读者自身 `sync_events` 追加 `read_cursor` 类事件，客户端 ingest 后更新本地未读角标与消息状态）。
+  - `sync_events` 保留清理：保留期/容量策略 + 落后于清理点的设备回退全量拉取，不破坏历史（对应欠账 P2）。
+  - 冲突处理及配套特性：消息编辑/删除、会话置顶/免打扰——均为全新特性栈，**建议单独立项分批实施**（先置顶/免打扰，后编辑/删除），编辑/删除需纳入 `sync_events` 事件类型与幂等语义设计。
+- **验收标准**：
+  - 设备 A 已读消息后，同账号设备 B 同步为已读（未读角标与消息状态一致）。
+  - 离线 24 小时后上线只增量同步缺失事件；清理事件后的落后设备可回退全量拉取且不丢历史。
+  - 服务端可清理过期 `sync_events` 而不破坏 `sync_messages` 历史拉取。
+  - （特性栈立项后）编辑/删除/置顶/静音在多端间一致。
+
+### 4.3 M10：搜索、通知与体验完善（4-6 周）
+
+- **目标**：把 MVP 从"能用"提升到"好用"。
+- **依赖**：M6.5 本地缓存（本地消息搜索的数据底座，已完成）。
+- **任务**：
+  - 客户端本地消息搜索（基于 LocalStore，注意密文列需经解密缓存/索引设计）。
+  - 服务端联系人/用户名搜索增强（现有 `search_users` 基础上补分页/模糊度控制）。
+  - 桌面通知、声音、未读角标完整配置（系统托盘、通知点击定位会话）。
+  - 草稿、表情基础能力。
+  - 会话置顶、免打扰、删除会话（与 M9 特性栈协同立项，避免重复设计）。
+  - 国际化与主题系统扩展。
+- **验收标准**：
+  - 用户能快速找到联系人、会话和历史消息。
+  - 通知行为符合系统习惯且可配置。
+
+### 4.4 M11：稳定性、可观测性与运维（持续）
+
+- **目标**：为真实用户使用做好稳定性基础。
+- **已提前落地**：登录限流（M2）；`fetch_keys`/`fetch_group_keys` 连接级限流（M6/M7b）。
+- **说明**：结构化日志与发消息/搜索限流曾于 2026-08-21 建议前置到 M6.5/M7 期间，未随期实施，现列为独立欠账（见第 3 节 P2），可按第 5 节顺序提前落地，不必等 M11 整体启动。
+- **任务**：
+  - 结构化日志：请求 ID、用户 ID、设备 ID、错误码、耗时（配合 LogSanitizer 脱敏）。
+  - 指标监控：在线连接数、消息吞吐、失败率、延迟、数据库慢查询。
+  - 崩溃捕获与客户端日志上报。
+  - 限流：发消息、搜索、文件上传（登录限流已有）。
+  - 备份与恢复演练。
+  - 压力测试：长连接数、消息吞吐、离线同步峰值。
+- **验收标准**：
+  - 能回答"当前多少在线用户、消息延迟多少、失败率多少"。
+  - 服务端异常重启后不丢已确认消息。
+  - 压测报告可指导扩容。
+
+## 5. 推荐执行顺序（2026-09-02 重排）
+
+下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**：
+
+1. **`validateSession()` 回查 DB 修复**（P1 安全欠账，改动小，可单独实施或与后续任一项合并）。
+2. **M11 前置两项：发消息/搜索限流 + 结构化日志**（服务端横切能力，越早落地后续功能越早受益）。
+3. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理**（收掉 M9 三条基础验收）。
+4. **M7b healing：成员变更 Sender-Key 重分发与失权回收**（群 E2EE 安全闭环）。
+5. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
+6. **M8 媒体文件**。
+7. **M10 搜索/通知/体验**。
+
+## 6. 目录结构（2026-09-02 与实际仓库同步）
 
 ```text
 XYChat_Project/
   3rdparty/               # 预编译依赖：QWindowKit、OpenSSL、zlib（include/lib/bin/src）
-  CommonModule/           # 客户端/服务端共享模块（原规划的 common/，实际落地名称）
-    protocol/             # Packet/PacketCodec
-    encryption/           # EncryptionManager/E2eeCrypto
+  CommonModule/           # 客户端/服务端共享模块
+    protocol/             # Packet/PacketCodec（消息类型 1-72，错误码 1000-9002）
+    encryption/           # EncryptionManager/E2eeCrypto(M6)/GroupE2eeCrypto(M7b)
     security/             # LogSanitizer/SecureMemory/TlsHelper
   Chat-Client/
-    core/                 # C++ 后端（NetworkManager/KeyStorage/ThemeSettings）
+    core/                 # NetworkManager/KeyStorage/LocalStore/ThemeSettings
     models/               # 数据模型
-    resources/            # QML 界面与资源
-      pages/              # LoginPage/MainPage 等页面
-      components/         # TitleBar/ConversationList/ChatView/MessageInput/MessageBubble
+    resources/
+      pages/              # LoginPage/MainPage/MainWindow
+      components/         # TitleBar/ConversationList/ChatView/MessageInput/MessageBubble/QWKButton
       theme/              # Theme.qml（darkMode 双配色）
       icons/
       main.qml
@@ -545,149 +228,65 @@ XYChat_Project/
     main.cpp
   Chat-Server/
     core/                 # Server/RequestHandler/NonceCache
-    database/             # DatabaseManager 与迁移
+    database/             # DatabaseManager 与迁移（当前 V7）
     main.cpp
-  docs/
-    ARCHITECTURE.md
-    PROTOCOL.md
-    ROADMAP.md
-    SECURITY.md           # 暂无 DATABASE.md，随后续数据库文档补齐
+  docs/                   # ARCHITECTURE/PROTOCOL/ROADMAP/SECURITY
   tests/
-    unit/                 # 集成测试目录待端到端 TLS 集成测试时新增
+    unit/                 # TestPacketCodec/TestEncryptionManager/TestDatabaseManager/
+                          # TestSecurity/TestLocalStore/TestGroupE2eeCrypto（均纳入 CTest）
+    e2e/                  # TestGroupRepro（双客户端群 E2EE 复现，手动运行，不纳入 CTest）
+  certs/                  # 开发证书生成脚本（运行时证书自动生成于可执行文件同级 certs/）
 ```
 
-## 6. 数据库演进建议
+## 7. 数据库演进
 
-初期可继续使用 SQLite 方便开发，但要尽早抽象 Repository/DAO，避免业务逻辑直接写 SQL。中长期如果服务端需要多人并发和部署，应迁移到 PostgreSQL/MySQL。
+- **服务端**（SQLite，版本化迁移，当前 V7）：`schema_version`、`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`（V7 增 `name`）、`conversation_members`（V7 增 `role`）、`messages`、`message_receipts`、`sync_events`、`device_identity_keys`（M6，仅公钥）、`prekeys`（M6，仅公钥）。中长期若需多人并发/多实例部署，迁移 PostgreSQL/MySQL，并尽早抽象 Repository/DAO。
+- **客户端 LocalStore**（SQLite，按账号+设备隔离，正文加密落库）：`schema_meta`、`messages`、`conversations`（含群名/成员数）、`outbox`（含 `conversation_id`）、`decrypt_cache`、`meta`（同步游标）、`sender_keys`（M7b：chain key/Ed25519 签名密钥对/迭代数，登出保留）。
 
-建议核心表：
-
-- `users`：用户基础信息。
-- `devices`：设备公钥、设备名称、平台、状态。
-- `sessions`：登录会话、token 哈希、过期时间。
-- `contacts`：联系人关系。
-- `conversations`：会话基础信息。
-- `conversation_members`：会话成员和权限。
-- `messages`：消息主体、密文、状态、时间。
-- `message_receipts`：送达/已读回执。
-- `sync_events`：多端同步事件流。
-- `files`：文件元数据、对象存储位置、校验值。
-- `audit_logs`：安全审计日志。
-
-## 7. 安全注意事项
+## 8. 安全注意事项
 
 - 不要把 SHA-256 当作密码存储方案；它太快，不适合抵抗离线撞库。
 - 不要自己设计未经验证的密码学协议；优先参考成熟方案和库。
 - 不要在日志中输出密码、token、私钥、验证码、完整密文密钥材料。
-- 不要把服务端能解密的“普通加密聊天”宣传成端到端加密。
+- 不要把服务端能解密的"普通加密聊天"宣传成端到端加密。
 - 端到端加密需要明确密钥验证、设备更换和历史消息恢复策略。
 - 对所有外部输入做长度限制、格式校验和速率限制。
-
-## 8. 推荐近期执行顺序
-
-如果只看接下来 4-6 周，建议按以下顺序执行：
-
-1. ~~修 README、`.gitignore`、构建说明和基础 CI。~~（M0 已完成）
-2. ~~完善 `docs/PROTOCOL.md` 中的长度前缀帧协议、统一错误码和兼容策略。~~（M1 已完成）
-3. ~~实现 `PacketCodec`，替换 Client/Server 直接 JSON 读写。~~（M1 已完成）
-4. ~~重构登录接口，加入 `requestId` 和标准响应结构。~~（M1 已完成）
-5. ~~增加注册接口和安全密码存储。~~（M2 已完成）
-6. ~~新增消息表与一对一文本消息接口。~~（M3 已完成）
-7. ~~客户端实现聊天窗口的最小收发闭环。~~（M3 已完成）
-8. ~~集成 QWindowKit，重构客户端 UI 为 QML 实现。~~（M4 已完成）
-9. ~~实现 Telegram 风格 QML 界面：无边框窗口、会话列表、聊天气泡、主题系统。~~（M4 已完成，亮暗切换遗留）
-10. ~~改用 `QSslSocket` 或等价 TLS 通道。~~（M5 基础完成，降级缺陷已在 M5.5 修复）
-11. ~~M5.5 P0 修复：会话/消息授权、移除越权注销、TLS fail-closed、重放保护强制化，逐项附测试。~~（已完成）
-12. ~~M5.5 P1 修复：token 语义、线程模型、消息幂等键与 outbox、回执表、sync_events 游标同步。~~（已完成，逐包验 token 遗留；本地持久化 outbox 移至 M6.5）
-13. ~~M4 遗留清理：亮/暗主题切换、移除 CMake 中 `Qt6::Widgets` 链接。~~（M4.5 已完成）
-14. ~~M6 端到端加密一对一聊天：身份密钥/预密钥注册与拉取、envelope 加密收发、TOFU、历史消息不可恢复决策。~~（已完成，审查问题已修复）
-15. ~~M6.5 本地持久化缓存与持久化 outbox（加密存储；可并行提前桌面通知与简化图片消息）。~~（已完成；提前项未实施，仍为可选）
-16. ~~M7a 明文群聊 → M7b Sender Keys 群 E2EE。~~（均已完成，M7b 经双客户端联调验证）
-17. M9 多端同步（范围收缩，依赖 M6.5 本地缓存）；期间前置落地 M11 的结构化日志与发消息/搜索限流。
+- ratchet/循环类解密路径必须设步数与参数上限（M7b DoS 教训：恶意 `iteration` 可迫使接收端长时间运算）。
 
 ## 9. 每个迭代的完成定义
 
 每个功能迭代都应同时交付：
 
-- 协议文档更新。
+- 协议文档更新（`docs/PROTOCOL.md`）。
 - 数据库迁移脚本或 schema 变更说明。
 - 服务端处理逻辑。
 - 客户端调用与 UI。
 - 单元测试或集成测试。
 - 错误码和日志。
-- 安全影响说明。
+- 安全影响说明（`docs/SECURITY.md`）。
+- 本路线图状态同步（状态总表 + 能力摘要 + 欠账清单 + 变更记录）。
 
 ## 10. 不建议现在立刻做的事
 
 - 不建议一开始就做超大规模分布式架构；先把单机可靠性做好。
 - 不建议过早引入复杂微服务；当前模块化单体更适合快速迭代。
-- 不建议在协议未稳定时做过度复杂的 UI 动效和装饰。
+- 不建议在协议未稳定时做过度复杂的 UI 动效和装饰（M7a 热修复教训：模型高频搅动 + 过渡动画曾致 delegate 悬空崩溃）。
 - 不建议自行发明完整端到端加密协议；应在充分调研后实现。
 - 不建议把文件传输塞进主聊天长连接；大文件应走独立上传下载通道。
 
-## 11. 建议的第一张任务看板
+## 11. 变更记录
 
-### Sprint 1：工程与协议基础
+原头部流水账更新块与原 Sprint 看板（Sprint 1-6，均已完成）合并为本表；详细过程经 `git log` 追溯。
 
-- [x] 修复 README 并补充环境说明。
-- [x] 增加 `.gitignore`。
-- [x] 编写 `docs/PROTOCOL.md`。
-- [x] 增加 `Packet`/`PacketCodec`。
-- [x] 改造登录请求为帧协议。
-- [x] 增加协议解析单元测试。
-
-### Sprint 2：认证基础
-
-- [x] 增加注册接口。
-- [x] 改造密码存储（PBKDF2-HMAC-SHA256 + 随机盐 + 参数版本）。
-- [x] 增加 session token。
-- [x] 增加退出登录接口。
-- [x] 增加登录失败限流。
-- [x] 增加数据库迁移机制。
-- [x] 增加 Token 续期和强制下线。
-
-### Sprint 3：一对一消息 MVP
-
-- [x] 增加消息数据库表。
-- [x] 增加发送消息接口。
-- [x] 增加离线消息同步接口。
-- [x] 客户端新增聊天界面。
-- [x] 客户端显示消息状态。
-
-### Sprint 4：QML UI 重构（Telegram 风格）
-
-- [x] 集成 QWindowKit 第三方库（CMake 子项目或预编译）。
-- [x] 客户端 CMake 迁移：Qt6 Qml/Quick 模块替换 Widgets。
-- [x] 重构 `main.cpp`：`QQmlApplicationEngine` + QWindowKit `WindowAgent` 初始化。
-- [x] 实现 `TitleBar.qml` 自定义无边框标题栏组件。
-- [x] 实现 `LoginPage.qml` 登录/注册页面。
-- [x] 实现 `MainPage.qml` 主界面布局（左侧导航 + 右侧聊天）。
-- [x] 实现 `ConversationList.qml` 会话列表组件。
-- [x] 实现 `ChatView.qml` 聊天消息气泡视图。
-- [x] 实现 `MessageInput.qml` 消息输入组件。
-- [x] 建立 `Theme.qml` 主题系统（亮色/暗色）。
-- [x] 适配 `NetworkManager` C++ 对象到 QML 上下文。
-- [x] 删除旧 Qt Widgets UI 文件。
-
-### Sprint 5：TLS 与安全加固
-
-- [x] 改用 `QSslSocket` 或等价 TLS 通道。
-- [x] 增加开发证书加载方式。
-- [x] 日志脱敏。
-- [x] 请求 nonce 与重放保护。（M5 基础字段 + M5.5/Sprint 6 强制校验与全局 TTL 去重，已完成）
-- [x] 编写安全测试用例。
-
-### Sprint 6：审查问题修复（M5.5，已完成）
-
-依据审查结果与主流 IM 最佳实践（Telegram random_id 幂等/差分同步/killSession、WhatsApp per-recipient 回执、Signal 预密钥）设立：
-
-- [x] 新增 `isConversationMember()` / `canAccessMessage()`，会话/回执/历史接口先授权再查询。
-- [x] `force_logout` 改为仅注销本人其他设备的 `terminate_session`。
-- [x] TLS fail-closed：初始化失败拒绝启动/连接，开发明文模式显式且默认关闭。
-- [x] timestamp/nonce 强制必填 + 拒绝重复/超时，nonce 全局 TTL 缓存去重（单服务器内存，多服务器部署时再持久化）。
-- [x] 认证 token 语义统一（续期真正校验 token；其余命令逐包验 token 留待后续）。
-- [x] `RequestHandler` 线程模型修复（handler 线程内发送代理对象，socket 只在所属线程访问）。
-- [x] `clientMessageId` 幂等键 + 部分唯一索引 + 客户端内存 outbox（本地持久化已在 M6.5 落地）。
-- [x] `message_receipts` 回执表与成员读游标，`messages.status` 改为回执聚合展示值。
-- [x] `sync_events` 账号级游标同步接口（消息/联系人/回执事件）。
-- [x] 补齐越权拒绝、nonce 拒绝/过期、重试去重、回执聚合、读游标单调等自动化测试（端到端 TLS 集成测试留待后续）。
+| 日期 | 事件 | 摘要 |
+| --- | --- | --- |
+| 2026-07-01 | M0/M1 完成 | 工程基线与协议层重构落地 |
+| 2026-07-29 | M2/M3/M4 完成 | 账户体系、一对一聊天 MVP、QML UI 重构落地 |
+| 2026-08-03 | 审查更正 + M5/M5.5 完成 | 更正 M3/M4/M5 中被提前标记完成的条目；新增并完成 M5.5 安全加固（fail-closed/nonce 强制/授权/幂等/回执/sync_events） |
+| 2026-08-04 | M4.5 完成 | 亮暗主题、搜索发起对话、乐观发送、已读回执及 8 项验证期缺陷修复 |
+| 2026-08-17 | M6 完成 | 一对一 E2EE（简化 Signal），审查修复预密钥泄漏/耗尽、身份轮换静默丢消息 |
+| 2026-08-20 | M6 联调修复 | 离线发送保留重试不丢弃；自身拷贝条目 + 持久化解密缓存解决登出重登解密；V6 迁移 |
+| 2026-08-21 | 路线图调整 + M6.5/M7a 完成 | 新增 M6.5；M7 拆 M7a/M7b；M9 范围收缩；M6.5 落地；M7a 三子任务（协议与数据模型/服务端处理器与 fan-out/客户端 UI）落地 |
+| 2026-08-22 | M7a.3 热修复 + M7b 实现 | 修复群聊联调崩溃（WER 定位 QML delegate 悬空通知端点：会话列表 clear+全量重建改差分更新、移除消息列表 add 动画、LocalStore 连接自愈与驱动检查，提交 `bafd4f6`）；M7b Sender-Key 群 E2EE 实现并双客户端联调通过（代码随 2026-09-02 安全修复后一并提交 `c806d90`） |
+| 2026-08-26 | 安全审查 | 发现 GroupE2eeCrypto ratchet 循环无上限（DoS）、服务端群消息缺 envelope fail-closed 校验、`validateSession()` 仅查内存态三项问题 |
+| 2026-09-02 | 安全修复 + M7b 入库 + 文档重构 | DoS 上限（`MaxRatchetSteps`/`MaxMessageIteration`）与服务端群 envelope fail-closed 落地（`TestGroupE2eeCrypto` 扩至 20 用例）；群聊横幅改为"已启用端到端加密"；M7b 连同修复提交（`c806d90`）；周度审查确认欠账清单；ROADMAP 完全重构（本版本），`validateSession()` 修复仍待实施 |

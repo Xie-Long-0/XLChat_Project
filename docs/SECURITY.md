@@ -1,6 +1,6 @@
 # XYChat 安全文档
 
-## 当前安全状态（M7a 全部子任务完成后）
+## 当前安全状态（M7b 完成后，2026-09-02 对齐）
 
 ### 端到端加密（M6）
 
@@ -28,6 +28,18 @@
 - **幂等防重**：持久化 outbox 重发沿用 `clientMessageId` 服务端幂等去重，重启/断线重连不产生重复消息。
 - **密文不落库**：解密失败的 envelope 原文绝不作为正文写入本地库（统一清空并标记 undecryptable），历史污染行在打开时自动检出并修复，避免密文伪装成正文泄漏到 UI。
 - **边界**：本地缓存为展示层缓存，权威数据以服务端为准；拥有本机用户权限者可经 DPAPI 还原存储密钥进而读取缓存（与主流 IM 本地存储模型一致，不抵抗本机管理员）。
+
+### 群聊端到端加密（M7b）
+
+群消息采用简化 Signal Sender-Key 方案，服务端只见密文：
+
+- **密钥体系**：每个发送方在每个群独立生成 SenderKey（32 字节 chain key + Ed25519 签名密钥对，`keyId` = SHA-256(签名公钥) hex 前 32 字符）；chain key 经 HKDF-SHA256 ratchet（salt `xychat-grp-chain`）逐条派生消息密钥，具备链式前向安全。
+- **消息加密与认证**：AES-256-GCM（随机 12B IV）加密，发送方 Ed25519 私钥签名覆盖 `iv || ciphertext`，接收方验签失败/iteration 回滚/篡改均拒绝解密。
+- **密钥分发**：chain key 复用 M6 pairwise E2EE（X25519 身份/预密钥）逐成员逐设备加密，以 `contentType=sender_key_distribution` 群消息投递；`fetch_group_keys` 仅限群成员且与 `fetch_keys` 共享连接级限流（60s/20 次），防预密钥池耗尽。
+- **DoS 防护**：单次解密 ratchet 跳跃上限 `MaxRatchetSteps = 2000`，envelope `iteration` 绝对上界 `MaxMessageIteration = 1e8`；恶意超大 iteration 在触发任何 HKDF 运算前即被拒绝（2026-09-02 安全审查修复）。
+- **服务端 fail-closed**：`e2ee_group` 与 `sender_key_distribution` 正文入库/fan-out 前强制 decode 校验（含 `senderDeviceId` 非空、条目非空、`groupId` 与会话一致），非法返回 `E2eeInvalidEnvelope (3008)`，无静默放行路径；群系统消息（`contentType=system`）仅含元数据不含用户正文，不加密。
+- **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。
+- **遗留限制**：成员变更的密钥 healing 与失权回收未实现——新成员需发送方手动重新分发或重新登录触发；被移除成员保留既有 chain key，可继续解密后续消息（缺乏后向安全，已列入 ROADMAP 欠账清单 P1）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。
 
 ### 传输层安全 (TLS)
 
@@ -88,7 +100,7 @@
 - 每个线程使用独立数据库连接名，避免多线程竞争；写并发启用 5 秒 busy timeout。
 - 表结构：`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`、`conversation_members`、`messages`、`message_receipts`、`sync_events`；M6 新增 `device_identity_keys`（仅存身份公钥）、`prekeys`（仅存预密钥公钥，服务端不接触任何私钥）。
 - Session 表存储 token 哈希而非明文。
-- M6 起新消息的 `messages.content` 为 E2EE envelope 密文；M6 前的存量消息为明文（历史遗留，不做转换）。
+- M6 起新私聊消息的 `messages.content` 为 pairwise E2EE envelope 密文；M7b 起新群消息为 `e2ee_group`/`sender_key_distribution` envelope 密文；M6/M7a 时期的存量明文消息保持原样（历史遗留，不做转换）。
 
 ### 传输层
 
@@ -100,8 +112,8 @@
 ## 风险
 
 - 开发环境使用自签证书，生产环境必须替换为正式 CA 证书。
-- Session token 当前通过 handler 内存状态验证，除续期外未逐包校验。
-- 群聊与媒体消息尚未 E2EE（M7b/M8），服务端仍可见其明文：M7a 明文群聊已全链路落地（服务端处理器 + 客户端 UI，子任务一/二/三），群消息以明文传输与存储，属阶段性形态，客户端 UI 已明确提示；群组接口均遵循先授权再操作（仅成员可发言/邀请/查询，踢人带角色层级保护），输入长度与批量大小受限（群名 ≤64、单批邀请 ≤100、群成员 ≤200、群消息 ≤16384 字符）；客户端本地缓存的群消息/群会话同样经存储密钥加密落库。
+- Session token 当前通过 handler 内存状态验证，除续期外未逐包校验；且 `validateSession()` 不回查 `sessions` 表，token 被终止/过期后存量连接在其生命周期内仍可能通过校验（2026-09-02 周度审查确认，待修复，见 ROADMAP 欠账清单 P1）。
+- 媒体消息尚未 E2EE（M8 目标）。群聊已经 M7b 实现 Sender-Key E2EE，但存在遗留限制：成员变更的密钥 healing 与失权回收未实现（被移除成员可继续解密后续群消息，新成员需发送方手动重分发或重登触发）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。群组接口均遵循先授权再操作（仅成员可发言/邀请/查询，踢人带角色层级保护），输入长度与批量大小受限（群名 ≤64、单批邀请 ≤100、群成员 ≤200、群消息 ≤16384 字符）；客户端本地缓存的群消息/群会话与 sender-key 同样经存储密钥加密落库。
 - 设备信任为 TOFU，首次通信无法抵抗服务端中间人；需后续引入安全码带外验证。
 - 客户端私钥文件在非 Windows 平台为明文存储（仅 Windows 有 DPAPI 保护）；LocalStore 存储密钥与解密缓存同受此限制。
 - 本地缓存（M6.5）含经存储密钥加密的消息明文，拥有本机用户权限者可经 DPAPI 还原后读取，与主流 IM 本地存储模型一致。
@@ -109,8 +121,10 @@
 
 ## 后续要求
 
+- 认证加固：`validateSession()` 回查 `sessions` 表（可带短 TTL 缓存）；全部命令逐包携带并验证 access token 或 TLS channel 绑定（撤销即时生效）。
 - 设备信任升级：安全码/二维码带外验证；密钥备份与设备间迁移策略。
-- 群聊 E2EE（发送者密钥方案，M7）；媒体文件客户端加密上传（M8）。
+- 群成员变更的 Sender-Key healing 与失权成员回收（M7b 遗留，后向安全闭环）；群路径收紧为拒绝 `text` 明文。
+- 媒体文件客户端加密上传（M8）。
 - 后续可考虑将 PBKDF2 升级为 Argon2id。
 - 生产部署时应启用证书自动续期或 ACME 协议。
 - 可考虑增加 HSTS 或证书固定 (Certificate Pinning) 策略。
