@@ -78,6 +78,7 @@ enum class ErrorCode : int
     InvalidRequest = 1000,
     UnsupportedVersion = 1001,
     ReplayRejected = 1002,
+    RateLimited = 1003,            // 非登录类请求频率超限（发消息/搜索/密钥拉取）
     // 2xxx: 认证相关
     AuthenticationFailed = 2001,
     AccountAlreadyExists = 2002,

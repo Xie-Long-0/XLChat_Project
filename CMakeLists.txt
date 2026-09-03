@@ -26,6 +26,8 @@ add_library(XYChatCommon STATIC
     CommonModule/security/SecureMemory.h
     CommonModule/security/LogSanitizer.cpp
     CommonModule/security/LogSanitizer.h
+    CommonModule/security/StructuredLogger.cpp
+    CommonModule/security/StructuredLogger.h
 )
 
 target_include_directories(XYChatCommon PUBLIC

@@ -35,6 +35,7 @@ set(HEADERS
     core/Server.h
     core/RequestHandler.h
     core/NonceCache.h
+    core/RateWindow.h
     database/DatabaseManager.h
 )
 

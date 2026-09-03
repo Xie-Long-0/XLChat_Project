@@ -1,6 +1,10 @@
 #include "Server.h"
 #include "RequestHandler.h"
 #include "TlsHelper.h"
+#include "StructuredLogger.h"
+
+using XYChat::Security::StructuredLogger;
+using XYChat::Security::LogLevel;
 
 void ConnectionServer::incomingConnection(qintptr socketDescriptor)
 {
@@ -95,8 +99,9 @@ void Server::onUserLoggedIn(qint64 userId, qint64 sessionId, const QString &devi
     m_sessionHandlers[sessionId] = handler;
     m_handlerUsers[handler] = userId;
 
-    qDebug() << "[Server] User" << userId << "online. Session:" << sessionId
-             << "Total online:" << onlineUserCount();
+    StructuredLogger::event(LogLevel::Info, "session.online")
+        .userId(userId).field("sessionId", sessionId)
+        .field("onlineUsers", onlineUserCount()).write();
 }
 
 void Server::onUserLoggedOut(qint64 userId, qint64 sessionId)
@@ -112,14 +117,16 @@ void Server::onUserLoggedOut(qint64 userId, qint64 sessionId)
                 ++it;
             }
         }
-        qDebug() << "[Server] User" << userId << "force logged out. All sessions cleared.";
+        StructuredLogger::event(LogLevel::Info, "session.offline")
+            .userId(userId).field("reason", "all_sessions_cleared").write();
     } else {
         m_onlineSessions[userId].remove(sessionId);
         if (m_onlineSessions[userId].isEmpty()) {
             m_onlineSessions.remove(userId);
         }
         m_sessionHandlers.remove(sessionId);
-        qDebug() << "[Server] User" << userId << "session" << sessionId << "ended.";
+        StructuredLogger::event(LogLevel::Info, "session.offline")
+            .userId(userId).field("sessionId", sessionId).write();
     }
 }
 
@@ -149,7 +156,8 @@ void Server::onHandlerFinished()
         }
     }
 
-    qDebug() << "[Server] Handler finished. Total online users:" << onlineUserCount();
+    StructuredLogger::event(LogLevel::Info, "handler.finished")
+        .field("onlineUsers", onlineUserCount()).write();
 }
 
 int Server::onlineUserCount() const
@@ -191,6 +199,7 @@ void Server::onSessionTerminated(qint64 sessionId)
     auto handlerIt = m_sessionHandlers.find(sessionId);
     if (handlerIt != m_sessionHandlers.end()) {
         handlerIt.value()->disconnectClient();
-        qDebug() << "[Server] Session" << sessionId << "terminated, disconnecting client.";
+        StructuredLogger::event(LogLevel::Info, "session.force_disconnect")
+            .field("sessionId", sessionId).write();
     }
 }

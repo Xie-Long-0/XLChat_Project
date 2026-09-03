@@ -3,13 +3,19 @@
 #include <QFile>
 #include <QSslCertificate>
 #include <QSslKey>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 
 #include "LogSanitizer.h"
 #include "SecureMemory.h"
 #include "TlsHelper.h"
 #include "NonceCache.h"
+#include "RateWindow.h"
+#include "StructuredLogger.h"
 
 using namespace XYChat::Security;
+using XYChat::Server::RateWindow;
 
 class TestSecurity : public QObject
 {
@@ -37,6 +43,14 @@ private slots:
     void testNonceAcceptsFreshAndRejectsDuplicate();
     void testNonceRejectsEmpty();
     void testNonceExpiresAfterTtl();
+
+    // M11 前置: 连接级限流窗口测试
+    void testRateWindowAllowsUpToLimitThenRejects();
+    void testRateWindowResetsAfterWindow();
+
+    // M11 前置: 结构化日志测试
+    void testStructuredLoggerJsonFields();
+    void testStructuredLoggerSanitizesSensitive();
 };
 
 // LogSanitizer
@@ -216,6 +230,78 @@ void TestSecurity::testNonceExpiresAfterTtl()
     QTest::qWait(1100);
     cache.purgeExpired();
     QVERIFY(cache.checkAndInsert("nonce-ttl"));
+}
+
+// M11 前置: 连接级限流窗口
+void TestSecurity::testRateWindowAllowsUpToLimitThenRejects()
+{
+    RateWindow window(3, 10);
+    const qint64 t0 = 1000;
+    QVERIFY(window.allow(t0));       // 第 1 次
+    QVERIFY(window.allow(t0 + 1));   // 第 2 次
+    QVERIFY(window.allow(t0 + 2));   // 第 3 次
+    QVERIFY(!window.allow(t0 + 3));  // 第 4 次仍在窗口内 -> 拒绝
+    QCOMPARE(window.count(), 3);     // 被拒的调用不递增计数
+}
+
+void TestSecurity::testRateWindowResetsAfterWindow()
+{
+    RateWindow window(2, 10);
+    const qint64 t0 = 5000;
+    QVERIFY(window.allow(t0));
+    QVERIFY(window.allow(t0));
+    QVERIFY(!window.allow(t0 + 5));  // 5 < 10，仍在窗口内 -> 拒绝
+    // 窗口过期（>= windowSeconds）后计数重置
+    QVERIFY(window.allow(t0 + 10));
+    QVERIFY(window.allow(t0 + 10));
+    QVERIFY(!window.allow(t0 + 11));
+}
+
+// M11 前置: 结构化日志
+void TestSecurity::testStructuredLoggerJsonFields()
+{
+    const QString json = StructuredLogger::event(LogLevel::Info, "response")
+                             .requestId(42)
+                             .userId(7)
+                             .deviceId("dev-abc")
+                             .field("type", "send_message")
+                             .errorCode(0)
+                             .durationMs(3)
+                             .toJson();
+
+    // 单行且为合法 JSON
+    QVERIFY(!json.contains(QLatin1Char('\n')));
+    QJsonParseError err;
+    const QJsonObject obj = QJsonDocument::fromJson(json.toUtf8(), &err).object();
+    QCOMPARE(err.error, QJsonParseError::NoError);
+    QCOMPARE(obj.value("event").toString(), QString("response"));
+    QCOMPARE(obj.value("level").toString(), QString("info"));
+    QVERIFY(obj.contains("ts"));
+    QCOMPARE(obj.value("requestId").toVariant().toLongLong(), static_cast<qint64>(42));
+    QCOMPARE(obj.value("userId").toVariant().toLongLong(), static_cast<qint64>(7));
+    QCOMPARE(obj.value("deviceId").toString(), QString("dev-abc"));
+    QCOMPARE(obj.value("type").toString(), QString("send_message"));
+    QCOMPARE(obj.value("code").toVariant().toInt(), 0);
+    QCOMPARE(obj.value("durationMs").toVariant().toLongLong(), static_cast<qint64>(3));
+}
+
+void TestSecurity::testStructuredLoggerSanitizesSensitive()
+{
+    const QString json = StructuredLogger::event(LogLevel::Warning, "auth.rate_limited")
+                             .ipField("ip", "192.168.1.100")
+                             .tokenField("token", "abcdef1234567890abcdef")
+                             .contentField("content",
+                                           "a very long secret message body that must be masked")
+                             .toJson();
+
+    // IP 脱敏：保留前两段，完整 IP 不出现
+    QVERIFY(json.contains("192.168.*.*"));
+    QVERIFY(!json.contains("192.168.1.100"));
+    // token 脱敏：完整 token 不出现，仅前 8 字符 + ...
+    QVERIFY(!json.contains("abcdef1234567890abcdef"));
+    QVERIFY(json.contains("abcdef12..."));
+    // 正文脱敏：完整正文不出现
+    QVERIFY(!json.contains("a very long secret message body that must be masked"));
 }
 
 QTEST_MAIN(TestSecurity)

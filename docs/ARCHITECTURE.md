@@ -13,13 +13,13 @@ Chat-Client ── QSslSocket/PacketCodec/JSON ── Chat-Server ── SQLite
 TLS 采用 fail-closed 策略：不存在静默降级路径（服务端无证书拒启，客户端无 CA 拒连；开发明文需显式开关）。
 
 - `Chat-Client`：Qt 桌面客户端，**UI 已全面采用 QML/Qt Quick**（M4 完成，M4.5 完善），通过 `QWindowKit::Quick` 实现无边框窗口；登录窗口与主窗口为**两个独立根窗口**（均由 `main.cpp` 经 `engine.load()` 加载，主窗口在任务栏独立显示）；C++ 后端层为 `core/NetworkManager`（网络状态机、协议编解码、TLS、M6 起集成 E2EE 引导/加密发送/接收解密/TOFU，M6.5 起接入本地缓存与持久化 outbox，M7a 起接入群组五接口/群消息 outbox 分流/群变更推送，M7b 起实现群 Sender-Key 生成/分发/加解密与 `FetchGroupKeys` 协议交互）、`core/KeyStorage`（M6：DPAPI 保护的本地密钥与 TOFU 指纹存储；M6.5：LocalStore 存储密钥）、`core/LocalStore`（M6.5：按账号+设备隔离的加密本地缓存；M7a：会话缓存新增群名/成员数字段；M7b：新增 `sender_keys` 表保存 chain key 与 Ed25519 签名密钥对）、`core/ThemeSettings`（主题偏好持久化）与 `models/User`。
-- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包），管理 session 路由与在线状态，访问 SQLite。
+- `Chat-Server`：Qt TCP 服务端，`ConnectionServer`（QTcpServer）接受连接，每连接一个 `RequestHandler`（QThread）处理注册/登录/登出/续期/联系人/消息/密钥交换/群组管理请求（M6 新增 register_keys/fetch_keys；M7a 新增建群/邀请/退群/踢人/群信息五个处理器与群消息 fan-out；M7b 新增 fetch_group_keys 处理器，一次性返回群内所有成员 E2EE 密钥包；M11 前置：发消息/搜索连接级限流 RateWindow + 结构化审计日志），管理 session 路由与在线状态，访问 SQLite。
 - `CommonModule`：客户端和服务端共享代码：
   - `protocol/`：`Packet` / `PacketCodec` 长度前缀帧协议；
   - `encryption/`：`EncryptionManager`（PBKDF2 慢哈希 + Token 生成）、`E2eeCrypto`（M6：X25519/HKDF/AES-256-GCM/envelope 编解码）、`GroupE2eeCrypto`（M7b：Sender-Key 生成/chain-key ratchet/群消息 AES-256-GCM + Ed25519 签名/分发消息 pairwise envelope 编解码）；
-  - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）。
+  - `security/`：`TlsHelper`（证书生成/加载）、`LogSanitizer`（日志脱敏）、`SecureMemory`（敏感内存清零）、`StructuredLogger`（M11 前置：单行 JSON 结构化日志，统一字段 + 复用 LogSanitizer 脱敏）。
 - `docs`：路线图、协议、安全和架构说明。
-- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层与 V7 迁移）、Security、LocalStore、GroupE2eeCrypto（M7b 新增））；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
+- `tests`：Qt Test 单元测试（PacketCodec、EncryptionManager、DatabaseManager（含 M7a 群组数据层与 V7 迁移）、Security（含 M11 前置 RateWindow 限流窗口与 StructuredLogger 结构化日志/脱敏）、LocalStore、GroupE2eeCrypto（M7b 新增））；`tests/e2e/TestGroupRepro` 为 M7b 双客户端群 E2EE 端到端复现工具（不纳入 CTest，需手动启动服务端）。
 
 ## 服务端运行模型
 
@@ -66,7 +66,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
 - M7a 群聊（明文，服务端与客户端均已落地）：服务端建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。客户端（子任务三）：`NetworkManager` 群组五接口 + 群消息 outbox 分流（明文直发不依赖 E2EE 引导，确定性错误移除待发项避免无限重试）；`LocalStore` 会话缓存群名/成员数（存量库幂等补列）；QML 建群（联系人多选）/群信息（成员列表/层级踢人/退群）/邀请（搜索多选）三个对话框，会话列表群样式与成员数标识，系统消息居中胶囊渲染。M7b 完成后群聊天区顶部“暂未端到端加密”横幅已改为群 E2EE 状态提示。
-- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式），群消息无发送限流（留待 M11 前置项）；成员加入/退出的 Sender-Key healing 与失权回收已实现（2026-09-02 P1：成员变更触发本端轮换+重分发，离线经 sync_events 补偿），残留大群分发上限与“先落盘后分发”窗口（P2）。
+- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式）；发消息/搜索限流已于 M11 前置实施（连接级 `RateWindow`：`send_message` 30/10s、`search_users` 20/60s，超限返回 `RateLimited (1003)`，客户端瞬时失败退避重刷不丢消息）；成员加入/退出的 Sender-Key healing 与失权回收已实现（2026-09-02 P1：成员变更触发本端轮换+重分发，离线经 sync_events 补偿），残留大群分发上限与“先落盘后分发”窗口（P2）。
 
 ### 端到端加密（M6）
 
@@ -104,8 +104,8 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 服务端 `QSslSocket` + TLS 1.2+，开发环境自签 CA（`certs/` 脚本生成）；初始化失败拒绝启动（`--allow-plaintext` 显式开发开关）。
 - 客户端校验服务端证书，证书错误时断开；CA 缺失拒绝连接（`XYCHAT_ALLOW_PLAINTEXT=1` 显式开发开关）。
 - 业务请求强制携带 timestamp/nonce（缺失/格式错误/超时/重复一律拒绝），nonce 由服务端全局 TTL 缓存（`NonceCache`）跨连接去重。
-- 日志脱敏；敏感内存清零。
-- **限制**：nonce 缓存为单服务器内存（重启清空）；媒体消息尚未 E2EE（M8）。
+- 日志脱敏（`LogSanitizer`）；敏感内存清零（`SecureMemory`）；结构化日志（M11 前置 `StructuredLogger`：单行 JSON 统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段，`sendResponse` 中央审计 + 安全事件带 reason，敏感字段脱敏）。
+- **限制**：nonce 缓存与限流窗口均为单服务器/单连接内存态（重启清空、多实例不共享）；媒体消息尚未 E2EE（M8）。
 
 ## 数据库 Schema（V7，M7a 迁移）
 

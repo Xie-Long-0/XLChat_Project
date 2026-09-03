@@ -254,6 +254,7 @@ private:
     };
     QList<OutboxItem> m_outbox;
     QHash<quint64, QString> m_pendingSendByRequestId; // requestId -> clientMessageId
+    bool m_outboxFlushScheduled = false; // M11: 瞬时发送失败后已调度退避重刷，避免定时器堆叠
 
     // M6: E2EE 状态
     QString m_localDeviceId;                          // 登录时使用的 deviceId

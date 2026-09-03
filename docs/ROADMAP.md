@@ -32,7 +32,7 @@
 | M8 | 媒体、文件与对象存储 | 未开始 | — | 见第 4.1 节 |
 | M9 | 多端同步与离线一致性 | 未开始 | — | 范围已按现状收缩，见第 4.2 节 |
 | M10 | 搜索、通知与体验完善 | 未开始 | — | 见第 4.3 节 |
-| M11 | 稳定性、可观测性与运维 | 未开始 | — | 登录限流已在 M2 落地，密钥拉取连接级限流已在 M6/M7b 落地，其余见第 4.4 节 |
+| M11 | 稳定性、可观测性与运维 | 未开始 | — | 登录限流已在 M2 落地，密钥拉取连接级限流已在 M6/M7b 落地；**M11 前置两项（发消息/搜索限流 + 结构化日志）已于 2026-09-03 提前落地**，其余见第 4.4 节 |
 
 ### 1.2 能力矩阵
 
@@ -43,7 +43,7 @@
 | 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；**成员变更 Sender-Key healing**（2026-09-02 P1 修复：`member_added/removed/left` 触发本端轮换+重分发，新成员获密钥、被移除成员失后续解密能力，离线经 `sync_events` 补偿）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：大群拉取模式、改群名接口（数据层已就绪） |
 | 本地存储 | `LocalStore`（SQLite，按账号+设备隔离）：消息/会话预览/outbox/解密缓存 AES-256-GCM 加密落库，存储密钥 DPAPI 保护；M7b 起含 `sender_keys` 表；登出清用户可见数据、保留密钥材料 |
 | 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）。**未实现**：已读状态向已读者自身其他设备同步、服务端事件保留清理、编辑/删除/置顶/静音 |
-| 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer） |
+| 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer）；结构化日志（StructuredLogger 单行 JSON，M11 前置）；发消息/搜索/密钥拉取连接级限流（RateWindow，M11 前置） |
 | 客户端 UI | QML/Qt Quick + QWindowKit 无边框双窗口（登录/主窗口独立）；Telegram 风格主题（亮/暗切换持久化）；群聊三对话框（建群/群信息/邀请）；群 E2EE 状态横幅 |
 
 ## 2. 已完成能力摘要
@@ -116,8 +116,6 @@
 | P3 | 工程 | 群成员变更 healing 的 O(N²) 重分发与预密钥消耗 | 2026-09-02 P1 修复审查 | 一次成员变更触发全员各自轮换+重分发；已加同群去重与单发槽位节流，但大群跨成员风暴仍需聚合策略（如群主统一分发或延迟合并） |
 | P2 | 工程 | `sync_events` 无保留清理机制 | M9 盘点 | 事件表无限增长；清理需保证落后设备可回退全量拉取（`sync_messages`/`get_conversations`）不破坏历史 |
 | P2 | 功能 | 已读状态多端同步缺失 | M9 盘点 | receipt 聚合事件只写发送方事件流；已读者自身其他设备无事件源，未读数/已读态不同步 |
-| P2 | 工程 | 发消息/搜索限流未实施 | M11 前置项（2026-08-21 曾建议随 M6.5/M7 落地，未实施） | `send_message`（私聊/群聊）与 `search_users` 无每用户频率限制 |
-| P2 | 工程 | 结构化日志未实施 | M11 前置项（同上） | 现为分散 `qDebug`/`qWarning` 文本日志，缺请求 ID/用户/设备/错误码/耗时的结构化字段（LogSanitizer 脱敏已在用） |
 | P2 | 工程 | 端到端 TLS 集成测试缺失 | M5.5 遗留 | `tests/e2e/TestGroupRepro` 为手动工具（不纳入 CTest，需手动启动服务端），无自动化 TLS 双端集成测试 |
 | P2 | 安全 | nonce 去重为单服务器内存态 | M5.5 | 服务端重启清空；多服务器部署需持久化/共享存储 |
 | P2 | 安全 | TOFU 无带外验证；无密钥备份/设备间迁移 | M6 | 首次通信无法抵抗服务端中间人；更换设备/清数据后历史消息不可恢复（产品已决策接受） |
@@ -181,13 +179,13 @@
 ### 4.4 M11：稳定性、可观测性与运维（持续）
 
 - **目标**：为真实用户使用做好稳定性基础。
-- **已提前落地**：登录限流（M2）；`fetch_keys`/`fetch_group_keys` 连接级限流（M6/M7b）。
-- **说明**：结构化日志与发消息/搜索限流曾于 2026-08-21 建议前置到 M6.5/M7 期间，未随期实施，现列为独立欠账（见第 3 节 P2），可按第 5 节顺序提前落地，不必等 M11 整体启动。
+- **已提前落地**：登录限流（M2）；`fetch_keys`/`fetch_group_keys` 连接级限流（M6/M7b）；**发消息/搜索限流 + 结构化日志（M11 前置两项，2026-09-03）**。
+- **说明**：结构化日志与发消息/搜索限流曾于 2026-08-21 建议前置，已于 2026-09-03 提前落地（见变更记录），对应 P2 欠账已销账；M11 其余任务（指标监控/崩溃捕获/备份/压测）待整体启动。
 - **任务**：
-  - 结构化日志：请求 ID、用户 ID、设备 ID、错误码、耗时（配合 LogSanitizer 脱敏）。
+  - 结构化日志（✅ 已实施 2026-09-03）：`StructuredLogger` 单行 JSON，统一请求 ID/用户 ID/设备 ID/错误码/耗时字段（配合 LogSanitizer 脱敏）；`sendResponse` 中央审计日志（成功 info/失败 warning，可统计失败率与延迟）+ 鉴权/会话/重放/envelope/限流安全事件带 `reason`。
   - 指标监控：在线连接数、消息吞吐、失败率、延迟、数据库慢查询。
   - 崩溃捕获与客户端日志上报。
-  - 限流：发消息、搜索、文件上传（登录限流已有）。
+  - 限流：发消息、搜索（✅ 已实施 2026-09-03，连接级 `RateWindow`：`send_message` 30/10s、`search_users` 20/60s，新增通用 `RateLimited` 1003，`fetch_keys`/`fetch_group_keys` 一并迁移）；文件上传限流待 M8；登录限流（M2）已有。
   - 备份与恢复演练。
   - 压力测试：长连接数、消息吞吐、离线同步峰值。
 - **验收标准**：
@@ -199,7 +197,7 @@
 
 下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**（原第 1 项 `validateSession()` 回查 DB + 逐包验 token、原第 4 项 M7b healing 已于 2026-09-02 P1 修复完成）：
 
-1. **M11 前置两项：发消息/搜索限流 + 结构化日志**（服务端横切能力，越早落地后续功能越早受益）。
+1. **M11 前置两项：发消息/搜索限流 + 结构化日志** ✅ **已完成（2026-09-03）**：连接级 `RateWindow` 限流（send_message 30/10s、search_users 20/60s、fetch_keys 迁移，新增 `RateLimited` 1003）+ `StructuredLogger` 结构化审计日志；新增 RateWindow/StructuredLogger 共 4 个单测，ctest 通过（TestLocalStore 沙箱 DPAPI 偶发除外）。**下一候选为第 2 项。**
 2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理**（收掉 M9 三条基础验收）。
 3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期**（P1 修复配套收尾，见欠账清单 P2）。
 4. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
@@ -291,3 +289,4 @@ XYChat_Project/
 | 2026-08-26 | 安全审查 | 发现 GroupE2eeCrypto ratchet 循环无上限（DoS）、服务端群消息缺 envelope fail-closed 校验、`validateSession()` 仅查内存态三项问题 |
 | 2026-09-02 | 安全修复 + M7b 入库 + 文档重构 | DoS 上限（`MaxRatchetSteps`/`MaxMessageIteration`）与服务端群 envelope fail-closed 落地（`TestGroupE2eeCrypto` 扩至 20 用例）；群聊横幅改为"已启用端到端加密"；M7b 连同修复提交（`c806d90`）；周度审查确认欠账清单；ROADMAP 完全重构（本版本），`validateSession()` 等 P1 修复见下一行 |
 | 2026-09-02 | P1 欠账修复（3 项） | ① `validateSession()` 逐请求回查 `sessions` 表 + 过期 fail-closed（`token_renew` 豁免过期门）；② 逐包验 token（客户端已认证请求经 `addReplayProtection` 携带 `token`，服务端逐包比对哈希；新增客户端 `MessageType::Error` 处理清理在途槽位）；③ 群成员变更 Sender-Key healing（`member_added/removed/left` 触发本端轮换+重分发，离线经 `sync_events` 补偿，含同群去重/队列/瞬时失败延迟重试）。新增回归用例 `sessionByIdReflectsDeletionAndExpiry`、`senderKeyRotationRevokesRemovedMember`；`ctest` 6/6 通过；审查发现的大群分发上限/先落盘后分发/会话过期重登 UX/O(N²) 重分发登记为新欠账（P2/P3） |
+| 2026-09-03 | M11 前置两项完成 | 发消息/搜索限流 + 结构化日志落地。① 限流：新增通用错误码 `RateLimited (1003)`（`LoginRateLimited` 收窄为仅登录）；`RateWindow`（`Chat-Server/core`，header-only）连接级固定窗口限流器替换 fetch_keys/fetch_group_keys 内联窗口并新增 `send_message`（30/10s，私聊/群聊同一入口）与 `search_users`（20/60s）限流；客户端 send 瞬时失败退避重刷（单发护栏防定时器堆叠）、fetch_group_keys healing 瞬时分类兼容新旧限流码。② 结构化日志：`StructuredLogger`（`CommonModule/security`）单行 JSON，统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段 + LogSanitizer 脱敏；`sendResponse` 中央审计日志（成功 info/失败 warning，含耗时）+ 鉴权/会话/重放/envelope/限流安全事件带 `reason`；移除登录/注册明文 username/IP 日志；Server 连接生命周期结构化。新增 4 单测（RateWindow×2/StructuredLogger×2），`ctest` 5/6 绿（TestLocalStore 沙箱 DPAPI 偶发 fail-closed，单独运行通过）；CodeReview 子代理审查并修复 3 项（客户端限流重试/登出日志 userId 归因/服务器自发响应陈旧 type）。对应第 3 节两项 P2 欠账销账 |

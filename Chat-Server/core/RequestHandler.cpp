@@ -6,6 +6,7 @@
 #include "GroupE2eeCrypto.h"
 #include "LogSanitizer.h"
 #include "SecureMemory.h"
+#include "StructuredLogger.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -20,11 +21,16 @@
 using namespace XYChat::Protocol;
 using XYChat::Security::LogSanitizer;
 using XYChat::Security::GroupE2eeCrypto;
+using XYChat::Security::StructuredLogger;
+using XYChat::Security::LogLevel;
 
 // 构造 / 析构
 RequestHandler::RequestHandler(qintptr socketDescriptor, QObject *parent)
     : QThread(parent)
     , m_socketDescriptor(socketDescriptor)
+    , m_fetchKeysWindow(MaxFetchKeysPerWindow, FetchKeysWindowSeconds)
+    , m_sendWindow(MaxSendMessagesPerWindow, SendMessageWindowSeconds)
+    , m_searchWindow(MaxSearchesPerWindow, SearchWindowSeconds)
 {
 }
 
@@ -85,14 +91,15 @@ void RequestHandler::run()
     const QString connName = QString("handler_%1").arg(reinterpret_cast<quintptr>(this));
     m_db = new DatabaseManager(connName);
     if (!m_db->initialize()) {
-        qCritical() << "[Handler] DB init failed for" << connName;
+        StructuredLogger::event(LogLevel::Critical, "handler.db_init_failed")
+            .field("connection", connName).write();
         emit finished();
         return;
     }
 
     m_socket = new QSslSocket();
     if (!m_socket->setSocketDescriptor(m_socketDescriptor)) {
-        qDebug() << "[Handler] Failed to set socket descriptor";
+        StructuredLogger::event(LogLevel::Warning, "handler.socket_init_failed").write();
         delete m_socket;
         m_socket = nullptr;
         emit finished();
@@ -107,7 +114,8 @@ void RequestHandler::run()
         });
         connect(m_socket, &QSslSocket::sslErrors, m_socket, [this](const QList<QSslError> &errors) {
             for (const auto &err : errors) {
-                qWarning() << "[Handler] SSL error:" << err.errorString();
+                StructuredLogger::event(LogLevel::Warning, "connection.ssl_error")
+                    .field("error", err.errorString()).write();
             }
             m_socket->disconnectFromHost();
         });
@@ -155,6 +163,8 @@ void RequestHandler::onReadyRead()
             return;
         }
         if (status == PacketCodec::DecodeStatus::InvalidData) {
+            // M11: 服务器自发响应，显式标注类型，避免沿用上一个请求的陈旧 type
+            m_currentRequestType = "invalid_frame";
             sendResponse(0, MessageType::Error, ErrorCode::InvalidRequest, errorMessage);
             m_socket->disconnectFromHost();
             return;
@@ -166,6 +176,8 @@ void RequestHandler::onReadyRead()
 
 void RequestHandler::onIdleTimeout()
 {
+    // M11: 服务器自发响应，显式标注类型，避免中央审计日志沿用上一个请求的陈旧 type
+    m_currentRequestType = "idle_timeout";
     sendResponse(0, MessageType::Error, ErrorCode::Timeout, "Idle timeout");
     m_socket->disconnectFromHost();
 }
@@ -182,6 +194,11 @@ void RequestHandler::processPacket(const Packet &packet)
         return;
     }
 
+    // M11: 记录每请求上下文（请求 ID/类型/起始计时），供 sendResponse 输出结构化审计日志
+    m_currentRequestId = packet.requestId;
+    m_currentRequestType.clear();
+    m_requestTimer.restart();
+
     // 解析 JSON payload
     QJsonParseError parseError;
     const QJsonDocument jsonDoc = QJsonDocument::fromJson(packet.payload, &parseError);
@@ -192,6 +209,7 @@ void RequestHandler::processPacket(const Packet &packet)
     }
     const QJsonObject json = jsonDoc.object();
     const QString type = json.value("type").toString();
+    m_currentRequestType = type;
 
     // M5: 重放保护检查（对所有业务请求）
     if (packet.messageType != MessageType::Ping && packet.messageType != MessageType::Pong) {
@@ -322,9 +340,6 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
     const QString platform = request.value("platform").toString();
     const QString ipAddr = m_socket->peerAddress().toString();
 
-    qDebug() << "[Handler] Login request" << packet.requestId << username
-             << "from" << LogSanitizer::maskIpAddress(ipAddr);
-
     if (username.isEmpty() || clientPassword.isEmpty()) {
         sendResponse(packet.requestId, MessageType::LoginResponse, ErrorCode::InvalidRequest,
                      "Username and password are required");
@@ -357,7 +372,6 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
         sendResponse(packet.requestId, MessageType::LoginResponse,
                      ErrorCode::AuthenticationFailed,
                      "Invalid username or password");
-        qDebug() << "[Handler] Login failed for" << username << "(wrong password)";
         return;
     }
 
@@ -397,7 +411,6 @@ void RequestHandler::processLoginRequest(const Packet &packet, const QJsonObject
 
     sendResponse(packet.requestId, MessageType::LoginResponse, ErrorCode::Ok,
                  "OK", data);
-    qDebug() << "[Handler] Login successful for" << username;
 }
 
 // 注册
@@ -408,8 +421,6 @@ void RequestHandler::processRegisterRequest(const Packet &packet, const QJsonObj
     const QString email = request.value("email").toString().trimmed();
     const QString phone = request.value("phone").toString().trimmed();
     const QString ipAddr = m_socket->peerAddress().toString();
-
-    qDebug() << "[Handler] Register request" << packet.requestId << username;
 
     // 输入校验
     if (username.isEmpty() || password.isEmpty()) {
@@ -456,7 +467,9 @@ void RequestHandler::processRegisterRequest(const Packet &packet, const QJsonObj
 
     sendResponse(packet.requestId, MessageType::RegisterResponse, ErrorCode::Ok,
                  "Account created successfully", data);
-    qDebug() << "[Handler] Registered user" << username << "id=" << userId;
+    StructuredLogger::event(LogLevel::Info, "user.registered")
+        .requestId(packet.requestId).userId(userId)
+        .ipField("ip", ipAddr).write();
 }
 
 // 登出
@@ -468,13 +481,14 @@ void RequestHandler::processLogoutRequest(const Packet &packet)
     m_db->deleteSession(sessionId);
     emit userLoggedOut(userId, sessionId);
 
-    m_authenticatedUserId = 0;
-    m_currentSessionId = 0;
-
     QJsonObject data;
     sendResponse(packet.requestId, MessageType::LogoutResponse, ErrorCode::Ok,
                  "Logged out", data);
-    qDebug() << "[Handler] User" << userId << "logged out";
+
+    // M11: 认证状态清零置于响应之后，使 sendResponse 的中央审计日志记录到实际登出用户
+    // （userId 非 0）；登出事件另由 Server 的 session.offline 结构化日志覆盖。
+    m_authenticatedUserId = 0;
+    m_currentSessionId = 0;
 }
 
 // Token 续期
@@ -500,7 +514,9 @@ void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonO
 
     const QString suppliedHash = EncryptionManager::hashToken(suppliedToken);
     if (suppliedHash != sessionOpt->tokenHash) {
-        qWarning() << "[Handler] Token renew rejected: token mismatch for user" << userId;
+        StructuredLogger::event(LogLevel::Warning, "token_renew.rejected")
+            .requestId(packet.requestId).userId(userId)
+            .field("reason", "token_mismatch").write();
         sendResponse(packet.requestId, MessageType::TokenRenewResponse,
                      ErrorCode::SessionInvalid, "Supplied token does not match session");
         return;
@@ -531,7 +547,6 @@ void RequestHandler::processTokenRenewRequest(const Packet &packet, const QJsonO
 
     sendResponse(packet.requestId, MessageType::TokenRenewResponse, ErrorCode::Ok,
                  "Token renewed", data);
-    qDebug() << "[Handler] Token renewed for user" << userId;
 }
 
 // 强制下线
@@ -590,8 +605,9 @@ void RequestHandler::processTerminateSessionRequest(const Packet &packet, const 
     data["terminatedSessionId"] = resolvedSessionId;
     sendResponse(packet.requestId, MessageType::ForceLogoutResponse, ErrorCode::Ok,
                  "Session terminated", data);
-    qDebug() << "[Handler] User" << m_authenticatedUserId
-             << "terminated own session" << resolvedSessionId;
+    StructuredLogger::event(LogLevel::Info, "session.terminated")
+        .requestId(packet.requestId).userId(m_authenticatedUserId)
+        .field("terminatedSessionId", resolvedSessionId).write();
 }
 
 // M3: 用户搜索
@@ -601,6 +617,13 @@ void RequestHandler::processSearchUsersRequest(const Packet &packet, const QJson
     if (query.isEmpty()) {
         sendResponse(packet.requestId, MessageType::SearchUsersResponse,
                      ErrorCode::InvalidRequest, "Query is required");
+        return;
+    }
+
+    // M11: 搜索限流（连接级固定窗口），抑制用户名枚举/刷库；超限由结构化审计日志记录
+    if (!m_searchWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::SearchUsersResponse,
+                     ErrorCode::RateLimited, "Too many search requests, please slow down");
         return;
     }
 
@@ -723,6 +746,14 @@ void RequestHandler::processSendMessageRequest(const Packet &packet, const QJson
     if (clientMessageId.isEmpty() || clientMessageId.size() > 128) {
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      ErrorCode::InvalidRequest, "clientMessageId is required");
+        return;
+    }
+
+    // M11: 发消息限流（连接级固定窗口，覆盖私聊与群聊两条分流路径），抑制刷消息/DoS。
+    // 超限返回 RateLimited，客户端视为瞬时失败：保留 outbox 并短退避后自动重刷，不丢消息。
+    if (!m_sendWindow.allow(QDateTime::currentSecsSinceEpoch())) {
+        sendResponse(packet.requestId, MessageType::SendMessageResponse,
+                     ErrorCode::RateLimited, "Too many messages, please slow down");
         return;
     }
 
@@ -1151,15 +1182,10 @@ void RequestHandler::processFetchKeysRequest(const Packet &packet, const QJsonOb
     }
 
     // M6 审查修复：连接级频率限制，防止恶意循环拉取耗尽他人预密钥池
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    if (now - m_fetchKeysWindowStart >= FetchKeysWindowSeconds) {
-        m_fetchKeysWindowStart = now;
-        m_fetchKeysCount = 0;
-    }
-    if (++m_fetchKeysCount > MaxFetchKeysPerWindow) {
-        qWarning() << "[Handler] FetchKeys rate limited: user" << m_authenticatedUserId;
+    // （M11：改用 RateWindow，超限返回 RateLimited，由结构化审计日志记录）
+    if (!m_fetchKeysWindow.allow(QDateTime::currentSecsSinceEpoch())) {
         sendResponse(packet.requestId, MessageType::FetchKeysResponse,
-                     ErrorCode::LoginRateLimited,
+                     ErrorCode::RateLimited,
                      "Too many key bundle requests, please slow down");
         return;
     }
@@ -1223,7 +1249,8 @@ void RequestHandler::postGroupSystemMessage(qint64 conversationId, qint64 operat
     const QString content = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     const qint64 msgId = m_db->sendMessage(conversationId, operatorId, content, "system");
     if (msgId < 0) {
-        qWarning() << "[Handler] Failed to store group system message, conv" << conversationId;
+        StructuredLogger::event(LogLevel::Warning, "group.system_message_failed")
+            .userId(operatorId).field("conversationId", conversationId).write();
         return;
     }
 
@@ -1653,16 +1680,10 @@ void RequestHandler::processFetchGroupKeysRequest(const Packet &packet, const QJ
     }
 
     // M6 审查修复：连接级频率限制（与 fetch_keys 共享窗口），
-    // 防止恶意循环拉取耗尽他人预密钥池
-    const qint64 now = QDateTime::currentSecsSinceEpoch();
-    if (now - m_fetchKeysWindowStart >= FetchKeysWindowSeconds) {
-        m_fetchKeysWindowStart = now;
-        m_fetchKeysCount = 0;
-    }
-    if (++m_fetchKeysCount > MaxFetchKeysPerWindow) {
-        qWarning() << "[Handler] FetchGroupKeys rate limited: user" << m_authenticatedUserId;
+    // 防止恶意循环拉取耗尽他人预密钥池（M11：改用 RateWindow，超限返回 RateLimited）
+    if (!m_fetchKeysWindow.allow(QDateTime::currentSecsSinceEpoch())) {
         sendResponse(packet.requestId, MessageType::FetchGroupKeysResponse,
-                     ErrorCode::LoginRateLimited,
+                     ErrorCode::RateLimited,
                      "Too many key bundle requests, please slow down");
         return;
     }
@@ -1765,8 +1786,11 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
         QString senderDeviceId;
         if (!GroupE2eeCrypto::decodeGroupMessage(content, probe, &senderDeviceId)
             || senderDeviceId.isEmpty()) {
-            qWarning() << "[Handler] Rejected invalid group e2ee envelope: user"
-                       << m_authenticatedUserId << "conv" << conversationId;
+            StructuredLogger::event(LogLevel::Warning, "envelope.rejected")
+                .requestId(packet.requestId).userId(m_authenticatedUserId)
+                .field("reason", "invalid_group_e2ee")
+                .field("contentType", "e2ee_group")
+                .field("conversationId", conversationId).write();
             sendResponse(packet.requestId, MessageType::SendMessageResponse,
                          ErrorCode::E2eeInvalidEnvelope,
                          "Group e2ee content is not a valid envelope");
@@ -1782,8 +1806,11 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
                                                  distDeviceId, distKey, distEntries)
             || distEntries.isEmpty()
             || distGroupId != conversationId) {
-            qWarning() << "[Handler] Rejected invalid sender key distribution: user"
-                       << m_authenticatedUserId << "conv" << conversationId;
+            StructuredLogger::event(LogLevel::Warning, "envelope.rejected")
+                .requestId(packet.requestId).userId(m_authenticatedUserId)
+                .field("reason", "invalid_sender_key_distribution")
+                .field("contentType", "sender_key_distribution")
+                .field("conversationId", conversationId).write();
             sendResponse(packet.requestId, MessageType::SendMessageResponse,
                          ErrorCode::E2eeInvalidEnvelope,
                          "sender_key_distribution content is not a valid envelope");
@@ -1883,7 +1910,10 @@ bool RequestHandler::validateSession(const QJsonObject &request)
     }
     const SessionInfo &session = *sessionOpt;
     if (session.userId != m_authenticatedUserId) {
-        qWarning() << "[Handler] Session/user mismatch for session" << m_currentSessionId;
+        StructuredLogger::event(LogLevel::Warning, "session.rejected")
+            .requestId(m_currentRequestId).userId(m_authenticatedUserId)
+            .field("reason", "session_user_mismatch")
+            .field("sessionId", m_currentSessionId).write();
         return false;
     }
 
@@ -1891,7 +1921,10 @@ bool RequestHandler::validateSession(const QJsonObject &request)
     // token_renew 豁免过期门，允许对已过期会话续期（其余请求过期即拒）
     const QDateTime expiresAt = QDateTime::fromString(session.expiresAt, Qt::ISODate);
     if (!expiresAt.isValid()) {
-        qWarning() << "[Handler] Unparseable session expiresAt for session" << m_currentSessionId;
+        StructuredLogger::event(LogLevel::Warning, "session.rejected")
+            .requestId(m_currentRequestId).userId(m_authenticatedUserId)
+            .field("reason", "unparseable_expires_at")
+            .field("sessionId", m_currentSessionId).write();
         return false;
     }
     const bool isRenew = request.value("type").toString() == QLatin1String("token_renew");
@@ -1905,7 +1938,10 @@ bool RequestHandler::validateSession(const QJsonObject &request)
         return false;
     }
     if (EncryptionManager::hashToken(suppliedToken) != session.tokenHash) {
-        qWarning() << "[Handler] Per-packet token mismatch for user" << m_authenticatedUserId;
+        StructuredLogger::event(LogLevel::Warning, "session.rejected")
+            .requestId(m_currentRequestId).userId(m_authenticatedUserId)
+            .field("reason", "token_mismatch")
+            .field("sessionId", m_currentSessionId).write();
         return false;
     }
     return true;
@@ -1916,13 +1952,19 @@ bool RequestHandler::checkRateLimit(const QString &ipAddress, qint64 userId)
 {
     const int ipFails = m_db->recentFailedLoginCount(ipAddress, RateLimitWindowSeconds);
     if (ipFails >= MaxFailedLoginsPerIP) {
-        qDebug() << "[Handler] Rate limit: IP" << ipAddress << "has" << ipFails << "failures";
+        StructuredLogger::event(LogLevel::Warning, "auth.rate_limited")
+            .requestId(m_currentRequestId).userId(userId)
+            .field("scope", "ip").ipField("ip", ipAddress)
+            .field("failures", ipFails).write();
         return true;
     }
     if (userId > 0) {
         const int userFails = m_db->recentFailedLoginCountForUser(userId, RateLimitWindowSeconds);
         if (userFails >= MaxFailedLoginsPerUser) {
-            qDebug() << "[Handler] Rate limit: user" << userId << "has" << userFails << "failures";
+            StructuredLogger::event(LogLevel::Warning, "auth.rate_limited")
+                .requestId(m_currentRequestId).userId(userId)
+                .field("scope", "user")
+                .field("failures", userFails).write();
             return true;
         }
     }
@@ -1946,13 +1988,31 @@ void RequestHandler::sendResponse(quint64 requestId,
     packet.requestId = requestId;
     packet.payload = QJsonDocument(response).toJson(QJsonDocument::Compact);
     sendPacket(packet);
+
+    // M11: 结构化审计日志。每个请求响应统一记录请求 ID/用户/设备/类型/错误码/耗时/来源 IP，
+    // 成功记为 info、非成功记为 warning，便于统计失败率与延迟；IP 经 LogSanitizer 脱敏，
+    // 不记录消息正文/凭据。
+    const qint64 durationMs = m_requestTimer.isValid() ? m_requestTimer.elapsed() : 0;
+    const QString peerIp = m_socket ? m_socket->peerAddress().toString() : QString();
+    StructuredLogger::event(code == ErrorCode::Ok ? LogLevel::Info : LogLevel::Warning,
+                            "response")
+        .requestId(requestId)
+        .userId(m_authenticatedUserId)
+        .deviceId(m_currentDeviceId)
+        .field("type", m_currentRequestType)
+        .errorCode(static_cast<int>(code))
+        .durationMs(durationMs)
+        .ipField("ip", peerIp)
+        .write();
+    m_requestTimer.invalidate();
 }
 
 void RequestHandler::sendPacket(const Packet &packet)
 {
     const QByteArray encoded = PacketCodec::encode(packet);
     if (encoded.isEmpty()) {
-        qWarning() << "[Handler] Failed to encode packet" << packet.requestId;
+        StructuredLogger::event(LogLevel::Warning, "packet.encode_failed")
+            .requestId(packet.requestId).write();
         return;
     }
 
@@ -1965,35 +2025,42 @@ bool RequestHandler::checkReplayProtection(const QJsonObject &request)
 {
     // timestamp 必填且为合法整数
     if (!request.contains("timestamp") || !request.value("timestamp").isDouble()) {
-        qDebug() << "[Handler] Replay protection: missing or invalid timestamp";
+        StructuredLogger::event(LogLevel::Warning, "replay.rejected")
+            .requestId(m_currentRequestId).field("reason", "missing_or_invalid_timestamp").write();
         return false;
     }
     const qint64 timestamp = request.value("timestamp").toVariant().toLongLong();
     if (timestamp <= 0) {
-        qDebug() << "[Handler] Replay protection: non-positive timestamp";
+        StructuredLogger::event(LogLevel::Warning, "replay.rejected")
+            .requestId(m_currentRequestId).field("reason", "non_positive_timestamp").write();
         return false;
     }
     const qint64 now = QDateTime::currentSecsSinceEpoch();
     const qint64 diff = qAbs(now - timestamp);
     if (diff > ReplayTimestampToleranceSecs) {
-        qDebug() << "[Handler] Replay protection: timestamp out of window, diff=" << diff << "s";
+        StructuredLogger::event(LogLevel::Warning, "replay.rejected")
+            .requestId(m_currentRequestId).field("reason", "timestamp_out_of_window")
+            .field("diffSecs", diff).write();
         return false;
     }
 
-    // nonce 必填：非空、长度受限
+    // nonce 必填：非空、长度受限（不记录 nonce 值本身）
     const QString nonce = request.value("nonce").toString().trimmed();
     if (nonce.isEmpty() || nonce.size() > 128) {
-        qDebug() << "[Handler] Replay protection: missing or oversized nonce";
+        StructuredLogger::event(LogLevel::Warning, "replay.rejected")
+            .requestId(m_currentRequestId).field("reason", "missing_or_oversized_nonce").write();
         return false;
     }
 
     // 全局 TTL 缓存去重（跨连接生效）；未配置时退回拒绝，fail-closed
     if (!m_nonceCache) {
-        qWarning() << "[Handler] Replay protection: nonce cache unavailable, rejecting";
+        StructuredLogger::event(LogLevel::Critical, "replay.rejected")
+            .requestId(m_currentRequestId).field("reason", "nonce_cache_unavailable").write();
         return false;
     }
     if (!m_nonceCache->checkAndInsert(nonce)) {
-        qDebug() << "[Handler] Replay protection: duplicate nonce detected";
+        StructuredLogger::event(LogLevel::Warning, "replay.rejected")
+            .requestId(m_currentRequestId).field("reason", "duplicate_nonce").write();
         return false;
     }
 

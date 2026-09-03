@@ -204,6 +204,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `1000` | `InvalidRequest` | 请求格式、类型或 payload 非法 |
 | `1001` | `UnsupportedVersion` | 协议版本不支持 |
 | `1002` | `ReplayRejected` | 重放保护拒绝：timestamp/nonce 缺失、格式错误、超时或重复（M5.5） |
+| `1003` | `RateLimited` | 非登录类请求频率超限：发消息 / 搜索 / 密钥拉取（M11 前置） |
 | `2001` | `AuthenticationFailed` | 用户名或密码错误 |
 | `2002` | `AccountAlreadyExists` | 用户名已存在 |
 | `2003` | `AccountNotFound` | 用户不存在 |
@@ -243,9 +244,14 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 
 ### 限流策略
 
-- 同一 IP 在 5 分钟内最多 10 次登录失败
-- 同一用户在 5 分钟内最多 5 次登录失败
-- 触发限流后返回 `LoginRateLimited` 错误
+限流均为**连接级**（一条连接对应一个已认证用户+设备），采用固定窗口计数（M11 前置统一为 `RateWindow`）。
+
+- **登录**（`login`）：同一 IP 5 分钟内最多 10 次失败、同一用户 5 分钟内最多 5 次失败；触发返回 `LoginRateLimited (2006)`，并记录 `login_audit`。
+- **发消息**（`send_message`，私聊/群聊同一入口）：每连接 10 秒内最多 30 条；超限返回 `RateLimited (1003)`。客户端视为瞬时失败——保留 outbox 并短退避后自动重刷，不丢消息。
+- **搜索**（`search_users`）：每连接 60 秒内最多 20 次；超限返回 `RateLimited (1003)`，抑制用户名枚举/刷库。
+- **密钥拉取**（`fetch_keys` 与 `fetch_group_keys` 共享窗口）：每连接 60 秒内最多 20 次；超限返回 `RateLimited (1003)`（M11 前由 `LoginRateLimited` 迁移而来），防止恶意耗尽他人预密钥池。
+
+> `LoginRateLimited (2006)` 自 M11 起仅用于登录限流；其余请求限流统一使用通用 `RateLimited (1003)`。
 
 ## 已知限制
 
@@ -454,7 +460,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 
 - 服务端在事务内为目标用户每个有库存的设备原子认领（`unused -> claimed`）一个预密钥；认领后 10 分钟未被消费自动回退为 `unused`（防泄漏）。
 - 目标无设备返回 `AccountNotFound`；无可用预密钥返回 `KeyBundleUnavailable (3007)`。
-- 连接级频率限制（60 秒内 ≤20 次），超限返回 `LoginRateLimited`，防止恶意耗尽他人预密钥池。
+- 连接级频率限制（60 秒内 ≤20 次），超限返回 `RateLimited (1003)`，防止恶意耗尽他人预密钥池。
 - 认领的密钥包仅供一条消息使用：消息入库时预密钥转为 `used`；发送方放弃时由超时回收兜底。
 
 #### 消息 envelope 格式
@@ -609,7 +615,7 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 
 ### 密钥包拉取（fetch_group_keys，类型 71/72）
 
-需要已认证 session 且仅限群成员（越权返回 `PermissionDenied`）；与 `fetch_keys` 共享连接级限流窗口（60 秒 ≤20 次，超限返回 `LoginRateLimited`）。
+需要已认证 session 且仅限群成员（越权返回 `PermissionDenied`）；与 `fetch_keys` 共享连接级限流窗口（60 秒 ≤20 次，超限返回 `RateLimited (1003)`）。
 
 ```json
 // 请求

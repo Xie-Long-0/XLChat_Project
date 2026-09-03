@@ -1407,8 +1407,10 @@ void NetworkManager::handleFetchGroupKeysResponse(const Packet &packet)
     if (code != static_cast<int>(ErrorCode::Ok) || convId <= 0) {
         qWarning() << "[NetMgr] FetchGroupKeys failed:" << response.value("message").toString();
         // P1-3: 瞬时失败（限流/内部错误/超时）延迟重试轮换，避免后向安全窗口；
-        // 确定性失败（越权/会话不存在）丢弃，待下次成员变更或发送再触发
-        const bool transient = code == static_cast<int>(ErrorCode::LoginRateLimited)
+        // 确定性失败（越权/会话不存在）丢弃，待下次成员变更或发送再触发。
+        // M11: 服务端限流错误码由 LoginRateLimited 迁至通用 RateLimited，两者均视为瞬时。
+        const bool transient = code == static_cast<int>(ErrorCode::RateLimited)
+            || code == static_cast<int>(ErrorCode::LoginRateLimited)
             || code == static_cast<int>(ErrorCode::InternalError)
             || code == static_cast<int>(ErrorCode::Timeout);
         if (transient && convId > 0) {
@@ -1989,6 +1991,15 @@ void NetworkManager::handleSendMessageResponse(const Packet &packet)
                     break;
                 }
             }
+        } else if (!m_outboxFlushScheduled) {
+            // M11: 瞬时失败（限流 RateLimited/内部错误/超时）保留 outbox，短退避后自动重刷。
+            // 群消息直发不经 fetch_keys 链路，若不调度重刷，超限消息会滞留至下次登录；
+            // 单发护栏避免一次突发（多条被限流）堆叠多个定时器。
+            m_outboxFlushScheduled = true;
+            QTimer::singleShot(3000, this, [this]() {
+                m_outboxFlushScheduled = false;
+                flushOutbox();
+            });
         }
         emit messageSendFailed(response.value("message").toString("Send failed"));
     }

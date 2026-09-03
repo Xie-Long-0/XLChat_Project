@@ -64,11 +64,12 @@
 - 服务端拒绝时间戳偏差超过 5 分钟的请求。
 - 服务端维护全局共享的 `NonceCache`（跨连接生效，TTL 600 秒，上限 100000 条），拒绝重复 nonce（M5.5 从每连接缓存升级为全局去重）。
 
-### 日志脱敏
+### 日志脱敏与结构化日志
 
-- 提供 `LogSanitizer` 工具类，对密码、token、消息正文、IP 地址、邮箱进行掌码处理。
+- 提供 `LogSanitizer` 工具类，对密码、token、消息正文、IP 地址、邮箱进行掩码处理。
 - 日志中不输出明文密码、完整 token、私钥或完整消息正文。
 - IP 地址只保留前两段（如 `192.168.*.*`）。
+- **结构化日志（M11 前置）**：服务端 `StructuredLogger`（`CommonModule/security`）以单行紧凑 JSON 输出统一字段——时间戳 `ts`、级别 `level`、事件 `event`、请求 ID `requestId`、用户 `userId`、设备 `deviceId`、错误码 `code`、耗时 `durationMs`、来源 IP `ip`（脱敏）。`sendResponse` 对每个请求响应输出一条中央审计日志（成功 `info`、失败 `warning`，据此可统计失败率与延迟）；鉴权/会话/重放/envelope/限流等安全事件另以结构化事件记录并携带 `reason`。敏感字段经 `LogSanitizer` 脱敏后写入，绝不记录 token/密码/私钥/完整正文；已移除登录/注册日志中的明文 username 与明文 IP。
 
 ### 安全内存
 
@@ -95,12 +96,13 @@
 - 支持 token 续期（重新生成 token 并替换旧 session）。
 - 支持主动登出和强制下线。
 
-### 登录限流
+### 限流（连接级固定窗口）
 
-- 同一 IP 在 5 分钟内最多允许 10 次登录失败。
-- 同一用户在 5 分钟内最多允许 5 次登录失败。
-- 触发限流后返回 `LoginRateLimited` 错误码。
-- 所有登录尝试（成功/失败）均记录到 `login_audit` 表。
+- **登录**：同一 IP 5 分钟内最多 10 次失败、同一用户 5 分钟内最多 5 次失败；触发返回 `LoginRateLimited (2006)`；所有登录尝试（成功/失败）记录到 `login_audit` 表。
+- **发消息**（M11 前置）：`send_message`（私聊/群聊同一入口）每连接 10 秒内最多 30 条，超限返回 `RateLimited (1003)`；客户端视为瞬时失败保留 outbox 并短退避重刷，不丢消息。抑制刷消息/DoS。
+- **搜索**（M11 前置）：`search_users` 每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`，抑制用户名枚举/刷库。
+- **密钥拉取**：`fetch_keys` 与 `fetch_group_keys` 共享窗口，每连接 60 秒内最多 20 次，超限返回 `RateLimited (1003)`（原用 `LoginRateLimited`，M11 迁至通用码），防预密钥池耗尽。
+- 所有限流窗口为连接级（`RateWindow`，`Chat-Server/core`），与既有 fetch_keys 内联窗口语义一致；`LoginRateLimited` 现仅用于登录。多服务器部署时限流状态需共享/持久化（与 nonce 缓存同为单实例内存态限制）。
 
 ### 数据库安全
 

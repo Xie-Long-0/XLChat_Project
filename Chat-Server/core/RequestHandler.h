@@ -5,10 +5,12 @@
 #include <QSslConfiguration>
 #include <QJsonObject>
 #include <QTimer>
+#include <QElapsedTimer>
 
 #include <atomic>
 
 #include "protocol/PacketCodec.h"
+#include "RateWindow.h"
 
 class DatabaseManager;
 class NonceCache;
@@ -129,9 +131,16 @@ private:
     qint64 m_currentSessionId = 0;
     QString m_currentDeviceId;
 
-    // M6: fetch_keys 频率限制（连接级滑动窗口）
-    qint64 m_fetchKeysWindowStart = 0;
-    int m_fetchKeysCount = 0;
+    // M6/M11: 连接级限流窗口（fetch_keys 与 fetch_group_keys 共享一个窗口）
+    XYChat::Server::RateWindow m_fetchKeysWindow;
+    // M11 前置: 发消息与搜索限流（连接级固定窗口，防刷消息/用户名枚举）
+    XYChat::Server::RateWindow m_sendWindow;
+    XYChat::Server::RateWindow m_searchWindow;
+
+    // M11 前置: 结构化日志的每请求上下文（起始计时/请求类型/请求 ID）
+    QElapsedTimer m_requestTimer;
+    QString m_currentRequestType;
+    quint64 m_currentRequestId = 0;
 
     // 数据库（每个线程使用独立连接名）
     DatabaseManager *m_db = nullptr;
@@ -148,6 +157,13 @@ private:
     // M6 审查修复：fetch_keys 频率限制，防止恶意耗尽他人预密钥池
     static constexpr int MaxFetchKeysPerWindow = 20;  // 窗口内拉取上限
     static constexpr int FetchKeysWindowSeconds = 60; // 滑动窗口长度
+
+    // M11 前置：发消息限流（连接级固定窗口，覆盖私聊/群聊 send_message）
+    static constexpr int MaxSendMessagesPerWindow = 30; // 窗口内发消息上限
+    static constexpr int SendMessageWindowSeconds = 10; // 窗口长度（秒）
+    // M11 前置：用户搜索限流（连接级固定窗口，抑制用户名枚举/刷库）
+    static constexpr int MaxSearchesPerWindow = 20; // 窗口内搜索上限
+    static constexpr int SearchWindowSeconds = 60;  // 窗口长度（秒）
 
     // M7a: 群消息明文长度上限（单条 UTF-8 字符数；M7b E2EE / M8 媒体另行调整）
     static constexpr int MaxGroupMessageLength = 16384;
