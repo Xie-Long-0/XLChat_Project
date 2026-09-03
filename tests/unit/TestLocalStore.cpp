@@ -425,6 +425,79 @@ private slots:
         store.closeAndDestroy();
     }
 
+    // 群 envelope 密文拦截：group_e2ee / sender_key_distribution 原文绝不落库
+    void upsertNeverPersistsGroupEnvelopeCiphertext()
+    {
+        const QString user = uniqueUser();
+        const QString groupEnv =
+            "{\"v\":1,\"type\":\"group_e2ee\",\"keyId\":\"k1\",\"iteration\":1,"
+            "\"senderDeviceId\":\"devA\",\"iv\":\"aaa\",\"ct\":\"bbb\",\"sig\":\"ccc\"}";
+        const QString distEnv =
+            "{\"v\":1,\"type\":\"sender_key_distribution\",\"groupId\":10,"
+            "\"senderUserId\":7,\"senderDeviceId\":\"devA\",\"keyId\":\"k1\",\"entries\":[]}";
+        // 自校验：测试数据确实被识别为群 envelope（否则拦截断言无意义）
+        QVERIFY(XYChat::Security::GroupE2eeCrypto::looksLikeGroupMessage(groupEnv));
+        QVERIFY(XYChat::Security::GroupE2eeCrypto::looksLikeDistribution(distEnv));
+
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+        // 无 undecryptable 标志、content 直接是群 envelope 原文：也必须被拦截清空
+        QVERIFY(store.upsertMessage(makeMessage(1, 80, groupEnv)));
+        QVERIFY(store.upsertMessage(makeMessage(2, 80, distEnv)));
+
+        const QJsonArray messages = store.loadMessages(80);
+        QCOMPARE(messages.size(), 2);
+        for (const QJsonValue &value : messages) {
+            const QJsonObject msg = value.toObject();
+            QVERIFY2(msg.value("content").toString().isEmpty(),
+                     "group envelope ciphertext must never be cached as content");
+            QVERIFY(msg.value("undecryptable").toBool());
+        }
+        store.closeAndDestroy();
+    }
+
+    void healsLegacyGroupEnvelopeLeakRows()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+        QVERIFY(store.upsertMessage(makeMessage(1, 90, "healthy row")));
+        store.close();
+
+        // 模拟旧缺陷版本写入的群密文污染行：group_e2ee envelope 原文加密落库
+        const QByteArray key = KeyStorage::loadLocalStoreKey(user, DeviceId);
+        QCOMPARE(key.size(), 32);
+        const QString groupEnv =
+            "{\"v\":1,\"type\":\"group_e2ee\",\"keyId\":\"k1\",\"iteration\":1,"
+            "\"senderDeviceId\":\"devA\",\"iv\":\"aaa\",\"ct\":\"bbb\",\"sig\":\"ccc\"}";
+        const auto gcm = XYChat::Security::E2eeCrypto::aesGcmEncrypt(key, groupEnv.toUtf8());
+        QVERIFY(gcm.valid);
+        const QString enc = "enc1:"
+            + QString::fromLatin1(gcm.iv.toBase64()) + QLatin1Char(':')
+            + QString::fromLatin1(gcm.ciphertext.toBase64());
+        {
+            QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE",
+                                                        "healgroupprobe");
+            db.setDatabaseName(LocalStore::dbFilePath(user, DeviceId));
+            QVERIFY(db.open());
+            QSqlQuery query(db);
+            query.prepare(
+                "UPDATE messages SET content_enc = ?, undecryptable = 0 WHERE message_id = 1");
+            query.addBindValue(enc);
+            QVERIFY(query.exec());
+            db.close();
+        }
+        QSqlDatabase::removeDatabase("healgroupprobe");
+
+        // 再次打开触发自愈：群密文污染行被清空为 undecryptable，不再泄漏到 UI
+        QVERIFY(store.open(user, DeviceId));
+        const QJsonArray messages = store.loadMessages(90);
+        QCOMPARE(messages.size(), 1);
+        QVERIFY(messages.at(0).toObject().value("content").toString().isEmpty());
+        QVERIFY(messages.at(0).toObject().value("undecryptable").toBool());
+        store.closeAndDestroy();
+    }
+
     // 回执状态只前进不回退
     void statusOnlyMovesForward()
     {

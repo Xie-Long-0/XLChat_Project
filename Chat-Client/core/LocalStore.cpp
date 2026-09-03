@@ -12,9 +12,11 @@
 
 #include "KeyStorage.h"
 #include "encryption/E2eeCrypto.h"
+#include "encryption/GroupE2eeCrypto.h"
 #include "security/SecureMemory.h"
 
 using XYChat::Security::E2eeCrypto;
+using XYChat::Security::GroupE2eeCrypto;
 using XYChat::Security::SecureMemory;
 
 namespace
@@ -513,7 +515,10 @@ bool LocalStore::upsertMessage(const QJsonObject &msg)
     // 修复：envelope 原文不是明文，绝不落库（否则密文会伪装成正文泄漏到
     // UI）；解密失败时 content 仍残留 envelope，统一清空并标记 undecryptable
     bool markUndecryptable = undecryptable;
-    if (undecryptable || E2eeCrypto::looksLikeEnvelope(content)) {
+    // 密文拦截扩展至群 envelope：私聊/群聊/分发消息原文都绝不落库
+    if (undecryptable || E2eeCrypto::looksLikeEnvelope(content)
+        || GroupE2eeCrypto::looksLikeGroupMessage(content)
+        || GroupE2eeCrypto::looksLikeDistribution(content)) {
         content.clear();
         markUndecryptable = true;
     }
@@ -956,7 +961,11 @@ void LocalStore::healEnvelopeLeaks()
     QList<qint64> leaked;
     while (select.next()) {
         const QString plain = decryptText(select.value(1).toString());
-        if (!plain.isEmpty() && E2eeCrypto::looksLikeEnvelope(plain)) {
+        // 自愈范围扩展至群 envelope：历史泄漏的群密文行同样清空为 undecryptable
+        if (!plain.isEmpty()
+            && (E2eeCrypto::looksLikeEnvelope(plain)
+                || GroupE2eeCrypto::looksLikeGroupMessage(plain)
+                || GroupE2eeCrypto::looksLikeDistribution(plain))) {
             leaked.append(select.value(0).toLongLong());
         }
     }

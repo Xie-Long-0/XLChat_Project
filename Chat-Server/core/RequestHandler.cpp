@@ -1752,6 +1752,12 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
         return;
     }
 
+    // 修复：群 Sender Key 分发引用的预密钥须在入库后消费（claimed->used），与单聊
+    // processSendMessage 一致；否则 claimed 预密钥 10 分钟超时回收为 unused，被后续
+    // fetch_group_keys 以 ORDER BY id 重复 claim，而接收方首次解密已删除本地私钥，
+    // 导致轮换后的新 distribution 永远解不开（群消息显示“无法解密”）
+    QList<qint64> distPrekeyIds;
+
     // M7b fail-closed：群 E2EE 消息入库前必须是合法 envelope 密文（与单聊 decodeEnvelope
     // 强校验一致），拒绝明文或结构非法的 blob 伪装成密文入库与 fan-out
     if (contentType == "e2ee_group") {
@@ -1783,6 +1789,12 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
                          "sender_key_distribution content is not a valid envelope");
             return;
         }
+        // 提取接收方设备条目引用的预密钥（排除发送方自身拷贝 prekeyId=0）
+        for (const auto &e : distEntries) {
+            if (e.envelope.prekeyId > 0) {
+                distPrekeyIds.append(e.envelope.prekeyId);
+            }
+        }
     }
 
     // M5.5 幂等重试优先：同键消息已存在时直接返回
@@ -1806,6 +1818,11 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
         sendResponse(packet.requestId, MessageType::SendMessageResponse,
                      ErrorCode::InternalError, "Failed to send message");
         return;
+    }
+
+    // 修复：群分发入库后消费其引用的预密钥（claimed->used），杜绝超时回收后重复 claim
+    if (!distPrekeyIds.isEmpty()) {
+        m_db->consumePrekeys(distPrekeyIds);
     }
 
     const QString createdAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);

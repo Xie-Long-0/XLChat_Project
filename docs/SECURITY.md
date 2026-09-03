@@ -26,7 +26,7 @@
 - **存储密钥**：每账号+设备随机生成 32 字节密钥（OpenSSL RAND_bytes），经 `KeyStorage` DPAPI 保护（`localstore/<account>_<device>.key`）；密钥仅驻留进程内存，关闭时安全清零。密钥无法持久化时禁用缓存（宁可无缓存不落明文）；密钥文件存在但 DPAPI 还原失败时拒绝启用，绝不用新密钥覆盖导致旧密文永久不可解。
 - **登出清除**：登出/切换账号时清除用户可见数据（消息/会话/outbox/同步游标）；**解密缓存与存储密钥作为 E2EE 密钥材料保留**——一次性预密钥消费后不可恢复，登出重登必须依靠解密缓存兜底（与 M6 产品承诺一致，等价于主流 IM 的本地密钥材料留存）；E2EE 身份密钥同样由 `KeyStorage` 保留复用。彻底销毁（删库+删密钥，旧密文不可再恢复）仅供显式销毁场景。
 - **幂等防重**：持久化 outbox 重发沿用 `clientMessageId` 服务端幂等去重，重启/断线重连不产生重复消息。
-- **密文不落库**：解密失败的 envelope 原文绝不作为正文写入本地库（统一清空并标记 undecryptable），历史污染行在打开时自动检出并修复，避免密文伪装成正文泄漏到 UI。
+- **密文不落库/不显示**：解密失败的 envelope 原文（私聊 `e2ee`、群聊 `group_e2ee` 与 `sender_key_distribution`）绝不作为正文写入本地库或渲染到 UI（统一清空并标记 undecryptable，UI 显示“无法解密”占位）；`upsertMessage` 落库拦截与 `healEnvelopeLeaks` 打开时自愈均覆盖上述三类 envelope，历史污染行自动检出并清空（2026-09-03 修复：此前群 envelope 未纳入拦截/自愈，且 `sync_messages` 曾 emit 未解密数组致密文当正文显示）。
 - **边界**：本地缓存为展示层缓存，权威数据以服务端为准；拥有本机用户权限者可经 DPAPI 还原存储密钥进而读取缓存（与主流 IM 本地存储模型一致，不抵抗本机管理员）。
 
 ### 群聊端到端加密（M7b）
@@ -35,7 +35,7 @@
 
 - **密钥体系**：每个发送方在每个群独立生成 SenderKey（32 字节 chain key + Ed25519 签名密钥对，`keyId` = SHA-256(签名公钥) hex 前 32 字符）；chain key 经 HKDF-SHA256 ratchet（salt `xychat-grp-chain`）逐条派生消息密钥，具备链式前向安全。
 - **消息加密与认证**：AES-256-GCM（随机 12B IV）加密，发送方 Ed25519 私钥签名覆盖 `iv || ciphertext`，接收方验签失败/iteration 回滚/篡改均拒绝解密。
-- **密钥分发**：chain key 复用 M6 pairwise E2EE（X25519 身份/预密钥）逐成员逐设备加密，以 `contentType=sender_key_distribution` 群消息投递；`fetch_group_keys` 仅限群成员且与 `fetch_keys` 共享连接级限流（60s/20 次），防预密钥池耗尽。
+- **密钥分发**：chain key 复用 M6 pairwise E2EE（X25519 身份/预密钥）逐成员逐设备加密，以 `contentType=sender_key_distribution` 群消息投递；`fetch_group_keys` 仅限群成员且与 `fetch_keys` 共享连接级限流（60s/20 次），防预密钥池耗尽。分发经 `send_message` 入库后消费其引用的预密钥（`claimed→used`，与单聊 `processSendMessage` 一致），否则 `claimed` 预密钥 10 分钟超时回收为 `unused` 被重复 claim，而接收方首次解密已删除本地私钥，致轮换后的新分发永久不可解（2026-09-03 修复）。
 - **DoS 防护**：单次解密 ratchet 跳跃上限 `MaxRatchetSteps = 2000`，envelope `iteration` 绝对上界 `MaxMessageIteration = 1e8`；恶意超大 iteration 在触发任何 HKDF 运算前即被拒绝（2026-09-02 安全审查修复）。
 - **服务端 fail-closed**：`e2ee_group` 与 `sender_key_distribution` 正文入库/fan-out 前强制 decode 校验（含 `senderDeviceId` 非空、条目非空、`groupId` 与会话一致），非法返回 `E2eeInvalidEnvelope (3008)`，无静默放行路径；群系统消息（`contentType=system`）仅含元数据不含用户正文，不加密。
 - **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。

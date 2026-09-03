@@ -1296,8 +1296,8 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
     // M7b: 群聊 Sender Key 分发消息
     if (GroupE2eeCrypto::looksLikeDistribution(content)) {
         processGroupSenderKeyDistribution(msg);
-        msg["content"] = QStringLiteral("[Sender key updated]");
-        msg["contentType"] = QStringLiteral("system");
+        msg["content"] = "[Sender key updated]";
+        msg["contentType"] = "system";
         return;
     }
 
@@ -1310,6 +1310,8 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
     bool undecryptable = false;
     const QString plain = decryptIncomingContent(content, &undecryptable);
     if (undecryptable) {
+        // 防御统一：解密失败一律清空 content，绝不把 envelope 原文透传给 UI/落库
+        msg["content"] = QString();
         msg["undecryptable"] = true;
     } else {
         msg["content"] = plain;
@@ -1420,6 +1422,9 @@ void NetworkManager::handleFetchGroupKeysResponse(const Packet &packet)
 
     const QJsonObject data = response.value("data").toObject();
     const QJsonObject bundlesByUser = data.value("bundles").toObject();
+    // 诊断：服务端返回的成员密钥包数量（少于群成员数说明有人被 fetch_group_keys 跳过）
+    qInfo() << "[NetMgr] FetchGroupKeys for conv" << convId
+            << "returned member bundles:" << bundlesByUser.size();
     const QString distribution = buildGroupSenderKeyDistribution(convId, bundlesByUser);
     if (!distribution.isEmpty()) {
         const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -1460,6 +1465,8 @@ QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
 
     QList<GroupE2eeCrypto::DistributionEntry> entries;
     const QString chainKeyB64 = QString::fromLatin1(key.chainKey.toBase64());
+    int coveredUsers = 0;
+    QList<qint64> skippedUsers;
 
     for (auto it = bundlesByUser.constBegin(); it != bundlesByUser.constEnd(); ++it) {
         const qint64 userId = it.key().toLongLong();
@@ -1468,18 +1475,23 @@ QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
         }
         const QJsonArray bundles = it.value().toArray();
         if (bundles.isEmpty()) {
+            // 该成员无密钥包：未注册 E2EE 或预密钥耗尽被服务端 fetch_group_keys 跳过
+            skippedUsers.append(userId);
             continue;
         }
         // 复用 pairwise E2EE 加密 chainKey，然后解析出各设备条目
         const QString envelope = encryptForUser(userId, bundles, chainKeyB64);
         if (envelope.isEmpty()) {
+            skippedUsers.append(userId);
             continue;
         }
         bool ok = false;
         const auto deviceEntries = E2eeCrypto::decodeEnvelope(envelope, &ok);
         if (!ok) {
+            skippedUsers.append(userId);
             continue;
         }
+        ++coveredUsers;
         for (const auto &entry : deviceEntries) {
             GroupE2eeCrypto::DistributionEntry distEntry;
             distEntry.userId = userId;
@@ -1488,6 +1500,10 @@ QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
             entries.append(distEntry);
         }
     }
+
+    // 诊断：暴露分发覆盖了哪些成员、跳过了哪些（跳过者将收不到 chain key → 群消息不可解）
+    qInfo() << "[NetMgr] Built group sender key distribution for conv" << conversationId
+            << "coveredUsers" << coveredUsers << "skippedUsers" << skippedUsers;
 
     if (entries.isEmpty()) {
         SecureMemory::wipe(key.chainKey);
@@ -1575,15 +1591,27 @@ bool NetworkManager::processGroupSenderKeyDistribution(const QJsonObject &msg)
     }
 
     QByteArray decryptedChainKeyB64;
+    bool foundSelfEntry = false;
+    // 修复：遍历所有属于本机的条目逐个尝试（与单聊 decryptIncomingContent 一致），
+    // 不因第一个条目失败就放弃——本机可能同时有预密钥条目与自身拷贝条目
+    // （prekeyId=0，仅身份密钥加密），后者在预密钥已消费时仍可稳定解出
     for (const auto &entry : entries) {
         if (entry.userId == m_userId && entry.deviceId == m_localDeviceId) {
+            foundSelfEntry = true;
             decryptedChainKeyB64 = decryptEnvelopeEntry(entry.envelope, m_identityKey, m_localPrekeys,
                                                         m_username, m_localDeviceId);
-            break;
+            if (!decryptedChainKeyB64.isEmpty()) {
+                break;
+            }
         }
     }
     if (decryptedChainKeyB64.isEmpty()) {
-        qWarning() << "[NetMgr] Failed to decrypt sender key distribution for group" << convId;
+        // 诊断：区分“分发中无本机条目”（发送方 fetch_group_keys 未覆盖本机/预密钥耗尽）
+        // 与“有条目但解密失败”（本机 E2EE 私钥/预密钥不匹配）
+        qWarning() << "[NetMgr] Group sender key distribution unusable for group" << convId
+                   << "sender" << senderUserId << "selfEntryPresent" << foundSelfEntry
+                   << "entries" << entries.size() << "identityKeyValid" << m_identityKey.valid
+                   << "localPrekeys" << m_localPrekeys.size();
         return false;
     }
 
@@ -1645,6 +1673,13 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
     GroupE2eeCrypto::EncryptedMessage encrypted;
     QString senderDeviceId;
     if (!GroupE2eeCrypto::decodeGroupMessage(content, encrypted, &senderDeviceId)) {
+        // 修复：decode 失败也必须清空 content 并标记 undecryptable，
+        // 否则群 envelope 原文会透传到 UI/落库（密文当正文显示）
+        qWarning() << "[NetMgr] Group envelope decode failed for conversation" << convId
+                   << "sender" << msg.value("senderId").toVariant().toLongLong()
+                   << "contentLength" << content.size();
+        msg["content"] = QString();
+        msg["undecryptable"] = true;
         return false;
     }
 
@@ -1996,10 +2031,16 @@ void NetworkManager::handleSyncMessagesResponse(const Packet &packet)
             m_localStore.upsertMessage(msg);
             visibleMessages.append(msg);
         }
-        emit messagesSynced(
-            data.value("conversationId").toVariant().toLongLong(),
-            messages,
-            data.value("hasMore").toBool());
+        // 修复：emit 解密后的 visibleMessages（原始 messages 的 content 为 envelope
+        // 密文且无 undecryptable 标记，直接渲染会把密文当正文显示——私聊离线/群聊历史）
+        // 边界保护：本页全为不可见消息（如密钥分发）时跳过 emit，
+        // 避免用空列表覆盖此前由本地缓存填充的聊天视图
+        if (messages.isEmpty() || !visibleMessages.isEmpty()) {
+            emit messagesSynced(
+                data.value("conversationId").toVariant().toLongLong(),
+                visibleMessages,
+                data.value("hasMore").toBool());
+        }
     }
 }
 
@@ -2091,6 +2132,8 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
                 if (ct == QLatin1String("sender_key_distribution")
                     || GroupE2eeCrypto::looksLikeDistribution(c)) {
                     processGroupSenderKeyDistribution(payload);
+                    // 分发消息不展示：清空 content，避免 envelope 原文随 eventsSynced 外发
+                    payload["content"] = QString();
                 } else {
                     decryptMessageObject(payload);
                 }
