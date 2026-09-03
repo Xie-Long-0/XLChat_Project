@@ -38,9 +38,9 @@
 
 | 能力域 | 现状 |
 | --- | --- |
-| 账户与认证 | 注册/登录/登出/token 续期/`terminate_session`（仅本人其他会话）；PBKDF2 密码存储；登录失败限流（IP 5min/10 次、用户 5min/5 次）；多设备识别（`deviceId` 取自机器唯一 ID）。**未实现**：逐包验 token、`validateSession()` 回查 DB、双因素认证、注销/找回 |
+| 账户与认证 | 注册/登录/登出/token 续期/`terminate_session`（仅本人其他会话）；PBKDF2 密码存储；登录失败限流（IP 5min/10 次、用户 5min/5 次）；多设备识别（`deviceId` 取自机器唯一 ID）；**逐包验 token + `validateSession()` 回查 `sessions` 表**（2026-09-02 P1 修复：过期/终止/续期换代即时失效，`expiresAt` 解析异常 fail-closed）。**未实现**：双因素认证、注销/找回、会话过期后客户端自动重登 UX |
 | 一对一聊天 | E2EE（envelope 密文，服务端 fail-closed）、`clientMessageId` 幂等、乐观发送 UI、per-recipient 回执（delivered/read）、消息状态实时推送、离线 outbox（加密持久化，跨重启重发） |
-| 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：成员变更密钥 healing 与失权回收、大群拉取模式、改群名接口（数据层已就绪） |
+| 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；**成员变更 Sender-Key healing**（2026-09-02 P1 修复：`member_added/removed/left` 触发本端轮换+重分发，新成员获密钥、被移除成员失后续解密能力，离线经 `sync_events` 补偿）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：大群拉取模式、改群名接口（数据层已就绪） |
 | 本地存储 | `LocalStore`（SQLite，按账号+设备隔离）：消息/会话预览/outbox/解密缓存 AES-256-GCM 加密落库，存储密钥 DPAPI 保护；M7b 起含 `sender_keys` 表；登出清用户可见数据、保留密钥材料 |
 | 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）。**未实现**：已读状态向已读者自身其他设备同步、服务端事件保留清理、编辑/删除/置顶/静音 |
 | 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer） |
@@ -79,7 +79,7 @@
 
 - 交付：TLS 1.2+（开发自签 CA 自动生成，SAN localhost/127.0.0.1）；fail-closed（无静默降级路径，开发明文需 `--allow-plaintext`/`XYCHAT_ALLOW_PLAINTEXT=1` 显式开关）；timestamp/nonce 强制必填 + 全局 `NonceCache`（TTL 600s、上限 10 万条、跨连接）；会话/消息接口先授权再查询（`isConversationMember`/`canAccessMessage`，越权 3006）；`force_logout` 改 `terminate_session`（仅本人会话）；handler 线程内发送代理（消除跨线程写 socket）；`clientMessageId` 幂等键 + 部分唯一索引 + 内存 outbox；`message_receipts` 回执表 + 成员读游标（只前进）；`sync_events` 账号级游标接口。
 - 验证：`TestSecurity`（nonce 系列）、`TestDatabaseManager`（越权拒绝/幂等去重/回执聚合/读游标单调/sync_events 游标）。
-- 已知限制：逐包验 token 未实施；nonce 缓存单服务器内存态；端到端 TLS 集成测试缺失。
+- 已知限制：nonce 缓存单服务器内存态；端到端 TLS 集成测试缺失。（逐包验 token 已于 2026-09-02 P1 修复实施，见变更记录）
 
 ### M6：一对一 E2EE（2026-08-17，08-20 联调修复）
 
@@ -102,7 +102,7 @@
 
 - 交付：`CommonModule/encryption/GroupE2eeCrypto`（简化 Signal Sender Keys）——每发送方每群独立 `SenderKey`（32B chain key + Ed25519 签名密钥对，`keyId` = SHA-256(签名公钥) hex 前 32 字符）；chain key 经 HKDF-SHA256 ratchet（salt `xychat-grp-chain`）派生消息密钥；群消息 AES-256-GCM 加密 + Ed25519 签名（覆盖 `iv || ciphertext`）；群消息 envelope（`contentType=e2ee_group`）含 `keyId`/`iteration`/`senderDeviceId`；sender-key 分发（`contentType=sender_key_distribution`）复用 M6 pairwise E2EE 逐设备加密 chain key（base64）；服务端 `fetch_group_keys`（类型 71/72）一次性返回全群成员密钥包（共享 fetch_keys 限流窗口）；服务端对两类群正文 fail-closed 校验（非法返回 3008）；客户端 `LocalStore.sender_keys` 表加密保存 chain key/签名密钥对/迭代数，登出保留；分发消息只处理不展示不落库。安全修复：ratchet DoS 上限（`MaxRatchetSteps=2000`、`MaxMessageIteration=1e8`）。
 - 验证：`TestGroupE2eeCrypto` 20 用例（原语/ratchet/篡改与回滚拒绝/DoS 上限/envelope 编解码/fail-closed）；`tests/e2e/TestGroupRepro` 双客户端全链路（建群→分发→加密收发→登出重登→再发）退出码 0；`ctest` 6/6 通过；M7a 验收标准一并经联调确认。
-- 已知限制：成员加入/退出的密钥 healing 与失权成员回收未实现（新成员需发送方手动重新分发或重新登录触发；被移除成员未被轮换出局）。
+- 已知限制：成员加入/退出的密钥 healing 与失权回收已于 2026-09-02 P1 修复实施（成员变更触发轮换+重分发，见变更记录）；残留：大群（成员设备数约 >60）单条 `sender_key_distribution` 可能超 16384 字符上限致分发失败（与大群拉取模式一并留待后续）；轮换采用“先落盘后分发”，分发永久失败时存在群解密不可用窗口（沿用 M7b 既有模式，均登记为 P2 欠账）。
 
 ## 3. 已知欠账与风险清单
 
@@ -110,9 +110,10 @@
 
 | 优先级 | 类别 | 条目 | 来源 | 影响/说明 |
 | --- | --- | --- | --- | --- |
-| P1 | 安全 | `RequestHandler::validateSession()` 仅查内存态（`m_currentSessionId`/`m_authenticatedUserId`），不回查 `sessions` 表 | 2026-09-02 周度审查 | token 被 `terminate_session`/过期/登出后，存量连接在其生命周期内仍可能通过校验；修复方向：逐请求回查 DB（带短 TTL 缓存）或结合逐包验 token |
-| P1 | 安全 | 除续期外命令未逐包验 token / TLS channel 绑定 | M5.5 遗留 | 认证依赖连接级内存状态，断线重连必须重新登录；与上一条同根源，宜一并设计 |
-| P1 | 功能 | 群成员变更 Sender-Key healing 与失权回收 | M7b 遗留 | 新成员可能收不到既有发送方密钥（需手动重分发/重登触发）；被移除成员保留旧 chain key（缺乏后向安全）；需设计成员变更触发的重分发与轮换 |
+| P2 | 安全 | 会话过期/被终止后客户端缺自动重登 UX | 2026-09-02 P1 修复审查 | 服务端已逐包验 token 并对失效会话回 `Error`，客户端已清理在途单发槽位避免卡死，但未触发重新登录提示；`renewToken()` 暂无调用点（7 天 TTL 到期后需手动重登） |
+| P2 | 功能 | 大群单条 `sender_key_distribution` 超 16384 字符上限 | 2026-09-02 P1 修复审查 | 成员设备数约 >60 时首次分发/healing 分发消息超限被服务端拒（`InvalidRequest`）；需分片分发或提高上限（与 P3 大群拉取模式相关） |
+| P2 | 安全 | 群 Sender-Key “先落盘后分发”，分发永久失败留解密窗口 | 2026-09-02 P1 修复审查 | 轮换后新 key 在分发 ACK 前即启用；瞬时失败已延迟重试，确定性失败（如超大群）下本端以新 keyId 加密而他人未收到 → 群消息不可解；建议改为 ACK 后启用/pending 提交 |
+| P3 | 工程 | 群成员变更 healing 的 O(N²) 重分发与预密钥消耗 | 2026-09-02 P1 修复审查 | 一次成员变更触发全员各自轮换+重分发；已加同群去重与单发槽位节流，但大群跨成员风暴仍需聚合策略（如群主统一分发或延迟合并） |
 | P2 | 工程 | `sync_events` 无保留清理机制 | M9 盘点 | 事件表无限增长；清理需保证落后设备可回退全量拉取（`sync_messages`/`get_conversations`）不破坏历史 |
 | P2 | 功能 | 已读状态多端同步缺失 | M9 盘点 | receipt 聚合事件只写发送方事件流；已读者自身其他设备无事件源，未读数/已读态不同步 |
 | P2 | 工程 | 发消息/搜索限流未实施 | M11 前置项（2026-08-21 曾建议随 M6.5/M7 落地，未实施） | `send_message`（私聊/群聊）与 `search_users` 无每用户频率限制 |
@@ -196,15 +197,14 @@
 
 ## 5. 推荐执行顺序（2026-09-02 重排）
 
-下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**：
+下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**（原第 1 项 `validateSession()` 回查 DB + 逐包验 token、原第 4 项 M7b healing 已于 2026-09-02 P1 修复完成）：
 
-1. **`validateSession()` 回查 DB 修复**（P1 安全欠账，改动小，可单独实施或与后续任一项合并）。
-2. **M11 前置两项：发消息/搜索限流 + 结构化日志**（服务端横切能力，越早落地后续功能越早受益）。
-3. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理**（收掉 M9 三条基础验收）。
-4. **M7b healing：成员变更 Sender-Key 重分发与失权回收**（群 E2EE 安全闭环）。
-5. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
-6. **M8 媒体文件**。
-7. **M10 搜索/通知/体验**。
+1. **M11 前置两项：发消息/搜索限流 + 结构化日志**（服务端横切能力，越早落地后续功能越早受益）。
+2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理**（收掉 M9 三条基础验收）。
+3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期**（P1 修复配套收尾，见欠账清单 P2）。
+4. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
+5. **M8 媒体文件**。
+6. **M10 搜索/通知/体验**。
 
 ## 6. 目录结构（2026-09-02 与实际仓库同步）
 
@@ -289,4 +289,5 @@ XYChat_Project/
 | 2026-08-21 | 路线图调整 + M6.5/M7a 完成 | 新增 M6.5；M7 拆 M7a/M7b；M9 范围收缩；M6.5 落地；M7a 三子任务（协议与数据模型/服务端处理器与 fan-out/客户端 UI）落地 |
 | 2026-08-22 | M7a.3 热修复 + M7b 实现 | 修复群聊联调崩溃（WER 定位 QML delegate 悬空通知端点：会话列表 clear+全量重建改差分更新、移除消息列表 add 动画、LocalStore 连接自愈与驱动检查，提交 `bafd4f6`）；M7b Sender-Key 群 E2EE 实现并双客户端联调通过（代码随 2026-09-02 安全修复后一并提交 `c806d90`） |
 | 2026-08-26 | 安全审查 | 发现 GroupE2eeCrypto ratchet 循环无上限（DoS）、服务端群消息缺 envelope fail-closed 校验、`validateSession()` 仅查内存态三项问题 |
-| 2026-09-02 | 安全修复 + M7b 入库 + 文档重构 | DoS 上限（`MaxRatchetSteps`/`MaxMessageIteration`）与服务端群 envelope fail-closed 落地（`TestGroupE2eeCrypto` 扩至 20 用例）；群聊横幅改为"已启用端到端加密"；M7b 连同修复提交（`c806d90`）；周度审查确认欠账清单；ROADMAP 完全重构（本版本），`validateSession()` 修复仍待实施 |
+| 2026-09-02 | 安全修复 + M7b 入库 + 文档重构 | DoS 上限（`MaxRatchetSteps`/`MaxMessageIteration`）与服务端群 envelope fail-closed 落地（`TestGroupE2eeCrypto` 扩至 20 用例）；群聊横幅改为"已启用端到端加密"；M7b 连同修复提交（`c806d90`）；周度审查确认欠账清单；ROADMAP 完全重构（本版本），`validateSession()` 等 P1 修复见下一行 |
+| 2026-09-02 | P1 欠账修复（3 项） | ① `validateSession()` 逐请求回查 `sessions` 表 + 过期 fail-closed（`token_renew` 豁免过期门）；② 逐包验 token（客户端已认证请求经 `addReplayProtection` 携带 `token`，服务端逐包比对哈希；新增客户端 `MessageType::Error` 处理清理在途槽位）；③ 群成员变更 Sender-Key healing（`member_added/removed/left` 触发本端轮换+重分发，离线经 `sync_events` 补偿，含同群去重/队列/瞬时失败延迟重试）。新增回归用例 `sessionByIdReflectsDeletionAndExpiry`、`senderKeyRotationRevokesRemovedMember`；`ctest` 6/6 通过；审查发现的大群分发上限/先落盘后分发/会话过期重登 UX/O(N²) 重分发登记为新欠账（P2/P3） |

@@ -212,8 +212,8 @@ void RequestHandler::processPacket(const Packet &packet)
         return;
     }
 
-    // 需要认证的请求：先验证 session token
-    if (!validateSession()) {
+    // 需要认证的请求：逐包验证 session token（P1 安全加固：回查 DB + 校验携带 token）
+    if (!validateSession(json)) {
         sendResponse(packet.requestId, MessageType::Error, ErrorCode::SessionInvalid,
                      "Authentication required");
         return;
@@ -1847,13 +1847,51 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
                  "Message sent", data);
 }
 
-// Session 验证
-bool RequestHandler::validateSession()
+// Session 验证（P1 安全加固 2026-09-02）
+// 除连接级内存态外，逐请求回查 sessions 表并校验客户端携带的 token，
+// 消除“token 被终止/过期/续期换代后存量连接仍可通过校验”的漏洞：
+// - session 被删除（logout/terminate_session/续期换代）后立即失效；
+// - session 过期（expires_at）后拒绝；
+// - 请求必须携带与当前 session token 哈希一致的 token（逐包验 token）。
+bool RequestHandler::validateSession(const QJsonObject &request)
 {
-    if (m_currentSessionId > 0 && m_authenticatedUserId > 0) {
-        return true;
+    if (m_currentSessionId <= 0 || m_authenticatedUserId <= 0) {
+        return false;
     }
-    return false;
+
+    auto sessionOpt = m_db->getSessionById(m_currentSessionId);
+    if (!sessionOpt.has_value()) {
+        // session 已不存在：已被登出/终止/续期换代删除
+        return false;
+    }
+    const SessionInfo &session = *sessionOpt;
+    if (session.userId != m_authenticatedUserId) {
+        qWarning() << "[Handler] Session/user mismatch for session" << m_currentSessionId;
+        return false;
+    }
+
+    // 过期校验（fail-closed）：expiresAt 格式异常一律拒绝，不放行；
+    // token_renew 豁免过期门，允许对已过期会话续期（其余请求过期即拒）
+    const QDateTime expiresAt = QDateTime::fromString(session.expiresAt, Qt::ISODate);
+    if (!expiresAt.isValid()) {
+        qWarning() << "[Handler] Unparseable session expiresAt for session" << m_currentSessionId;
+        return false;
+    }
+    const bool isRenew = request.value("type").toString() == QLatin1String("token_renew");
+    if (!isRenew && expiresAt < QDateTime::currentDateTimeUtc()) {
+        return false;
+    }
+
+    // 逐包验 token：请求必须携带与 session 记录一致的 token
+    const QString suppliedToken = request.value("token").toString();
+    if (suppliedToken.isEmpty()) {
+        return false;
+    }
+    if (EncryptionManager::hashToken(suppliedToken) != session.tokenHash) {
+        qWarning() << "[Handler] Per-packet token mismatch for user" << m_authenticatedUserId;
+        return false;
+    }
+    return true;
 }
 
 // 限流检查

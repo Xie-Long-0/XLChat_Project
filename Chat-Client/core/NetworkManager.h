@@ -127,6 +127,8 @@ private:
     void handleRegisterResponse(const XYChat::Protocol::Packet &packet);
     void handleLogoutResponse(const XYChat::Protocol::Packet &packet);
     void handleTokenRenewResponse(const XYChat::Protocol::Packet &packet);
+    // P1: 服务端 MessageType::Error 回包（鉴权门/校验失败）：清理在途单发槽位并推进 healing 队列
+    void handleErrorResponse(const XYChat::Protocol::Packet &packet);
     // M3 响应处理
     void handleSearchUsersResponse(const XYChat::Protocol::Packet &packet);
     void handleAddContactResponse(const XYChat::Protocol::Packet &packet);
@@ -180,6 +182,10 @@ private:
     bool processGroupSenderKeyDistribution(const QJsonObject &msg);
     QString encryptGroupMessage(qint64 conversationId, const QString &plaintext);
     bool decryptGroupMessageObject(QJsonObject &msg);
+    // P1-3: 群成员变更触发本端 Sender-Key 轮换与重分发（新成员获得密钥、
+    // 被移除成员因轮换失去后续消息解密能力）；单发槽位占用时入队待推进
+    void healGroupSenderKey(qint64 conversationId);
+    void drainHealQueue(); // P1-3: 单发槽位空闲且就绪时从队列推进一个群的轮换重分发
     // M6.5: 本地持久化缓存
     // 登录后打开本地加密库：加载持久化 outbox、立即展示缓存会话、游标增量同步
     void openLocalStore();
@@ -236,6 +242,7 @@ private:
     qint64 m_fetchGroupKeysTargetConvId = 0;
     QSet<QString> m_pendingGroupDistributions; // clientMessageId 集合：等待 ACK 的分发消息
     QHash<qint64, XYChat::Security::GroupE2eeCrypto::SenderKey> m_groupSenderKeys; // 内存缓存
+    QSet<qint64> m_healQueue; // P1-3: 待轮换重分发的群（单发槽位占用时排队）
 
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem

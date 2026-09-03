@@ -104,7 +104,7 @@ private:
                       const QString &message,
                       const QJsonObject &data = {});
     void sendPacket(const XYChat::Protocol::Packet &packet);
-    bool validateSession();
+    bool validateSession(const QJsonObject &request);
     bool checkRateLimit(const QString &ipAddress, qint64 userId);
 
 private:

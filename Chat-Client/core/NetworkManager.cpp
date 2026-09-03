@@ -155,6 +155,7 @@ void NetworkManager::onDisconnected()
     m_fetchGroupKeysTargetConvId = 0;
     m_pendingGroupDistributions.clear();
     m_groupSenderKeys.clear();
+    m_healQueue.clear();
     setState(ConnectionState::Disconnected);
 
     if (shouldRelogin) {
@@ -378,6 +379,10 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::TokenRenewResponse:
         handleTokenRenewResponse(packet);
         break;
+    // P1: 服务端鉴权门/校验失败以 MessageType::Error 回包（非对应响应类型）
+    case MessageType::Error:
+        handleErrorResponse(packet);
+        break;
     // M3 响应分发
     case MessageType::SearchUsersResponse:
         handleSearchUsersResponse(packet);
@@ -584,6 +589,7 @@ void NetworkManager::resetAuthState()
     m_fetchGroupKeysTargetConvId = 0;
     m_pendingGroupDistributions.clear();
     m_groupSenderKeys.clear();
+    m_healQueue.clear();
     XYChat::Security::SecureMemory::wipe(m_identityKey.privateKey);
     m_identityKey = {};
     for (auto &pk : m_localPrekeys) {
@@ -606,6 +612,12 @@ void NetworkManager::addReplayProtection(QJsonObject &json)
 {
     json["timestamp"] = QDateTime::currentSecsSinceEpoch();
     json["nonce"] = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    // P1-2 逐包验 token：仅在已认证状态携带当前 session token，
+    // 服务端 validateSession 逐包校验其哈希与 sessions 表记录一致。
+    // 认证态判断避免登录/注册（认证前）与重连重登路径把 stale token 写入报文。
+    if (m_state == ConnectionState::Authenticated && !m_sessionToken.isEmpty()) {
+        json["token"] = m_sessionToken;
+    }
 }
 
 // M3: 用户搜索
@@ -951,6 +963,8 @@ void NetworkManager::handleRegisterKeysResponse(const Packet &packet)
                 << m_serverPrekeyRemaining;
         // 引导完成后继续发送 outbox
         flushOutbox();
+        // P1-3: E2EE 就绪后排空离线期间排队的群 healing（登录时 sync_events 早于本响应）
+        drainHealQueue();
     } else {
         qWarning() << "[NetMgr] RegisterKeys failed:"
                    << response.value("message").toString() << ", retry in 3s";
@@ -1390,34 +1404,46 @@ void NetworkManager::handleFetchGroupKeysResponse(const Packet &packet)
     const int code = response.value("code").toInt();
     if (code != static_cast<int>(ErrorCode::Ok) || convId <= 0) {
         qWarning() << "[NetMgr] FetchGroupKeys failed:" << response.value("message").toString();
-        // 保持 outbox，稍后由重连或下一条消息触发重试
+        // P1-3: 瞬时失败（限流/内部错误/超时）延迟重试轮换，避免后向安全窗口；
+        // 确定性失败（越权/会话不存在）丢弃，待下次成员变更或发送再触发
+        const bool transient = code == static_cast<int>(ErrorCode::LoginRateLimited)
+            || code == static_cast<int>(ErrorCode::InternalError)
+            || code == static_cast<int>(ErrorCode::Timeout);
+        if (transient && convId > 0) {
+            m_healQueue.insert(convId);
+            QTimer::singleShot(5000, this, [this]() { drainHealQueue(); });
+        } else {
+            drainHealQueue();
+        }
         return;
     }
 
     const QJsonObject data = response.value("data").toObject();
     const QJsonObject bundlesByUser = data.value("bundles").toObject();
     const QString distribution = buildGroupSenderKeyDistribution(convId, bundlesByUser);
-    if (distribution.isEmpty()) {
+    if (!distribution.isEmpty()) {
+        const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        QJsonObject json;
+        json["type"] = "send_message";
+        json["conversationId"] = convId;
+        json["content"] = distribution;
+        json["contentType"] = "sender_key_distribution";
+        json["clientMessageId"] = clientMessageId;
+        addReplayProtection(json);
+
+        Packet distPacket;
+        distPacket.messageType = MessageType::SendMessageRequest;
+        distPacket.requestId = nextRequestId();
+        distPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+        m_pendingSendByRequestId.insert(distPacket.requestId, clientMessageId);
+        m_pendingGroupDistributions.insert(clientMessageId);
+        sendPacket(distPacket);
+    } else {
         qWarning() << "[NetMgr] Failed to build group sender key distribution for" << convId;
-        return;
     }
 
-    const QString clientMessageId = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    QJsonObject json;
-    json["type"] = "send_message";
-    json["conversationId"] = convId;
-    json["content"] = distribution;
-    json["contentType"] = "sender_key_distribution";
-    json["clientMessageId"] = clientMessageId;
-    addReplayProtection(json);
-
-    Packet distPacket;
-    distPacket.messageType = MessageType::SendMessageRequest;
-    distPacket.requestId = nextRequestId();
-    distPacket.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
-    m_pendingSendByRequestId.insert(distPacket.requestId, clientMessageId);
-    m_pendingGroupDistributions.insert(clientMessageId);
-    sendPacket(distPacket);
+    // P1-3: 推进 healing 队列（逐群轮换，单发槽位约束下每次一个）
+    drainHealQueue();
 }
 
 QString NetworkManager::buildGroupSenderKeyDistribution(qint64 conversationId,
@@ -1669,6 +1695,67 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
     m_localStore.saveSenderKey(convId, senderUserId, senderDeviceId, encrypted.keyId,
                                chainKey, publicSigningKey, QByteArray(), iteration);
     return true;
+}
+
+// P1-3: 触发指定群的 Sender-Key 轮换与重分发。
+// 复用 fetch_group_keys → buildGroupSenderKeyDistribution（内部 generateSenderKey 生成新 keyId）
+// → 以 sender_key_distribution 群消息分发；pairwise 条目仅现任成员可解，
+// 从而新成员获得当前密钥、被移除成员因密钥轮换失去后续消息的解密能力（后向安全）。
+void NetworkManager::healGroupSenderKey(qint64 conversationId)
+{
+    if (conversationId <= 0) {
+        return;
+    }
+    // 去重：同一群已在途或已排队时跳过（避免成员变更风暴放大预密钥消耗）
+    if (m_fetchGroupKeysTargetConvId == conversationId || m_healQueue.contains(conversationId)) {
+        return;
+    }
+    // 未认证/E2EE 未就绪/单发槽位被占用：入队待推进（不丢弃，保证离线补偿与登录后补触发）
+    if (m_state != ConnectionState::Authenticated || !m_e2eeReady
+        || m_pendingFetchGroupKeysRequestId != 0) {
+        m_healQueue.insert(conversationId);
+        return;
+    }
+    sendFetchGroupKeysRequest(conversationId);
+}
+
+// P1-3: 单发槽位空闲且已就绪时，从队列取出一个群推进轮换重分发（每次一个，
+// 其响应回到 handleFetchGroupKeysResponse 后继续推进，天然受 fetch 限流节流）
+void NetworkManager::drainHealQueue()
+{
+    if (m_state != ConnectionState::Authenticated || !m_e2eeReady
+        || m_pendingFetchGroupKeysRequestId != 0 || m_healQueue.isEmpty()) {
+        return;
+    }
+    auto next = m_healQueue.constBegin();
+    const qint64 nextConv = *next;
+    m_healQueue.erase(next);
+    sendFetchGroupKeysRequest(nextConv);
+}
+
+// P1: 服务端 MessageType::Error 回包处理（鉴权门 validateSession 失败、校验拒绝等）。
+// 关键作用：清理在途单发槽位，避免 Error 回包（非对应响应类型）导致
+// m_pendingFetchGroupKeysRequestId 永久占用 → healing 队列与 outbox 群分支卡死。
+void NetworkManager::handleErrorResponse(const Packet &packet)
+{
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt();
+    qWarning() << "[NetMgr] Server error response, code" << code
+               << "message" << response.value("message").toString();
+
+    if (packet.requestId != 0 && packet.requestId == m_pendingFetchGroupKeysRequestId) {
+        m_pendingFetchGroupKeysRequestId = 0;
+        m_fetchGroupKeysTargetConvId = 0;
+        drainHealQueue();
+    }
+    if (packet.requestId != 0 && packet.requestId == m_pendingFetchKeysRequestId) {
+        m_pendingFetchKeysRequestId = 0;
+        m_fetchKeysTargetUserId = 0;
+    }
+    if (packet.requestId != 0 && packet.requestId == m_pendingRegisterKeysRequestId) {
+        m_pendingRegisterKeysRequestId = 0;
+        m_e2eeBootstrapPending = false;
+    }
 }
 
 // M3: 确认消息
@@ -2079,6 +2166,9 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
         return;
     }
 
+    // P1-3: 离线成员变更补偿集合（去重后批次结束统一触发 healing）
+    QSet<qint64> healConvs;
+
     for (const QJsonValue &value : events) {
         const QJsonObject event = value.toObject();
         const QString type = event.value("type").toString();
@@ -2114,8 +2204,33 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
             m_localStore.updateMessageStatus(
                 payload.value("messageId").toVariant().toLongLong(),
                 payload.value("status").toString());
+        } else if (type == "group_changed") {
+            // P1-3: 离线期间的群成员变更补偿：收集需 healing 的群，批次结束后统一触发
+            const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
+            const QString changeType = payload.value("changeType").toString();
+            const qint64 targetUserId = payload.value("targetUserId").toVariant().toLongLong();
+            const qint64 operatorId = payload.value("operatorId").toVariant().toLongLong();
+            const bool membershipChanged = changeType == "member_added"
+                || changeType == "member_removed"
+                || changeType == "member_left";
+            const bool selfRemoved =
+                (changeType == "member_removed" && targetUserId == m_userId)
+                || (changeType == "member_left" && operatorId == m_userId);
+            if (convId > 0 && membershipChanged) {
+                if (selfRemoved) {
+                    m_groupSenderKeys.remove(convId);
+                    healConvs.remove(convId);
+                } else {
+                    healConvs.insert(convId);
+                }
+            }
         }
         // contact_added 等事件忽略：联系人列表按需从服务端拉取
+    }
+
+    // P1-3: 触发离线补偿的 Sender-Key healing（去重后逐群，受单发槽位约束由队列推进）
+    for (qint64 convId : std::as_const(healConvs)) {
+        healGroupSenderKey(convId);
     }
 
     // 游标单调前进
@@ -2303,6 +2418,16 @@ void NetworkManager::handleLeaveGroupResponse(const Packet &packet)
 
     const qint64 conversationId =
         response.value("data").toObject().value("conversationId").toVariant().toLongLong();
+    // P1-3: 本端退群，清除内存与本地 sender key（chain key / Ed25519 私钥），先 wipe 再移除
+    auto keyIt = m_groupSenderKeys.find(conversationId);
+    if (keyIt != m_groupSenderKeys.end()) {
+        SecureMemory::wipe(keyIt->chainKey);
+        SecureMemory::wipe(keyIt->privateSigningKey);
+        m_groupSenderKeys.erase(keyIt);
+    }
+    if (m_localStore.isOpen()) {
+        m_localStore.removeSenderKeysForGroup(conversationId);
+    }
     getConversations();
     emit groupLeft(conversationId);
 }
@@ -2341,7 +2466,29 @@ void NetworkManager::handleGetGroupInfoResponse(const Packet &packet)
 void NetworkManager::handleGroupChangedNotification(const Packet &packet)
 {
     const QJsonObject payload = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
+    const QString changeType = payload.value("changeType").toString();
+    const qint64 targetUserId = payload.value("targetUserId").toVariant().toLongLong();
+    const qint64 operatorId = payload.value("operatorId").toVariant().toLongLong();
+
     getConversations();
+
+    // P1-3: 群成员变更触发 Sender-Key healing（轮换 + 重分发）
+    const bool membershipChanged = changeType == "member_added"
+        || changeType == "member_removed"
+        || changeType == "member_left";
+    const bool selfRemoved =
+        (changeType == "member_removed" && targetUserId == m_userId)
+        || (changeType == "member_left" && operatorId == m_userId);
+    if (membershipChanged && convId > 0) {
+        if (selfRemoved) {
+            // 本端已非成员：清除内存 sender key（对方轮换后旧密钥无法解密新消息）
+            m_groupSenderKeys.remove(convId);
+        } else {
+            healGroupSenderKey(convId);
+        }
+    }
+
     emit groupChanged(payload);
 }
 

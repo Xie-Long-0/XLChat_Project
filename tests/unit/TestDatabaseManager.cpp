@@ -1,5 +1,6 @@
 #include <QtTest/QtTest>
 #include <QSet>
+#include <QDateTime>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 
@@ -46,6 +47,8 @@ private slots:
     // M5.5 安全加固测试
     void v4TablesExist();
     void sessionByIdContainsTokenHash();
+    // P1 安全加固（2026-09-02）：validateSession 逐请求回查 sessions 表依赖的会话契约
+    void sessionByIdReflectsDeletionAndExpiry();
     void conversationMembershipAuthorization();
     void messageAccessAuthorization();
     void clientMessageIdDeduplicates();
@@ -153,6 +156,31 @@ void TestDatabaseManager::sessionByIdContainsTokenHash()
     QVERIFY(session.has_value());
     QCOMPARE(session->tokenHash, QString("tokenhash-renew"));
     QCOMPARE(session->deviceId, QString("dev-renew"));
+}
+
+// P1 安全加固（2026-09-02）：validateSession 逐请求回查 sessions 表，
+// 依赖两项契约——会话删除后 getSessionById 立即返回空（登出/终止/续期换代即失效），
+// 且 expiresAt 以可解析的 ISO 格式存储并落在未来（过期判定不会 fail-open）。
+void TestDatabaseManager::sessionByIdReflectsDeletionAndExpiry()
+{
+    auto user = m_db->getUserByUsername("testuser");
+    QVERIFY(user.has_value());
+
+    const qint64 sid = m_db->createSession(user->id, "dev-p1",
+                                           "tokenhash-p1", "127.0.0.1", 3600);
+    QVERIFY(sid > 0);
+
+    // 契约一：expiresAt 可被 Qt::ISODate 解析且在未来（新鲜会话未过期）
+    auto session = m_db->getSessionById(sid);
+    QVERIFY(session.has_value());
+    QCOMPARE(session->userId, user->id);
+    const QDateTime expiresAt = QDateTime::fromString(session->expiresAt, Qt::ISODate);
+    QVERIFY(expiresAt.isValid());
+    QVERIFY(expiresAt > QDateTime::currentDateTimeUtc());
+
+    // 契约二：删除会话后 getSessionById 立即返回空（token 被终止/登出后存量连接失效）
+    QVERIFY(m_db->deleteSession(sid));
+    QVERIFY(!m_db->getSessionById(sid).has_value());
 }
 
 void TestDatabaseManager::conversationMembershipAuthorization()

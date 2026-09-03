@@ -39,7 +39,15 @@
 - **DoS 防护**：单次解密 ratchet 跳跃上限 `MaxRatchetSteps = 2000`，envelope `iteration` 绝对上界 `MaxMessageIteration = 1e8`；恶意超大 iteration 在触发任何 HKDF 运算前即被拒绝（2026-09-02 安全审查修复）。
 - **服务端 fail-closed**：`e2ee_group` 与 `sender_key_distribution` 正文入库/fan-out 前强制 decode 校验（含 `senderDeviceId` 非空、条目非空、`groupId` 与会话一致），非法返回 `E2eeInvalidEnvelope (3008)`，无静默放行路径；群系统消息（`contentType=system`）仅含元数据不含用户正文，不加密。
 - **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。
-- **遗留限制**：成员变更的密钥 healing 与失权回收未实现——新成员需发送方手动重新分发或重新登录触发；被移除成员保留既有 chain key，可继续解密后续消息（缺乏后向安全，已列入 ROADMAP 欠账清单 P1）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。
+- **成员变更 healing（2026-09-02 P1 修复）**：`member_added/removed/left` 群变更通知（及离线期间的 `sync_events` 补偿）触发本端 sender key 轮换（`generateSenderKey` 生成新 `keyId`）并向现任成员重分发；新成员因此获得当前密钥、被移除成员因密钥轮换失去后续消息的解密能力（后向安全）。轮换去重（同群在途/已排队不重复触发）、单发槽位队列化、瞬时失败（限流/超时）延迟重试；退群时清除本端该群 sender key（内存 wipe + `removeSenderKeysForGroup`）。
+- **遗留限制**：大群（成员设备数约 >60）单条 `sender_key_distribution` 可能超 16384 字符上限致分发失败；轮换采用“先落盘后分发”，分发永久失败时存在群解密不可用窗口；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。上述均登记为 ROADMAP 欠账（P2/P3）。
+
+### 会话与认证加固（2026-09-02）
+
+- **逐包验 token**：每个已认证请求在 payload 携带当前 session token（客户端 `addReplayProtection` 在已认证态统一附加）；服务端 `validateSession()` 逐包比对 `hashToken(token)` 与 `sessions.token_hash`，不再仅依赖连接级内存态。
+- **回查 sessions 表（fail-closed）**：`validateSession()` 逐请求 `getSessionById` 回查，session 被 `logout`/`terminate_session`/续期换代删除后立即失效；`expires_at` 以 `Qt::ISODate` 解析并校验未过期，格式不可解析一律拒绝（fail-closed，不放行）；`token_renew` 豁免过期门以允许对已过期会话续期。
+- **失效回包处理**：鉴权门失败以 `MessageType::Error`（`SessionInvalid`）回包；客户端新增 `handleErrorResponse` 清理在途单发槽位（`fetch_group_keys`/`fetch_keys`/`register_keys`），避免 Error 回包（非对应响应类型）导致群密钥拉取槽位与 healing 队列卡死。
+- **残留**：会话过期/被终止后客户端尚无自动重登 UX（`renewToken()` 暂无调用点，7 天 TTL 到期需手动重登），登记为 ROADMAP 欠账 P2。
 
 ### 传输层安全 (TLS)
 
@@ -112,8 +120,8 @@
 ## 风险
 
 - 开发环境使用自签证书，生产环境必须替换为正式 CA 证书。
-- Session token 当前通过 handler 内存状态验证，除续期外未逐包校验；且 `validateSession()` 不回查 `sessions` 表，token 被终止/过期后存量连接在其生命周期内仍可能通过校验（2026-09-02 周度审查确认，待修复，见 ROADMAP 欠账清单 P1）。
-- 媒体消息尚未 E2EE（M8 目标）。群聊已经 M7b 实现 Sender-Key E2EE，但存在遗留限制：成员变更的密钥 healing 与失权回收未实现（被移除成员可继续解密后续群消息，新成员需发送方手动重分发或重登触发）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。群组接口均遵循先授权再操作（仅成员可发言/邀请/查询，踢人带角色层级保护），输入长度与批量大小受限（群名 ≤64、单批邀请 ≤100、群成员 ≤200、群消息 ≤16384 字符）；客户端本地缓存的群消息/群会话与 sender-key 同样经存储密钥加密落库。
+- Session token 认证已加固（2026-09-02）：逐包携带并校验 token + `validateSession()` 回查 `sessions` 表，过期/终止/续期换代即时失效（此前仅连接级内存态、除续期外不逐包校验、不回查 DB，存量连接在 token 失效后仍可能通过校验——现已闭环，详见“会话与认证加固”节）。残留：会话过期后客户端缺自动重登 UX（见 ROADMAP 欠账 P2）。
+- 媒体消息尚未 E2EE（M8 目标）。群聊已经 M7b 实现 Sender-Key E2EE，成员变更的密钥 healing 与失权回收已于 2026-09-02 实施（`member_added/removed/left` 触发轮换+重分发，被移除成员失去后续消息解密能力）；残留：大群单条分发消息可能超 16384 字符上限、轮换“先落盘后分发”的失败窗口（P2）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。群组接口均遵循先授权再操作（仅成员可发言/邀请/查询，踢人带角色层级保护），输入长度与批量大小受限（群名 ≤64、单批邀请 ≤100、群成员 ≤200、群消息 ≤16384 字符）；客户端本地缓存的群消息/群会话与 sender-key 同样经存储密钥加密落库。
 - 设备信任为 TOFU，首次通信无法抵抗服务端中间人；需后续引入安全码带外验证。
 - 客户端私钥文件在非 Windows 平台为明文存储（仅 Windows 有 DPAPI 保护）；LocalStore 存储密钥与解密缓存同受此限制。
 - 本地缓存（M6.5）含经存储密钥加密的消息明文，拥有本机用户权限者可经 DPAPI 还原后读取，与主流 IM 本地存储模型一致。
@@ -121,9 +129,9 @@
 
 ## 后续要求
 
-- 认证加固：`validateSession()` 回查 `sessions` 表（可带短 TTL 缓存）；全部命令逐包携带并验证 access token 或 TLS channel 绑定（撤销即时生效）。
+- 认证加固：`validateSession()` 回查 `sessions` 表 + 逐包验 token 已于 2026-09-02 实施（撤销/过期即时生效）；后续可选 TLS channel 绑定进一步加固、补会话过期后的客户端自动重登 UX 与 `renewToken()` 定时续期。
 - 设备信任升级：安全码/二维码带外验证；密钥备份与设备间迁移策略。
-- 群成员变更的 Sender-Key healing 与失权成员回收（M7b 遗留，后向安全闭环）；群路径收紧为拒绝 `text` 明文。
+- 群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（后向安全闭环）；后续：大群分片分发/提高分发上限、轮换改为 ACK 后启用（消除分发失败窗口）、群路径收紧为拒绝 `text` 明文。
 - 媒体文件客户端加密上传（M8）。
 - 后续可考虑将 PBKDF2 升级为 Argon2id。
 - 生产部署时应启用证书自动续期或 ACME 协议。

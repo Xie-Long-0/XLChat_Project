@@ -52,7 +52,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 登录后签发 session token，服务端维护 `sessions` 表。
 - 登录失败限流：同一 IP 5 分钟 10 次、同一用户 5 分钟 5 次。
 - 会话终止仅限本人其他会话（`terminate_session`，M5.5），被终止连接由服务端主动断开。
-- **限制**：认证状态保存在 `RequestHandler` 内存中，断线重连必须重新登录；M5.5 起续期接口会真正校验携带的 token，其余命令尚未逐包验 token。
+- **限制**：断线重连必须重新登录。认证已加固（2026-09-02 P1）：每个已认证请求逐包携带 token，`validateSession()` 在连接级内存态之外逐请求回查 `sessions` 表并比对 token 哈希 + 校验过期（fail-closed，`token_renew` 豁免过期门），登出/终止/续期换代后即时失效；残留：会话过期后客户端尚无自动重登 UX（P2）。
 
 ### 即时通信（M3 + M5.5 加固）
 
@@ -66,7 +66,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
 - M7a 群聊（明文，服务端与客户端均已落地）：服务端建群（创建者为 owner，初始成员去重/上限 200）/邀请（仅成员，已在群中拒绝）/退群（群主自动转让给最早入群成员）/踢人（层级保护：owner 可移除 admin/member，admin 仅可移除 member）/群信息查询（仅成员）；`send_message` 按 `conversationId`/`toUserId` 分流，群消息明文入库后逐成员在线直推（小群 fan-out）+ 全员 sync_events 兜底；成员变更产生 `contentType=system` 系统消息与 `GroupChangedNotification`/`group_changed` 事件；回执聚合改为按接收用户人数（多设备去重），`MessageStatusUpdate` 携带 `deliveredCount`/`readCount`；`get_conversations` 群会话携带 `name`/`memberCount`。客户端（子任务三）：`NetworkManager` 群组五接口 + 群消息 outbox 分流（明文直发不依赖 E2EE 引导，确定性错误移除待发项避免无限重试）；`LocalStore` 会话缓存群名/成员数（存量库幂等补列）；QML 建群（联系人多选）/群信息（成员列表/层级踢人/退群）/邀请（搜索多选）三个对话框，会话列表群样式与成员数标识，系统消息居中胶囊渲染。M7b 完成后群聊天区顶部“暂未端到端加密”横幅已改为群 E2EE 状态提示。
-- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式），群消息无发送限流（留待 M11 前置项）；成员加入/退出的 Sender-Key 自动 healing 与失权成员回收未实现（M7b 当前需发送方手动重新分发或重新登录触发）。
+- **限制**：消息撤回/删除未实现；本地缓存仅供快速展示与离线查看，权威数据仍以服务端为准；群聊仅小群直推 fan-out（无大群拉取模式），群消息无发送限流（留待 M11 前置项）；成员加入/退出的 Sender-Key healing 与失权回收已实现（2026-09-02 P1：成员变更触发本端轮换+重分发，离线经 sync_events 补偿），残留大群分发上限与“先落盘后分发”窗口（P2）。
 
 ### 端到端加密（M6）
 
@@ -87,7 +87,8 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 持久化：`LocalStore` 新增 `sender_keys` 表，字段包括 `group_id`、`sender_user_id`、`sender_device_id`、`key_id`、`chain_key_enc`、`public_signing_key`、`private_signing_key_enc`、`iteration`、`updated_at`，chain key 与签名私钥经存储密钥 AES-256-GCM 加密后落库（`_enc` 后缀列为密文）。登出时保留 sender-key 材料（与 M6 解密缓存策略一致），避免重登后无法解密或签名。
 - 安全属性：服务端数据库中群消息正文为密文；篡改、错误 chain key、错误签名均导致解密失败；一对一 E2EE 与群 E2EE 使用独立密钥路径，互不影响。
 - DoS 防护与服务端 fail-closed（2026-09-02 安全审查修复）：单次解密 ratchet 跳跃上限 `MaxRatchetSteps = 2000`、envelope `iteration` 绝对上界 `MaxMessageIteration = 1e8`，恶意超大 iteration 在触发 HKDF 运算前即被拒绝；服务端 `processSendGroupMessage` 对 `e2ee_group`（`decodeGroupMessage` 且 `senderDeviceId` 非空）与 `sender_key_distribution`（`decodeDistribution` 且条目非空、`groupId` 与会话一致）入库/fan-out 前强制校验，非法返回 `E2eeInvalidEnvelope (3008)`，无静默放行路径。
-- **限制**：成员加入/退出的 Sender-Key 自动 healing 与失权成员回收未实现；当前新成员接收群 E2EE 消息需发送方手动重新分发或发送方重新登录触发；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。
+- **成员变更 healing（2026-09-02 P1）**：`handleGroupChangedNotification` 在 `member_added/removed/left` 时调用 `healGroupSenderKey` 轮换本端 sender key（新 `keyId`）并经 `fetch_group_keys` → `buildGroupSenderKeyDistribution` 重分发；离线期间的变更由 `ingestSyncEvents` 处理 `group_changed` 事件补偿；含同群去重、单发槽位队列（`m_healQueue`/`drainHealQueue`）、瞬时失败延迟重试，E2EE 就绪（`register_keys` 响应）后排空队列；退群响应清除本端该群 sender key（wipe + `removeSenderKeysForGroup`）。服务端 `MessageType::Error` 回包由 `handleErrorResponse` 清理在途槽位，避免 healing 队列卡死。
+- **限制**：大群（成员设备数约 >60）单条 `sender_key_distribution` 可能超 16384 字符上限致分发失败；轮换“先落盘后分发”，分发永久失败时存在群解密不可用窗口；一次成员变更触发全员各自轮换（O(N²) 重分发，已加同群去重/节流）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生）。上述登记为 ROADMAP 欠账（P2/P3）。
 
 ### 客户端本地加密持久化缓存（M6.5）
 
@@ -170,13 +171,13 @@ M7a 群聊 UI（子任务三新增）：
 | P0 | `force_logout` 接受任意 `userId`，构成越权注销 | ✅ 已修复：改为 `terminate_session`，仅允许终止本人其他会话（指定他人 userId 被拒绝），被终止连接由服务端断开 |
 | P0 | TLS 可静默降级 | ✅ 已修复：fail-closed（服务端拒启 / 客户端拒连），开发明文改为显式开关（`--allow-plaintext` / `XYCHAT_ALLOW_PLAINTEXT=1`） |
 | P0 | timestamp/nonce 非必填，可整体绕过 | ✅ 已修复：强制必填 + 格式校验，拒绝返回 `ReplayRejected`；nonce 由服务端全局 `NonceCache`（TTL）跨连接去重 |
-| P1 | 认证依赖 handler 内存状态，token 语义不完整 | ◑ 部分修复：续期接口真正校验 token；其余命令逐包验 token / channel 绑定留待后续 |
+| P1 | 认证依赖 handler 内存状态，token 语义不完整 | ✅ 已修复（2026-09-02）：每个已认证请求逐包携带并校验 token，`validateSession()` 回查 `sessions` 表 + 过期 fail-closed（`token_renew` 豁免过期门）；TLS channel 绑定为可选后续加固 |
 | P1 | `sendRawData` 排队写存在线程风险 | ✅ 已修复：发送投递到 handler 线程内的发送代理 QObject，socket 只在其所属线程被访问 |
 | P1 | 消息无客户端幂等键，无 outbox | ✅ 已修复：`clientMessageId` + 部分唯一索引去重；客户端内存 outbox 登录成功后自动重发（本地持久化 outbox 随本地缓存一并补齐） |
 | P1 | 单值 `messages.status` 无法多设备聚合 | ✅ 已修复：`message_receipts` 按接收者/设备记录，`messages.status` 改为回执聚合展示值 |
 | P1 | `sync_messages` 单会话拉取 | ✅ 已补充：新增 `sync_events` 账号级游标同步（消息/联系人/回执）；sync_messages 保留为会话内历史分页 |
 
-剩余已知问题（非阻塞，完整清单见 ROADMAP 欠账节）：nonce 去重为单服务器内存缓存（多服务器部署需持久化）；服务端每连接一线程模型在高连接数下成本高；除续期外的命令未逐包验 token，且 `validateSession()` 不回查 `sessions` 表（P1 待修复）；`sync_events` 无保留清理机制；群路径仍兼容 `text` 明文。
+剩余已知问题（非阻塞，完整清单见 ROADMAP 欠账节）：nonce 去重为单服务器内存缓存（多服务器部署需持久化）；服务端每连接一线程模型在高连接数下成本高；会话过期后客户端缺自动重登 UX（P2）；`sync_events` 无保留清理机制；群路径仍兼容 `text` 明文；大群 `sender_key_distribution` 超 16384 上限、轮换“先落盘后分发”窗口、healing O(N²) 重分发（P2/P3）。
 
 ## M6 代码审查修复记录（2026-08-17）
 

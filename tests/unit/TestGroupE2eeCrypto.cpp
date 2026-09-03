@@ -389,6 +389,51 @@ private slots:
         QCOMPARE(groupId, 100LL);
         QCOMPARE(entries.size(), 1);
     }
+
+    // P1-3 healing 语义（2026-09-02）：群成员变更后发送方轮换 sender key（新 keyId），
+    // 被移除成员仅持有旧密钥材料，无法解密轮换后的新消息（后向安全 / 失权回收）；
+    // 现任成员收到重分发的新密钥后可正常解密。
+    void senderKeyRotationRevokesRemovedMember()
+    {
+        // 轮换前：发送方持有 K1，被移除成员 bob 保存了 K1 的 chain key 与签名公钥
+        auto k1 = GroupE2eeCrypto::generateSenderKey();
+        QVERIFY(k1.valid);
+        const QByteArray bobChainKey0 = k1.chainKey;
+        const QByteArray bobPubKey = k1.publicSigningKey;
+
+        // 成员变更触发轮换：生成全新 K2（新 keyId、新签名密钥对、iteration 归零）
+        auto k2 = GroupE2eeCrypto::generateSenderKey();
+        QVERIFY(k2.valid);
+        QVERIFY(k2.keyId != k1.keyId);
+        QVERIFY(k2.publicSigningKey != k1.publicSigningKey);
+        QCOMPARE(k2.iteration, 0);
+        // 现任成员经重分发获得 K2 的初始 chain key 与公钥
+        const QByteArray memberChainKey0 = k2.chainKey;
+        const QByteArray memberPubKey = k2.publicSigningKey;
+
+        // 发送方用 K2 加密轮换后的新消息
+        const QByteArray secret = "message after member removal";
+        const auto encrypted = GroupE2eeCrypto::encryptMessage(k2, secret);
+        QVERIFY(encrypted.valid);
+        QCOMPARE(encrypted.keyId, k2.keyId);
+        QCOMPARE(encrypted.iteration, 1);
+
+        // 被移除成员 bob 仅持有旧 K1 材料：签名验证失败（K2 公钥不匹配）→ 解密被拒，
+        // 且其本地状态不被推进（chain key 未被消耗）
+        QByteArray bobChainKey = bobChainKey0;
+        int bobIteration = 0;
+        QVERIFY(GroupE2eeCrypto::decryptMessage(
+            bobChainKey, bobIteration, bobPubKey, encrypted).isEmpty());
+        QCOMPARE(bobIteration, 0);
+        QCOMPARE(bobChainKey, bobChainKey0);
+
+        // 现任成员用重分发获得的 K2 材料解密成功
+        QByteArray memberChainKey = memberChainKey0;
+        int memberIteration = 0;
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            memberChainKey, memberIteration, memberPubKey, encrypted), secret);
+        QCOMPARE(memberIteration, 1);
+    }
 };
 
 QTEST_GUILESS_MAIN(TestGroupE2eeCrypto)

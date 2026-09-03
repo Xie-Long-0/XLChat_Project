@@ -4,7 +4,7 @@
 
 M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。
 
-仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级（续期已校验 token，但其他请求未逐包验 token，且 `validateSession()` 未回查 sessions 表）、媒体消息尚未 E2EE（M8 目标）、群成员变更的 Sender-Key healing 与失权回收未实现（M7b 遗留）、设备信任为 TOFU（无安全码比对）。
+仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、媒体消息尚未 E2EE（M8 目标）、设备信任为 TOFU（无安全码比对）、会话过期后客户端尚无自动重登 UX。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
 
 ### 固定包头
 
@@ -234,12 +234,12 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 
 1. 客户端连接服务端（TLS fail-closed：服务端无证书拒绝启动，客户端无 CA 拒绝连接；开发明文需显式开关）
 2. 发送 `LoginRequest`，服务端验证密码后返回 session token
-3. 后续请求依赖连接级认证状态（`RequestHandler` 内存中的 `m_authenticatedUserId`/`m_currentSessionId`）；M5.5 起 `TokenRenewRequest` 会真正校验携带的 token
+3. 后续每个已认证请求在 payload 携带 `token` 字段（当前 session token）；服务端 `validateSession()` 逐包回查 `sessions` 表并比对 `hashToken(token)` 与 `token_hash`，同时校验 `expires_at` 未过期（`token_renew` 豁免过期门），任一不符回 `Error`（`SessionInvalid`）（2026-09-02 P1 修复；此前仅连接级内存态 + 续期校验 token）
 4. 客户端可发送 `TokenRenewRequest` 续期 token（旧 session 删除，新 session 生效）
 5. 客户端发送 `LogoutRequest` 主动登出；或用 `terminate_session` 终止本人其他设备的会话
 6. 服务端在连接断开时自动清理 session
 
-> 已知限制：断线重连后必须重新登录；除续期外的命令尚未逐包验证 token。后续方向：每个认证命令显式携带 access token 或绑定已认证 TLS channel，撤销后即时失效。
+> 已知限制：断线重连后必须重新登录。逐包验 token 已于 2026-09-02 实施（每个已认证请求携带 `token`，服务端逐包回查 `sessions` 表 + 比对哈希 + 过期校验，撤销/过期即时生效）。后续方向：可选 TLS channel 绑定进一步加固；会话过期后的客户端自动重登 UX 待补。
 
 ### 限流策略
 
@@ -250,10 +250,10 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 ## 已知限制
 
 - 当前协议兼容策略只支持版本 `1`，后续版本升级需要扩展协商或降级策略。
-- Session token 通过连接级认证状态维护；仅 `TokenRenewRequest` 逐包校验 token（M5.5），其他命令尚未逐包验证。
+- Session token 自 2026-09-02 起逐包校验：每个已认证请求携带 `token`，服务端 `validateSession()` 回查 `sessions` 表并比对哈希 + 过期（此前仅连接级内存态 + `TokenRenewRequest` 校验）。
 - nonce 去重缓存为单服务器内存 TTL 缓存（跨连接共享），服务端重启后清空；多服务器部署时需改为持久化存储。
 - E2EE 覆盖一对一文本消息（M6）与群聊消息（M7b Sender Keys）；媒体消息仍为服务端可见形态（M8 目标）；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。
-- 群成员变更的 Sender-Key healing 与失权回收未实现（M7b 遗留）：新成员需发送方手动重新分发或重新登录触发；被移除成员未被轮换出局。
+- 群成员变更的 Sender-Key healing 与失权回收已实现（2026-09-02）：`member_added/removed/left` 触发本端 sender key 轮换（新 `keyId`）+ 重分发，新成员获得当前密钥、被移除成员因轮换失去后续消息解密能力（后向安全）；离线期间的成员变更经 `sync_events` 补偿。残留：大群（成员设备数约 >60）单条分发消息可能超 16384 字符上限（见 ROADMAP 欠账 P2）。
 - 设备信任为 TOFU，无安全码/二维码带外验证；密钥备份与设备间迁移未实现（更换设备/清除应用数据后无法解密历史消息，但同一设备登出重登不受影响）。
 - 预密钥超时回收阈值为 10 分钟；发送方在认领后 10 分钟内仍可正常消费。
 - 客户端解密缓存与本地持久化 outbox 均已实现（M6.5：`LocalStore` 加密落库，重启后自动重发且幂等不重复）。
@@ -657,6 +657,6 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 - 接收方按 `(groupId, senderUserId, senderDeviceId, keyId)` 定位本地 chain key，ratchet 前进到 `iteration` 派生消息密钥解密，验签失败/回滚（iteration 倒退）/篡改均拒绝。
 - DoS 防护：单次解密 ratchet 跳跃超过 `MaxRatchetSteps = 2000` 拒绝；`iteration` 超过绝对上界 `MaxMessageIteration = 1e8` 直接判非法（恶意超大 iteration 不会触发 HKDF 运算）。
 - 服务端 fail-closed：`decodeGroupMessage` 解析失败或 `senderDeviceId` 为空时拒绝入库与 fan-out（`E2eeInvalidEnvelope 3008`）。
-- 接收方无对应 chain key（新成员/新设备未收到分发）时显示“无法解密此消息”占位；healing（成员变更触发重分发）未实现，当前需发送方手动重新分发或重新登录触发（见 ROADMAP 欠账清单 P1）。
+- 接收方无对应 chain key（新成员/新设备未收到分发）时显示“无法解密此消息”占位；healing（成员变更触发重分发）已于 2026-09-02 实施：`member_added/removed/left` 使本端轮换 sender key 并重新分发，离线经 `sync_events` 补偿。
 - 群系统消息（`contentType=system`，服务端内部产生）不加密：仅含成员 ID/事件类型等元数据，不含用户正文。
 
