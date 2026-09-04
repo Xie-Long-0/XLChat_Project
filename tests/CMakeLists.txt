@@ -1,15 +1,9 @@
 find_package(Qt6 COMPONENTS Test Sql Network REQUIRED)
-find_package(OpenSSL REQUIRED)
+# OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
+include(XYChatOpenSSL)
+xychat_find_openssl()
 
 set(CMAKE_AUTOMOC ON)
-
-# 公共 OpenSSL 运行时 DLL 列表
-set(OPENSSL_RUNTIME_DLLS
-    ${CMAKE_SOURCE_DIR}/3rdparty/bin/libcrypto-3-x64.dll
-    ${CMAKE_SOURCE_DIR}/3rdparty/bin/libssl-3-x64.dll
-    ${CMAKE_SOURCE_DIR}/3rdparty/bin/legacy.dll
-    ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
-)
 
 # ── TestEncryptionManager ──
 add_executable(TestEncryptionManager
@@ -23,11 +17,7 @@ target_link_libraries(TestEncryptionManager PRIVATE
 
 add_test(NAME TestEncryptionManager COMMAND TestEncryptionManager)
 
-add_custom_command(TARGET TestEncryptionManager POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${OPENSSL_RUNTIME_DLLS}
-        $<TARGET_FILE_DIR:TestEncryptionManager>
-)
+xychat_copy_runtime_dlls(TestEncryptionManager)
 
 # ── TestPacketCodec ──
 add_executable(TestPacketCodec
@@ -61,11 +51,7 @@ target_link_libraries(TestDatabaseManager PRIVATE
 
 add_test(NAME TestDatabaseManager COMMAND TestDatabaseManager)
 
-add_custom_command(TARGET TestDatabaseManager POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${OPENSSL_RUNTIME_DLLS}
-        $<TARGET_FILE_DIR:TestDatabaseManager>
-)
+xychat_copy_runtime_dlls(TestDatabaseManager)
 
 # ── TestSecurity (M5) ──
 add_executable(TestSecurity
@@ -87,11 +73,7 @@ target_link_libraries(TestSecurity PRIVATE
 
 add_test(NAME TestSecurity COMMAND TestSecurity)
 
-add_custom_command(TARGET TestSecurity POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${OPENSSL_RUNTIME_DLLS}
-        $<TARGET_FILE_DIR:TestSecurity>
-)
+xychat_copy_runtime_dlls(TestSecurity)
 
 # ── TestLocalStore (M6.5 客户端本地加密持久化缓存) ──
 add_executable(TestLocalStore
@@ -119,11 +101,7 @@ endif()
 
 add_test(NAME TestLocalStore COMMAND TestLocalStore)
 
-add_custom_command(TARGET TestLocalStore POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${OPENSSL_RUNTIME_DLLS}
-        $<TARGET_FILE_DIR:TestLocalStore>
-)
+xychat_copy_runtime_dlls(TestLocalStore)
 
 # ── TestGroupE2eeCrypto (M7b 群聊 Sender-Key E2EE 原语) ──
 add_executable(TestGroupE2eeCrypto
@@ -137,11 +115,7 @@ target_link_libraries(TestGroupE2eeCrypto PRIVATE
 
 add_test(NAME TestGroupE2eeCrypto COMMAND TestGroupE2eeCrypto)
 
-add_custom_command(TARGET TestGroupE2eeCrypto POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${OPENSSL_RUNTIME_DLLS}
-        $<TARGET_FILE_DIR:TestGroupE2eeCrypto>
-)
+xychat_copy_runtime_dlls(TestGroupE2eeCrypto)
 
 # ── M7aGroupRepro（临时诊断工具：群聊端到端复现，不纳入 CTest） ──
 add_executable(TestGroupRepro
@@ -168,10 +142,9 @@ if (WIN32)
     target_link_libraries(TestGroupRepro PRIVATE crypt32)
 endif()
 
+xychat_copy_runtime_dlls(TestGroupRepro)
+
 add_custom_command(TARGET TestGroupRepro POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${OPENSSL_RUNTIME_DLLS}
-        $<TARGET_FILE_DIR:TestGroupRepro>
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         $<TARGET_FILE_DIR:Chat-Server>/certs
         $<TARGET_FILE_DIR:TestGroupRepro>/certs

@@ -17,7 +17,9 @@ else()
 endif()
 
 find_package(Qt6 COMPONENTS Core Network Sql REQUIRED)
-find_package(OpenSSL REQUIRED)
+# OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
+include(XYChatOpenSSL)
+xychat_find_openssl()
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -64,15 +66,8 @@ target_include_directories(Chat-Server SYSTEM PUBLIC
 )
 
 # 构建后将 OpenSSL 运行时 DLL 拷贝到输出目录
-add_custom_command(TARGET Chat-Server POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libcrypto-3-x64.dll
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libssl-3-x64.dll
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/legacy.dll
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
-        $<TARGET_FILE_DIR:Chat-Server>
-    COMMENT "Copying OpenSSL runtime DLLs to output"
-)
+# Debug 取 3rdparty/debug/bin，其余配置取 3rdparty/bin
+xychat_copy_runtime_dlls(Chat-Server)
 
 # M5: 构建后拷贝证书生成脚本到输出目录
 add_custom_command(TARGET Chat-Server POST_BUILD

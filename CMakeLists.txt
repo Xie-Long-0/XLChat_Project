@@ -10,6 +10,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_PREFIX_PATH ${CMAKE_PREFIX_PATH} ${PROJECT_SOURCE_DIR}/3rdparty)
 
+# 3rdparty 内置 OpenSSL：按构建配置在 Release / Debug 版本之间切换
+list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+include(XYChatOpenSSL)
+xychat_find_openssl()
+
 add_library(XYChatCommon STATIC
     CommonModule/encryption/EncryptionManager.cpp
     CommonModule/encryption/EncryptionManager.h
@@ -37,7 +42,7 @@ target_include_directories(XYChatCommon PUBLIC
 )
 
 find_package(Qt6 COMPONENTS Core Network REQUIRED)
-find_package(OpenSSL REQUIRED)
+# OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
 
 qt_standard_project_setup(REQUIRES 6.8)
 

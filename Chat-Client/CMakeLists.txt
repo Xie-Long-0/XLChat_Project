@@ -21,7 +21,9 @@ endif()
 
 # QML 模块：Qml + Quick；M6.5 本地持久化缓存需要 Sql（QSQLITE）
 find_package(Qt6 COMPONENTS Quick QuickControls2 Network Sql REQUIRED)
-find_package(OpenSSL REQUIRED)
+# OpenSSL 由 XYChatOpenSSL 模块查找（已按配置绑定 Release/Debug 导入库）
+include(XYChatOpenSSL)
+xychat_find_openssl()
 
 # QWindowKit
 find_package(QWindowKit COMPONENTS Core Quick REQUIRED)
@@ -86,10 +88,9 @@ add_custom_command(TARGET Chat-Client POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:QWindowKit::Core>
         $<TARGET_FILE:QWindowKit::Quick>
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libcrypto-3-x64.dll
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/libssl-3-x64.dll
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/legacy.dll
-        ${CMAKE_SOURCE_DIR}/3rdparty/bin/zlib1.dll
         $<TARGET_FILE_DIR:Chat-Client>
-    COMMENT "Copying runtime DLLs to output"
+    COMMENT "Copying QWindowKit runtime DLLs to output"
 )
+
+# OpenSSL/zlib 运行时 DLL：Debug 取 3rdparty/debug/bin，其余配置取 3rdparty/bin
+xychat_copy_runtime_dlls(Chat-Client)
