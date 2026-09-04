@@ -4,7 +4,7 @@
 
 M5 在 M3 基础上新增了传输层加密（TLS 1.2+）与重放保护；**M5.5（2026-08-03 实施）完成了安全加固**：TLS 改为 fail-closed、timestamp/nonce 改为强制必填并全局 TTL 去重、会话/消息接口全部先授权再查询、越权注销接口改为仅能终止本人其他会话、发送消息新增 `clientMessageId` 幂等键、回执改为按接收者/设备维度记录、新增账号级 `sync_events` 游标同步。**M6（2026-08-17 实施）完成了一对一聊天端到端加密**：简化 Signal 方案（X25519 身份密钥 + 一次性预密钥 + 每消息临时密钥 ECDH + HKDF-SHA256 + AES-256-GCM），消息正文以不透明 envelope 密文传输，服务端 fail-closed 只存密文。**M6.5（2026-08-21 实施）为纯客户端本地持久化（本地加密缓存与持久化 outbox），未变更任何线上协议**：复用既有 `sync_events` 游标接口（客户端登录后自动增量拉取并持久化游标）与 `clientMessageId` 幂等语义（持久化 outbox 重启后重发）。**M7a 子任务一（2026-08-21 实施）完成了明文群聊的协议定义与服务端数据模型**：新增群组请求/响应消息类型（60-70）与群组错误码（3009-3012），数据库迁移至 V7（`conversations.name` + `conversation_members.role`）。**M7a 子任务二（2026-08-21 实施）完成了群组业务处理器与 fan-out**：建群/邀请/退群（群主自动转让）/踢人（层级保护）/群信息全部服务端落地，`send_message` 按 `conversationId`/`toUserId` 分流（群聊明文 fan-out，私聊维持 envelope fail-closed），群成员变更产生系统消息与 `group_changed` 事件，回执聚合改为按接收者人数（新增送达/已读计数）。**M7a 子任务三（2026-08-21 实施）完成客户端接入与群聊 UI**（无线上协议变更）：`NetworkManager` 群组五接口与群消息 outbox 分流，`LocalStore` 会话缓存新增群名/成员数，QML 建群/群信息/邀请对话框与系统消息渲染。**M7b（2026-09-02 入库）完成了群聊端到端加密（Sender Keys）**：新增 `FetchGroupKeysRequest/Response`（消息类型 71/72）一次性拉取全群成员 E2EE 密钥包；群消息新增 `contentType=e2ee_group`（chain-key ratchet + AES-256-GCM + Ed25519 签名的群 envelope）与 `contentType=sender_key_distribution`（chain key 经 M6 pairwise envelope 逐设备加密分发）；服务端对两类正文 fail-closed 校验（非法返回 3008），只见密文。上述变更均有自动化测试覆盖。
 
-仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、媒体消息尚未 E2EE（M8 目标）、设备信任为 TOFU（无安全码比对）、会话过期后客户端尚无自动重登 UX。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
+仍属非生产级的部分：nonce 去重为单服务器内存缓存（重启清空）、认证状态仍为连接级内存态（但自 2026-09-02 起每个已认证请求逐包携带并校验 token，`validateSession()` 逐请求回查 `sessions` 表并对过期/终止/续期换代即时失效）、媒体消息尚未 E2EE（M8 目标）、设备信任为 TOFU（无安全码比对）。会话自动续期与失效自动重登已落地（2026-09-04：客户端解析 `expiresAt` 过期前自动 `renewToken`，失效回登录页）。群成员变更的 Sender-Key healing 与失权回收已于 2026-09-02 实施（成员变更触发轮换+重分发）。
 
 ### 固定包头
 
@@ -241,7 +241,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 5. 客户端发送 `LogoutRequest` 主动登出；或用 `terminate_session` 终止本人其他设备的会话
 6. 服务端在连接断开时自动清理 session
 
-> 已知限制：断线重连后必须重新登录。逐包验 token 已于 2026-09-02 实施（每个已认证请求携带 `token`，服务端逐包回查 `sessions` 表 + 比对哈希 + 过期校验，撤销/过期即时生效）。后续方向：可选 TLS channel 绑定进一步加固；会话过期后的客户端自动重登 UX 待补。
+> 已知限制：断线重连后必须重新登录。逐包验 token 已于 2026-09-02 实施（每个已认证请求携带 `token`，服务端逐包回查 `sessions` 表 + 比对哈希 + 过期校验，撤销/过期即时生效）。客户端自动续期与失效自动重登已于 2026-09-04 实施（解析 `expiresAt` 过期前自动 `renewToken`，失效经 `sessionExpired` 回登录页）。后续方向：可选 TLS channel 绑定进一步加固。
 
 ### 限流策略
 

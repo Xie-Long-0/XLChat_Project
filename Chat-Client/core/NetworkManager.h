@@ -84,6 +84,8 @@ signals:
     void registerSuccessful();
     void registerFailed(const QString &errorMessage);
     void logoutFinished();
+    // P2: 会话失效（过期/被终止/续期被拒）——QML 据此回登录页并提示重新登录
+    void sessionExpired();
     void connectionStateChanged(NetworkManager::ConnectionState state);
     void sessionChanged();
     // M3 信号
@@ -131,6 +133,10 @@ private:
     void handleTokenRenewResponse(const XYChat::Protocol::Packet &packet);
     // P1: 服务端 MessageType::Error 回包（鉴权门/校验失败）：清理在途单发槽位并推进 healing 队列
     void handleErrorResponse(const XYChat::Protocol::Packet &packet);
+    // P2: 会话续期与失效处理
+    void scheduleTokenRenew();
+    void notifySessionExpired();
+    qint64 parseExpiresAt(const QString &iso) const;
     // M3 响应处理
     void handleSearchUsersResponse(const XYChat::Protocol::Packet &packet);
     void handleAddContactResponse(const XYChat::Protocol::Packet &packet);
@@ -223,6 +229,12 @@ private:
     QString m_sessionToken;
     qint64 m_userId = 0;
     QString m_username;
+
+    // P2: 会话续期与失效状态
+    QTimer *m_tokenRenewTimer;        // 单发定时器：过期前触发自动续期
+    qint64 m_sessionExpiresAtSecs = 0; // 会话过期时间（UTC epoch 秒；0 = 未知/未登录）
+    quint64 m_pendingTokenRenewRequestId = 0;
+    bool m_sessionExpiredNotified = false; // 已通知会话失效（幂等，避免重复弹窗）
 
     // M3: 待处理请求 ID
     quint64 m_pendingSearchRequestId = 0;

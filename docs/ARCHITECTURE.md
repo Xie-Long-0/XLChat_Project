@@ -52,7 +52,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 登录后签发 session token，服务端维护 `sessions` 表。
 - 登录失败限流：同一 IP 5 分钟 10 次、同一用户 5 分钟 5 次。
 - 会话终止仅限本人其他会话（`terminate_session`，M5.5），被终止连接由服务端主动断开。
-- **限制**：断线重连必须重新登录。认证已加固（2026-09-02 P1）：每个已认证请求逐包携带 token，`validateSession()` 在连接级内存态之外逐请求回查 `sessions` 表并比对 token 哈希 + 校验过期（fail-closed，`token_renew` 豁免过期门），登出/终止/续期换代后即时失效；残留：会话过期后客户端尚无自动重登 UX（P2）。
+- **限制**：断线重连必须重新登录。认证已加固（2026-09-02 P1）：每个已认证请求逐包携带 token，`validateSession()` 在连接级内存态之外逐请求回查 `sessions` 表并比对 token 哈希 + 校验过期（fail-closed，`token_renew` 豁免过期门），登出/终止/续期换代后即时失效；会话失效已闭环（2026-09-04）：客户端解析 `expiresAt` 并在过期前 1 天自动续期，续期被拒或业务请求返回 `SessionInvalid/SessionExpired` 时安全清零并回登录页提示重新登录。
 
 ### 即时通信（M3 + M5.5 加固）
 
@@ -138,7 +138,7 @@ Chat-Client
   │     ├── components/（TitleBar, ConversationList, ChatView, MessageInput, MessageBubble, QWKButton）
   │     └── theme/（Theme.qml 单例，darkMode 驱动亮/暗双配色，qmldir 注册）
   ├── C++ 后端层
-  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密；M6.5 起接入 LocalStore 缓存与持久化 outbox；M7a 起提供群组五接口与 sendGroupMessage（outbox 分流，群消息明文直发）；M7b 起实现 ensureGroupSenderKey/buildGroupSenderKeyDistribution/encryptGroupMessage/decryptGroupMessageObject 等群 Sender-Key E2EE 接口与 FetchGroupKeys 协议交互）
+  │     ├── core/NetworkManager（连接状态机 + TLS + 协议，注册为 QML 上下文对象；sendMessage 返回 clientMessageId 供乐观消息跟踪；M6 起登录后自动引导 E2EE 密钥注册，发送前 fetch_keys 加密、接收后解密；M6.5 起接入 LocalStore 缓存与持久化 outbox；M7a 起提供群组五接口与 sendGroupMessage（outbox 分流，群消息明文直发）；M7b 起实现 ensureGroupSenderKey/buildGroupSenderKeyDistribution/encryptGroupMessage/decryptGroupMessageObject 等群 Sender-Key E2EE 接口与 FetchGroupKeys 协议交互；2026-09-04 起接入会话续期：解析 `expiresAt` 过期前自动 `renewToken`（60 秒看门狗 + 失败退避）、失效发 `sessionExpired` 回登录页）
   │     ├── core/KeyStorage（M6：身份/预密钥私钥持久化，Windows DPAPI 保护；TOFU 指纹存储；M6.5：LocalStore 存储密钥）
   │     ├── core/LocalStore（M6.5：按账号+设备隔离的 SQLite 加密本地缓存，M7a 含群会话字段，M7b 新增 sender_keys 表保存 chain key 与 Ed25519 签名密钥对，见上文）
   │     ├── core/ThemeSettings（QSettings 主题持久化，注册为 QML 上下文对象）
@@ -179,7 +179,7 @@ M7a 群聊 UI（子任务三新增）：
 | P1 | 单值 `messages.status` 无法多设备聚合 | ✅ 已修复：`message_receipts` 按接收者/设备记录，`messages.status` 改为回执聚合展示值 |
 | P1 | `sync_messages` 单会话拉取 | ✅ 已补充：新增 `sync_events` 账号级游标同步（消息/联系人/回执）；sync_messages 保留为会话内历史分页 |
 
-剩余已知问题（非阻塞，完整清单见 ROADMAP 欠账节）：nonce 去重为单服务器内存缓存（多服务器部署需持久化）；服务端每连接一线程模型在高连接数下成本高；会话过期后客户端缺自动重登 UX（P2）；`sync_events` 无保留清理机制；群路径仍兼容 `text` 明文；大群 `sender_key_distribution` 超 16384 上限、轮换“先落盘后分发”窗口、healing O(N²) 重分发（P2/P3）。
+剩余已知问题（非阻塞，完整清单见 ROADMAP 欠账节）：nonce 去重为单服务器内存缓存（多服务器部署需持久化）；服务端每连接一线程模型在高连接数下成本高；群路径仍兼容 `text` 明文；大群 `sender_key_distribution` 超 16384 上限、轮换“先落盘后分发”窗口、healing O(N²) 重分发（P2/P3）。
 
 ## M6 代码审查修复记录（2026-08-17）
 

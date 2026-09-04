@@ -21,15 +21,26 @@ using namespace XYChat::Protocol;
 using namespace XYChat::Security;
 using XYChat::Security::GroupE2eeCrypto;
 
+namespace {
+// P2: 会话续期策略——会话 TTL 为 7 天，在过期前 1 天（第 6 天）自动续期，
+// 避免到期瞬间掉线；续期瞬时失败（网络/服务端内部错误）按 5 分钟退避重试；
+// 续期响应超时（60 秒未收到响应）视为丢失，重新触发续期。
+constexpr qint64 kRenewBeforeExpirySecs = 86400;   // 过期前 1 天
+constexpr int kRenewRetryDelayMs = 300000;          // 瞬时失败退避 5 分钟
+constexpr int kRenewResponseTimeoutMs = 60000;      // 续期响应看门狗 60 秒
+} // namespace
+
 NetworkManager::NetworkManager(QObject *parent) :
     QObject(parent),
     m_sslSocket(new QSslSocket(this)),
     m_heartbeatTimer(new QTimer(this)),
-    m_reconnectTimer(new QTimer(this))
+    m_reconnectTimer(new QTimer(this)),
+    m_tokenRenewTimer(new QTimer(this))
 {
     m_heartbeatTimer->setInterval(30000);
     m_reconnectTimer->setInterval(3000);
     m_reconnectTimer->setSingleShot(true);
+    m_tokenRenewTimer->setSingleShot(true);
 
     connect(m_sslSocket, &QSslSocket::connected, this, &NetworkManager::onConnected);
     connect(m_sslSocket, &QSslSocket::disconnected, this, &NetworkManager::onDisconnected);
@@ -38,6 +49,7 @@ NetworkManager::NetworkManager(QObject *parent) :
     connect(m_sslSocket, &QSslSocket::sslErrors, this, &NetworkManager::onSslErrors);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &NetworkManager::sendHeartbeat);
     connect(m_reconnectTimer, &QTimer::timeout, this, &NetworkManager::connectToServer);
+    connect(m_tokenRenewTimer, &QTimer::timeout, this, &NetworkManager::renewToken);
 
     // M5: 初始化 TLS
     initTls();
@@ -108,6 +120,12 @@ void NetworkManager::renewToken()
     if (m_state != ConnectionState::Authenticated || m_sessionToken.isEmpty()) {
         return;
     }
+    // P2: 若已有在途续期请求，说明是响应超时看门狗触发——清除在途标记并重发，
+    // 避免续期响应丢失导致会话静默过期
+    if (m_pendingTokenRenewRequestId != 0) {
+        qWarning() << "[NetMgr] Token renewal response timeout, retrying";
+        m_pendingTokenRenewRequestId = 0;
+    }
 
     QJsonObject json;
     json["type"] = "token_renew";
@@ -118,7 +136,13 @@ void NetworkManager::renewToken()
     packet.messageType = MessageType::TokenRenewRequest;
     packet.requestId = nextRequestId();
     packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingTokenRenewRequestId = packet.requestId;
     sendPacket(packet);
+
+    // 响应看门狗：60 秒内未收到续期响应则重新触发续期（响应丢失兜底）
+    if (m_tokenRenewTimer) {
+        m_tokenRenewTimer->start(kRenewResponseTimeoutMs);
+    }
 }
 
 // 连接回调
@@ -139,6 +163,11 @@ void NetworkManager::onDisconnected()
     const bool shouldRelogin = m_reconnectEnabled && !m_pendingUsername.isEmpty();
 
     m_heartbeatTimer->stop();
+    // P2: 连接断开时清在途续期请求并停续期定时器（重连重登后由登录响应重新调度）
+    if (m_tokenRenewTimer) {
+        m_tokenRenewTimer->stop();
+    }
+    m_pendingTokenRenewRequestId = 0;
     m_codec.reset();
     m_pendingLoginRequestId = 0;
     // M5.5: 在途发送请求随连接丢失，清除映射，
@@ -478,6 +507,9 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         m_sessionToken = data.value("token").toString();
         m_userId = data.value("userId").toVariant().toLongLong();
         m_username = data.value("username").toString();
+        // P2: 记录会话过期时间并调度自动续期；重置失效通知标记供本轮会话复用
+        m_sessionExpiresAtSecs = parseExpiresAt(data.value("expiresAt").toString());
+        m_sessionExpiredNotified = false;
         m_loginQueued = false;
         setState(ConnectionState::Authenticated);
         emit sessionChanged();
@@ -486,6 +518,7 @@ void NetworkManager::handleLoginResponse(const Packet &packet)
         openLocalStore();
         // M5.5: 登录成功后重发 outbox 中未确认的消息（幂等键保证不重复）
         flushOutbox();
+        scheduleTokenRenew();
         return;
     }
 
@@ -532,15 +565,42 @@ void NetworkManager::handleLogoutResponse(const Packet &packet)
 // Token 续期响应
 void NetworkManager::handleTokenRenewResponse(const Packet &packet)
 {
+    // P2: 仅处理当前在途续期请求的响应，避免陈旧响应串扰
+    if (packet.requestId != m_pendingTokenRenewRequestId) {
+        return;
+    }
+    m_pendingTokenRenewRequestId = 0;
+
     const QJsonDocument responseDoc = QJsonDocument::fromJson(packet.payload);
     const QJsonObject response = responseDoc.object();
     const int code = response.value("code").toInt(static_cast<int>(ErrorCode::InternalError));
 
     if (code == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
+        // P2: 先擦除旧 token 再替换新 token，与 resetAuthState 的安全清零约定一致
+        XYChat::Security::SecureMemory::wipe(m_sessionToken);
         m_sessionToken = data.value("token").toString();
+        m_sessionExpiresAtSecs = parseExpiresAt(data.value("expiresAt").toString());
         emit sessionChanged();
-        qDebug() << "[NetMgr] Token renewed";
+        qInfo() << "[NetMgr] Token renewed";
+        scheduleTokenRenew();
+        return;
+    }
+
+    // P2: 续期被拒——token 已失效（被 terminate_session/登出/续期换代删除，或 token 不匹配），
+    // 无法自动恢复，回登录页让用户重新登录。
+    if (code == static_cast<int>(ErrorCode::SessionInvalid)
+        || code == static_cast<int>(ErrorCode::SessionExpired)) {
+        qWarning() << "[NetMgr] Token renewal rejected, session invalid";
+        notifySessionExpired();
+        return;
+    }
+
+    // 其他瞬时失败（网络/服务端内部错误）：短退避后重试一次，避免会话无谓失效
+    qWarning() << "[NetMgr] Token renewal failed, will retry:"
+               << response.value("message").toString();
+    if (m_tokenRenewTimer) {
+        m_tokenRenewTimer->start(kRenewRetryDelayMs);
     }
 }
 
@@ -577,6 +637,12 @@ void NetworkManager::resetAuthState()
     XYChat::Security::SecureMemory::wipe(m_sessionToken);
     XYChat::Security::SecureMemory::wipe(m_pendingPassword);
     XYChat::Security::SecureMemory::wipe(m_pendingRegisterPassword);
+    // P2: 会话续期状态重置（停止续期定时器、清在途续期请求与过期时间）
+    if (m_tokenRenewTimer) {
+        m_tokenRenewTimer->stop();
+    }
+    m_pendingTokenRenewRequestId = 0;
+    m_sessionExpiresAtSecs = 0;
     m_userId = 0;
     m_username.clear();
     m_pendingUsername.clear();
@@ -609,6 +675,77 @@ void NetworkManager::resetAuthState()
         m_localStore.close();
     }
     emit sessionChanged();
+}
+
+// P2: 调度自动续期——在会话过期前 kRenewBeforeExpirySecs 触发一次 renewToken()
+void NetworkManager::scheduleTokenRenew()
+{
+    if (!m_tokenRenewTimer) {
+        return;
+    }
+    m_tokenRenewTimer->stop();
+    // 未获取到过期时间（旧服务端未返回 expiresAt）时不做调度，避免误触发
+    if (m_sessionExpiresAtSecs <= 0) {
+        return;
+    }
+
+    const qint64 now = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+    qint64 delayMs = (m_sessionExpiresAtSecs - kRenewBeforeExpirySecs - now) * 1000;
+    if (delayMs < 1000) {
+        // 已过触发点但尚未过期（或时间漂移）：稍后立即续期一次
+        delayMs = 1000;
+    }
+    // QTimer 以 int 毫秒计，超长间隔（>24.8 天）夹取到上限；实际 6 天远小于上限
+    m_tokenRenewTimer->start(static_cast<int>(qMin<qint64>(delayMs, 2147483647LL)));
+}
+
+// P2: 会话失效——安全清理并回登录页。幂等：单次会话仅通知一次，避免重复弹窗。
+void NetworkManager::notifySessionExpired()
+{
+    if (m_sessionExpiredNotified) {
+        return;
+    }
+    m_sessionExpiredNotified = true;
+
+    if (m_tokenRenewTimer) {
+        m_tokenRenewTimer->stop();
+    }
+    m_pendingTokenRenewRequestId = 0;
+    m_sessionExpiresAtSecs = 0;
+
+    // 安全清零 token 与本地用户数据（保留 E2EE 密钥材料），并停止重连/重登录
+    resetAuthState();
+    m_loginQueued = false;
+    m_registerQueued = false;
+    m_reconnectEnabled = false;
+
+    // 断开连接，避免残留无效长连接继续心跳
+    if (m_sslSocket->state() != QAbstractSocket::UnconnectedState) {
+        m_sslSocket->disconnectFromHost();
+    }
+    setState(ConnectionState::Disconnected);
+
+    qInfo() << "[NetMgr] Session expired, returning to login";
+    emit sessionExpired();
+}
+
+// P2: 解析服务端返回的过期时间（UTC ISO 字符串）。
+// 服务端以 UTC 生成 ISO 时间；Qt 对无时区后缀的 ISO 串按本地时间解析，
+// 此处加回本地时区偏移以还原真实 UTC 时刻，避免续期定时器提前/滞后触发。
+qint64 NetworkManager::parseExpiresAt(const QString &iso) const
+{
+    if (iso.isEmpty()) {
+        return 0;
+    }
+    QDateTime dt = QDateTime::fromString(iso, Qt::ISODate);
+    if (!dt.isValid()) {
+        return 0;
+    }
+    qint64 epochSecs = dt.toSecsSinceEpoch();
+    if (dt.timeSpec() == Qt::LocalTime) {
+        epochSecs += dt.offsetFromUtc();
+    }
+    return epochSecs;
 }
 
 // M5: 重放保护
@@ -1783,6 +1920,14 @@ void NetworkManager::handleErrorResponse(const Packet &packet)
     const int code = response.value("code").toInt();
     qWarning() << "[NetMgr] Server error response, code" << code
                << "message" << response.value("message").toString();
+
+    // P2: 会话已失效（过期/被终止）——任何业务请求被鉴权门拒绝即触发，
+    // 清状态并回登录页，避免静默卡死
+    if (code == static_cast<int>(ErrorCode::SessionInvalid)
+        || code == static_cast<int>(ErrorCode::SessionExpired)) {
+        notifySessionExpired();
+        return;
+    }
 
     if (packet.requestId != 0 && packet.requestId == m_pendingFetchGroupKeysRequestId) {
         m_pendingFetchGroupKeysRequestId = 0;

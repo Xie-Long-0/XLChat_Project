@@ -120,6 +120,17 @@ ApplicationWindow {
             loginPage.showError(errorMessage)
         }
 
+        // P2: 会话失效（过期/被终止/续期被拒）——回登录页并提示重新登录
+        function onSessionExpired() {
+            if (mainWindow !== undefined && mainWindow !== null) {
+                mainWindow.resetUi()
+                mainWindow.hide()
+            }
+            loginPage.setLoading(false)
+            loginPage.showError("会话已过期，请重新登录")
+            root.show()
+        }
+
         function onRegisterSuccessful() {
             loginPage.showSuccess("注册成功，请登录")
         }

@@ -239,4 +239,9 @@ Window {
     function loadConversations() {
         networkManager.getConversations()
     }
+
+    // P2: 会话失效回登录页时重置主页面 UI（会话列表/聊天区/当前会话选择）
+    function resetUi() {
+        mainPage.resetUi()
+    }
 }

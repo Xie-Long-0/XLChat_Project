@@ -38,7 +38,7 @@
 
 | 能力域 | 现状 |
 | --- | --- |
-| 账户与认证 | 注册/登录/登出/token 续期/`terminate_session`（仅本人其他会话）；PBKDF2 密码存储；登录失败限流（IP 5min/10 次、用户 5min/5 次）；多设备识别（`deviceId` 取自机器唯一 ID）；**逐包验 token + `validateSession()` 回查 `sessions` 表**（2026-09-02 P1 修复：过期/终止/续期换代即时失效，`expiresAt` 解析异常 fail-closed）。**未实现**：双因素认证、注销/找回、会话过期后客户端自动重登 UX |
+| 账户与认证 | 注册/登录/登出/token 续期/`terminate_session`（仅本人其他会话）；PBKDF2 密码存储；登录失败限流（IP 5min/10 次、用户 5min/5 次）；多设备识别（`deviceId` 取自机器唯一 ID）；**逐包验 token + `validateSession()` 回查 `sessions` 表**（2026-09-02 P1 修复：过期/终止/续期换代即时失效，`expiresAt` 解析异常 fail-closed）；**会话自动续期 + 失效自动重登**（2026-09-04：过期前 1 天自动 `renewToken`、续期响应 60 秒看门狗兜底、失效回登录页提示重新登录）。**未实现**：双因素认证、注销/找回 |
 | 一对一聊天 | E2EE（envelope 密文，服务端 fail-closed）、`clientMessageId` 幂等、乐观发送 UI、per-recipient 回执（delivered/read）、消息状态实时推送、离线 outbox（加密持久化，跨重启重发） |
 | 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；**成员变更 Sender-Key healing**（2026-09-02 P1 修复：`member_added/removed/left` 触发本端轮换+重分发，新成员获密钥、被移除成员失后续解密能力，离线经 `sync_events` 补偿）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：大群拉取模式、改群名接口（数据层已就绪） |
 | 本地存储 | `LocalStore`（SQLite，按账号+设备隔离）：消息/会话预览/outbox/解密缓存 AES-256-GCM 加密落库，存储密钥 DPAPI 保护；M7b 起含 `sender_keys` 表；登出清用户可见数据、保留密钥材料 |
@@ -110,7 +110,6 @@
 
 | 优先级 | 类别 | 条目 | 来源 | 影响/说明 |
 | --- | --- | --- | --- | --- |
-| P2 | 安全 | 会话过期/被终止后客户端缺自动重登 UX | 2026-09-02 P1 修复审查 | 服务端已逐包验 token 并对失效会话回 `Error`，客户端已清理在途单发槽位避免卡死，但未触发重新登录提示；`renewToken()` 暂无调用点（7 天 TTL 到期后需手动重登） |
 | P2 | 功能 | 大群单条 `sender_key_distribution` 超 16384 字符上限 | 2026-09-02 P1 修复审查 | 成员设备数约 >60 时首次分发/healing 分发消息超限被服务端拒（`InvalidRequest`）；需分片分发或提高上限（与 P3 大群拉取模式相关） |
 | P2 | 安全 | 群 Sender-Key “先落盘后分发”，分发永久失败留解密窗口 | 2026-09-02 P1 修复审查 | 轮换后新 key 在分发 ACK 前即启用；瞬时失败已延迟重试，确定性失败（如超大群）下本端以新 keyId 加密而他人未收到 → 群消息不可解；建议改为 ACK 后启用/pending 提交 |
 | P3 | 工程 | 群成员变更 healing 的 O(N²) 重分发与预密钥消耗 | 2026-09-02 P1 修复审查 | 一次成员变更触发全员各自轮换+重分发；已加同群去重与单发槽位节流，但大群跨成员风暴仍需聚合策略（如群主统一分发或延迟合并） |
@@ -197,7 +196,7 @@
 
 1. **M11 前置两项：发消息/搜索限流 + 结构化日志** ✅ **已完成（2026-09-03）**：连接级 `RateWindow` 限流（send_message 30/10s、search_users 20/60s、fetch_keys 迁移，新增 `RateLimited` 1003）+ `StructuredLogger` 结构化审计日志；新增 RateWindow/StructuredLogger 共 4 个单测，ctest 通过（TestLocalStore 沙箱 DPAPI 偶发除外）。**下一候选为第 2 项。**
 2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理** ✅ **已完成（2026-09-04）**：`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算；`migrateToV8` 水位线 + `pruneSyncEvents`（30 天/每小时）+ `needsFullSync` 全量回退；新增 3 个回归用例，`ctest` 6/6。**下一候选为第 3 项。**
-3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期**（P1 修复配套收尾，见欠账清单 P2）。
+3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期** ✅ **已完成（2026-09-04）**：登录/续期响应解析 `expiresAt`，过期前 1 天自动 `renewToken`（续期响应 60 秒看门狗兜底、瞬时失败 5 分钟退避重试），续期时先擦除旧 token；服务端回 `SessionInvalid/SessionExpired`（含业务请求与续期响应两路径）时客户端安全清零并 `sessionExpired` 信号回登录页提示重新登录；断线重连重登后自动重新调度。对应欠账清单 P2 已销账。**下一候选为第 4 项。**
 4. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
 5. **M8 媒体文件**。
 6. **M10 搜索/通知/体验**。
@@ -289,3 +288,4 @@ XYChat_Project/
 | 2026-09-02 | P1 欠账修复（3 项） | ① `validateSession()` 逐请求回查 `sessions` 表 + 过期 fail-closed（`token_renew` 豁免过期门）；② 逐包验 token（客户端已认证请求经 `addReplayProtection` 携带 `token`，服务端逐包比对哈希；新增客户端 `MessageType::Error` 处理清理在途槽位）；③ 群成员变更 Sender-Key healing（`member_added/removed/left` 触发本端轮换+重分发，离线经 `sync_events` 补偿，含同群去重/队列/瞬时失败延迟重试）。新增回归用例 `sessionByIdReflectsDeletionAndExpiry`、`senderKeyRotationRevokesRemovedMember`；`ctest` 6/6 通过；审查发现的大群分发上限/先落盘后分发/会话过期重登 UX/O(N²) 重分发登记为新欠账（P2/P3） |
 | 2026-09-03 | M11 前置两项完成 | 发消息/搜索限流 + 结构化日志落地。① 限流：新增通用错误码 `RateLimited (1003)`（`LoginRateLimited` 收窄为仅登录）；`RateWindow`（`Chat-Server/core`，header-only）连接级固定窗口限流器替换 fetch_keys/fetch_group_keys 内联窗口并新增 `send_message`（30/10s，私聊/群聊同一入口）与 `search_users`（20/60s）限流；客户端 send 瞬时失败退避重刷（单发护栏防定时器堆叠）、fetch_group_keys healing 瞬时分类兼容新旧限流码。② 结构化日志：`StructuredLogger`（`CommonModule/security`）单行 JSON，统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段 + LogSanitizer 脱敏；`sendResponse` 中央审计日志（成功 info/失败 warning，含耗时）+ 鉴权/会话/重放/envelope/限流安全事件带 `reason`；移除登录/注册明文 username/IP 日志；Server 连接生命周期结构化。新增 4 单测（RateWindow×2/StructuredLogger×2），`ctest` 5/6 绿（TestLocalStore 沙箱 DPAPI 偶发 fail-closed，单独运行通过）；CodeReview 子代理审查并修复 3 项（客户端限流重试/登出日志 userId 归因/服务器自发响应陈旧 type）。对应第 3 节两项 P2 欠账销账 |
 | 2026-09-04 | M9 核心一致性完成 | 已读状态多端同步 + `sync_events` 保留清理（收掉 M9 三条基础验收）。① 已读多端同步：新增 `ReadCursorNotification (80)` 推送 + 已读者自身 `read_cursor` 事件，客户端 `markConversationRead` 按剩余未读重算角标、对方消息状态只前进；② 清理：`migrateToV8`（`sync_meta` 水位线）+ `pruneSyncEvents`（30 天/每小时，Server 独立维护连接）+ 落后设备 `needsFullSync`/`fullSyncSeq` 全量回退（历史经 `sync_messages` 从 messages 表补齐）。新增回归用例 `pruneSyncEventsPrunesExpiredAndAdvancesWatermark`/`readCursorEventRoundTrips`/`markConversationReadRecomputesUnreadAndOnlyAdvances`，`groupMigration` 版本断言更新至 V8；`ctest` 6/6；CodeReview 无 P0，修复 P1（`fullSyncSeq=0` 用 `qMax(maxSeq, prunedBelow)` 保证游标自愈）与 P2（未读角标改重算避免误清更新未读）。对应第 3 节 `sync_events` 清理与已读多端同步两项 P2 欠账销账；特性栈（置顶/免打扰/编辑/删除）仍按建议单独立项 |
+| 2026-09-04 | 会话续期与失效重登完成 | 客户端接入 `expiresAt`：登录/续期响应解析过期时间，过期前 1 天自动 `renewToken`（续期响应 60 秒看门狗兜底 + 瞬时失败 5 分钟退避重试），续期换代先 `SecureMemory::wipe` 旧 token；服务端 `SessionInvalid/SessionExpired`（业务请求经 `MessageType::Error`、续期经 `TokenRenewResponse` 两路径）触发客户端安全清零 + `sessionExpired` 信号回登录页提示重新登录；断线重连重登后自动重新调度续期；`parseExpiresAt` 校正 Qt 对无时区 ISO 串按本地解析的偏移。对应第 3 节 P2 欠账销账；构建 41/41 目标通过，`ctest` 5/6（TestLocalStore 为已知沙箱 DPAPI 偶发，与本次改动无关） |
