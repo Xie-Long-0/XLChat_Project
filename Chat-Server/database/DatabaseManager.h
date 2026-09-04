@@ -189,6 +189,10 @@ public:
     // M5.5: 同步事件流
     qint64 appendSyncEvent(qint64 userId, const QString &eventType, const QString &payloadJson);
     QList<SyncEventInfo> getSyncEvents(qint64 userId, qint64 afterSeq, int limit = 200);
+    // M9: sync_events 保留清理与落后检测
+    int pruneSyncEvents(int retentionDays);  // 删除早于保留期的事件，返回删除数
+    qint64 prunedBelowSeq();                 // 清理水位线：该 seq 及以下事件已不可用
+    qint64 maxSyncEventSeq();                // 当前全局最大 seq（供全量回退重置游标）
 
     // M6: 端到端加密密钥管理
     // 注册/更新设备身份公钥（仅公钥，私钥永不离开客户端）
@@ -245,6 +249,7 @@ private:
     bool migrateToV5();
     bool migrateToV6();
     bool migrateToV7();
+    bool migrateToV8();
 
     // M7a: 插入单个会话成员（供 createGroup/addGroupMembers 复用）
     bool insertMember(qint64 conversationId, qint64 userId, const QString &role);

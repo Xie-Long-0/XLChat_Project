@@ -62,6 +62,7 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - 服务端实现 send_message（`clientMessageId` 幂等去重）/ ack_message（先授权再写回执）/ sync_messages（先授权再查询）/ sync_events（账号级游标同步）。
 - 客户端实现会话列表、聊天窗口、消息气泡、持久化 outbox（M6.5：加密落库，未确认消息重启后登录成功自动重发，幂等键保证不重复）。
 - M6.5 本地缓存接入：登录后立即展示上一周期的缓存会话列表，打开会话先展示本地缓存再由服务端数据覆盖；登录后基于 `sync_events` 游标自动增量同步（hasMore 自动续拉），事件写入本地缓存并推进游标。
+- M9 多端同步与离线一致性：`ack_message(read)` 触发已读者自身 `read_cursor` 事件 + `ReadCursorNotification` 推送，同账号其他设备经 `markConversationRead` 重算未读角标、推进消息已读态（状态只前进）；`sync_events` 按 30 天保留期每小时清理（`sync_meta` 水位线），落后于水位的设备由 `needsFullSync` 触发全量回退（重置游标 + `get_conversations`，历史消息经 `sync_messages` 从 messages 表补齐）。
 - M4.5 客户端体验完善：搜索用户直接发起对话（虚拟会话 + 首条消息 ACK 后绑定 conversationId）、发送乐观显示（发送中→已发送→已送达→已读实时流转）、显式已读回执、日期分隔线、会话选中高亮与未读角标本地实时更新、侧边栏用户信息栏与登出入口、亮/暗主题切换（`Theme.qml` darkMode 驱动 + `ThemeSettings` QSettings 持久化）。
 - 离线消息通过 sync_messages（afterId 游标）按会话增量同步；离线期间的消息/联系人/回执变更可经 sync_events 兜底补齐。
 - 会话/消息接口全部先授权再查询（`isConversationMember()` / `canAccessMessage()`，M5.5）。
@@ -119,7 +120,8 @@ ConnectionServer(主线程) ── socketAccepted ──> RequestHandler(QThread
 - `conversation_members`：会话成员（conversation_id, user_id, last_read_message_id，读游标只前进；M7a 新增 `role` 成员角色列，取值 owner/admin/member，存量行默认 member）
 - `messages`：消息主体（conversation_id, sender_id, content, status, created_at, client_message_id, sender_device_id）——M6 起新消息正文为 E2EE envelope 密文，存量旧消息为明文
 - `message_receipts`（V4 新增）：送达/已读回执（message_id, user_id, device_id, delivered_at, read_at，UNIQUE(message_id, user_id, device_id)）
-- `sync_events`（V4 新增）：账号级同步事件流（seq 自增, user_id, event_type, payload），索引 (user_id, seq)
+- `sync_events`（V4 新增）：账号级同步事件流（seq 全局自增, user_id, event_type, payload），索引 (user_id, seq)；event_type 含 message/contact_added/receipt/group_changed/read_cursor（M9）
+- `sync_meta`（V8 新增，M9）：单行清理水位线（id=1, pruned_below_seq），记录已被 `pruneSyncEvents` 清理的最大 seq，供落后设备 `needsFullSync` 判定
 - `device_identity_keys`（V5 新增）：设备身份公钥（user_id, device_id, identity_pub, UNIQUE(user_id, device_id)）——仅存公钥
 - `prekeys`（V5 新增）：一次性预密钥公钥（user_id, device_id, pub, status: unused/claimed/used, claimed_at）——仅存公钥，认领超时回退靠 `claimed_at`（V6 迁移兼容补齐该列）
 - `sender_keys`（M7b 新增，客户端 `LocalStore` 本地表）：群 Sender-Key 本地加密存储（group_id, sender_user_id, sender_device_id, key_id, chain_key_enc, public_signing_key, private_signing_key_enc, iteration, updated_at，主键 (group_id, sender_user_id, sender_device_id, key_id)）——chain key 与签名私钥经 `LocalStore` 存储密钥加密后落库，登出保留

@@ -115,6 +115,9 @@ bool DatabaseManager::runMigrations()
     if (currentVersion < 7) {
         if (!migrateToV7()) return false;
     }
+    if (currentVersion < 8) {
+        if (!migrateToV8()) return false;
+    }
 
     return true;
 }
@@ -545,6 +548,34 @@ bool DatabaseManager::migrateToV7()
     }
 
     qDebug() << "[DB] Migration V7 complete";
+    return true;
+}
+
+bool DatabaseManager::migrateToV8()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V8...";
+
+    // M9: sync_events 清理水位线（单行元数据）——记录已被清理的最大 seq，
+    // 供 sync_events 请求判定设备游标是否落后于清理点（需全量回退）
+    if (!q.exec(
+            "CREATE TABLE IF NOT EXISTS sync_meta ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  pruned_below_seq INTEGER NOT NULL DEFAULT 0)")) {
+        qCritical() << "[DB] V8: Failed to create sync_meta table:" << q.lastError().text();
+        return false;
+    }
+    q.exec("INSERT OR IGNORE INTO sync_meta (id, pruned_below_seq) VALUES (1, 0)");
+
+    q.prepare("INSERT INTO schema_version (version) VALUES (8)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V8: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V8 complete";
     return true;
 }
 
@@ -1503,6 +1534,72 @@ QList<SyncEventInfo> DatabaseManager::getSyncEvents(qint64 userId, qint64 afterS
         }
     }
     return result;
+}
+
+// M9: sync_events 保留清理——删除早于保留期的事件并推进水位线，返回删除数。
+// seq 全局自增且与 created_at 单调，故按过期事件的最大 seq 批量删除（走主键索引）
+int DatabaseManager::pruneSyncEvents(int retentionDays)
+{
+    if (retentionDays <= 0) {
+        return 0;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+
+    qint64 cutoffSeq = 0;
+    {
+        QSqlQuery q(db);
+        q.prepare("SELECT COALESCE(MAX(seq), 0) FROM sync_events WHERE created_at < datetime('now', ?)");
+        q.addBindValue(QString("-%1 days").arg(retentionDays));
+        if (q.exec() && q.next()) {
+            cutoffSeq = q.value(0).toLongLong();
+        }
+    }
+    if (cutoffSeq <= 0) {
+        return 0;
+    }
+
+    // 按 created_at 精确删除过期事件（不依赖 seq 与时间严格单调）
+    QSqlQuery del(db);
+    del.prepare("DELETE FROM sync_events WHERE created_at < datetime('now', ?)");
+    del.addBindValue(QString("-%1 days").arg(retentionDays));
+    if (!del.exec()) {
+        qWarning() << "[DB] pruneSyncEvents delete failed:" << del.lastError().text();
+        return 0;
+    }
+    const int removed = del.numRowsAffected();
+
+    // 水位线只前进
+    QSqlQuery upd(db);
+    upd.prepare("UPDATE sync_meta SET pruned_below_seq = ? WHERE id = 1 AND pruned_below_seq < ?");
+    upd.addBindValue(cutoffSeq);
+    upd.addBindValue(cutoffSeq);
+    upd.exec();
+
+    if (removed > 0) {
+        qInfo() << "[DB] Pruned" << removed << "expired sync_events below seq" << cutoffSeq;
+    }
+    return removed;
+}
+
+qint64 DatabaseManager::prunedBelowSeq()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("SELECT pruned_below_seq FROM sync_meta WHERE id = 1");
+    if (q.exec() && q.next()) {
+        return q.value(0).toLongLong();
+    }
+    return 0;
+}
+
+qint64 DatabaseManager::maxSyncEventSeq()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    if (q.exec("SELECT COALESCE(MAX(seq), 0) FROM sync_events") && q.next()) {
+        return q.value(0).toLongLong();
+    }
+    return 0;
 }
 
 // M6: 端到端加密密钥管理

@@ -415,6 +415,10 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::SyncEventsResponse:
         handleSyncEventsResponse(packet);
         break;
+    // M9: 已读游标推送（同账号其他设备已读）
+    case MessageType::ReadCursorNotification:
+        handleReadCursorNotification(packet);
+        break;
     // M6
     case MessageType::RegisterKeysResponse:
         handleRegisterKeysResponse(packet);
@@ -2104,6 +2108,29 @@ void NetworkManager::handleMessageStatusUpdate(const Packet &packet)
     }
 }
 
+// M9: 已读游标推送（同账号其他设备已读）
+void NetworkManager::handleReadCursorNotification(const Packet &packet)
+{
+    const QJsonObject obj = QJsonDocument::fromJson(packet.payload).object();
+    applyReadCursor(obj.value("conversationId").toVariant().toLongLong(),
+                    obj.value("readMessageId").toVariant().toLongLong());
+}
+
+// M9: 应用已读游标——更新本地缓存（未读清零 + 对方消息标记已读）并通知 UI；
+// 实时推送（ReadCursorNotification）与离线补偿（sync_events read_cursor）共用
+void NetworkManager::applyReadCursor(qint64 conversationId, qint64 readMessageId)
+{
+    if (conversationId <= 0 || readMessageId <= 0) {
+        return;
+    }
+    if (m_localStore.isOpen()) {
+        m_localStore.markConversationRead(conversationId, readMessageId, m_userId);
+        // 会话列表未读角标已变，重新 emit 缓存会话刷新侧边栏
+        emit conversationsResult(m_localStore.loadConversations());
+    }
+    emit readCursorAdvanced(conversationId, readMessageId);
+}
+
 // M5.5: 账号级增量同步
 void NetworkManager::syncEvents(qint64 afterSeq, int limit)
 {
@@ -2131,6 +2158,21 @@ void NetworkManager::handleSyncEventsResponse(const Packet &packet)
     const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
     if (response.value("code").toInt() == static_cast<int>(ErrorCode::Ok)) {
         const QJsonObject data = response.value("data").toObject();
+
+        // M9: 落后于服务端清理水位——afterSeq 与水位线之间的事件已被清理，
+        // 增量拉取不可得，回退全量：重置游标到最新 seq 并重拉会话列表，
+        // 历史消息在用户打开对应会话时经 syncMessages(afterId=0) 全量补齐
+        if (data.value("needsFullSync").toBool()) {
+            const qint64 fullSyncSeq = data.value("fullSyncSeq").toVariant().toLongLong();
+            qInfo() << "[NetMgr] sync_events behind prune watermark; full resync to seq"
+                    << fullSyncSeq;
+            if (m_localStore.isOpen() && fullSyncSeq > m_localStore.syncCursor()) {
+                m_localStore.setSyncCursor(fullSyncSeq);
+            }
+            getConversations();
+            return;
+        }
+
         // M6: 解密事件流中的 message 事件正文
         QJsonArray events = data.value("events").toArray();
         for (QJsonValueRef value : events) {
@@ -2258,6 +2300,10 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
             m_localStore.updateMessageStatus(
                 payload.value("messageId").toVariant().toLongLong(),
                 payload.value("status").toString());
+        } else if (type == "read_cursor") {
+            // M9: 已读者自身其他设备的已读游标（离线补偿）
+            applyReadCursor(payload.value("conversationId").toVariant().toLongLong(),
+                            payload.value("readMessageId").toVariant().toLongLong());
         } else if (type == "group_changed") {
             // P1-3: 离线期间的群成员变更补偿：收集需 healing 的群，批次结束后统一触发
             const qint64 convId = payload.value("conversationId").toVariant().toLongLong();

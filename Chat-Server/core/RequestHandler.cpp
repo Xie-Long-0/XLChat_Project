@@ -958,6 +958,21 @@ void RequestHandler::processAckMessageRequest(const Packet &packet, const QJsonO
 
     if (status == "read") {
         m_db->updateMemberReadCursor(msgOpt->conversationId, m_authenticatedUserId, messageId);
+
+        // M9: 已读状态多端同步——向已读者自身事件流追加 read_cursor 并实时推送给其
+        // 所有在线设备（含本机，幂等）；其他设备据此清零未读角标、把该会话中
+        // messageId 及之前的对方消息标记为已读
+        QJsonObject readEv;
+        readEv["conversationId"] = msgOpt->conversationId;
+        readEv["readMessageId"] = messageId;
+        const QByteArray readPayload = QJsonDocument(readEv).toJson(QJsonDocument::Compact);
+        m_db->appendSyncEvent(m_authenticatedUserId, "read_cursor", QString::fromUtf8(readPayload));
+
+        Packet readPacket;
+        readPacket.messageType = MessageType::ReadCursorNotification;
+        readPacket.requestId = 0;
+        readPacket.payload = readPayload;
+        emit messageForUser(m_authenticatedUserId, PacketCodec::encode(readPacket));
     }
 
     // M7a: 按接收者总数聚合展示状态（私聊接收者为 1 人，群聊为除发送方外全体成员），
@@ -1075,6 +1090,23 @@ void RequestHandler::processSyncEventsRequest(const Packet &packet, const QJsonO
         limit = 200;
     }
 
+    // M9: 落后于清理水位的设备需全量回退——afterSeq 与水位线之间的事件已被清理，
+    // 增量拉取会静默丢失这段历史，故返回 needsFullSync 让客户端重拉会话/消息全量
+    const qint64 prunedBelow = m_db->prunedBelowSeq();
+    if (afterSeq > 0 && afterSeq < prunedBelow) {
+        QJsonObject data;
+        data["events"] = QJsonArray();
+        data["lastSeq"] = afterSeq;
+        data["hasMore"] = false;
+        data["needsFullSync"] = true;
+        // 事件表被清空时 maxSyncEventSeq 为 0，回退到水位线（已删事件最大 seq，
+        // AUTOINCREMENT 不复用）保证客户端游标能前进并自愈，避免反复触发全量回退
+        data["fullSyncSeq"] = qMax(m_db->maxSyncEventSeq(), prunedBelow);
+        sendResponse(packet.requestId, MessageType::SyncEventsResponse, ErrorCode::Ok,
+                     "OK", data);
+        return;
+    }
+
     // 仅返回本人事件流，无越权面
     const auto events = m_db->getSyncEvents(m_authenticatedUserId, afterSeq, limit);
 
@@ -1092,6 +1124,7 @@ void RequestHandler::processSyncEventsRequest(const Packet &packet, const QJsonO
     data["events"] = eventArray;
     data["lastSeq"] = events.isEmpty() ? afterSeq : events.last().seq;
     data["hasMore"] = (events.size() >= limit);
+    data["needsFullSync"] = false;
     sendResponse(packet.requestId, MessageType::SyncEventsResponse, ErrorCode::Ok,
                  "OK", data);
 }

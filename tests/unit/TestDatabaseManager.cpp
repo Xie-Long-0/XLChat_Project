@@ -55,6 +55,9 @@ private slots:
     void receiptsAggregatePerRecipient();
     void readCursorOnlyMovesForward();
     void syncEventsCursorWorks();
+    // M9: sync_events 保留清理与已读游标事件
+    void pruneSyncEventsPrunesExpiredAndAdvancesWatermark();
+    void readCursorEventRoundTrips();
 
     // M6 端到端加密密钥管理测试
     void v5TablesExist();
@@ -334,6 +337,60 @@ void TestDatabaseManager::syncEventsCursorWorks()
     // limit 生效
     auto limited = m_db->getSyncEvents(user1->id, 0, 1);
     QCOMPARE(limited.size(), 1);
+}
+
+// M9: sync_events 保留清理——过期事件被删、水位线前进、新事件保留
+void TestDatabaseManager::pruneSyncEventsPrunesExpiredAndAdvancesWatermark()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    QVERIFY(user1.has_value());
+
+    const qint64 baseWatermark = m_db->prunedBelowSeq();
+
+    // 直接插入两条过期事件（created_at 早于保留期）与一条新事件
+    {
+        QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+        QSqlQuery q(db);
+        q.prepare("INSERT INTO sync_events (user_id, event_type, payload, created_at) "
+                  "VALUES (?, 'message', '{}', datetime('now', '-40 days'))");
+        q.addBindValue(user1->id);
+        QVERIFY(q.exec());
+        QVERIFY(q.exec());
+    }
+    const qint64 freshSeq = m_db->appendSyncEvent(user1->id, "message", "{\"fresh\":true}");
+    QVERIFY(freshSeq > 0);
+    QCOMPARE(m_db->maxSyncEventSeq(), freshSeq);
+
+    // 保留 30 天：删除 40 天前的两条，水位线前进，新事件保留
+    QCOMPARE(m_db->pruneSyncEvents(30), 2);
+    QVERIFY(m_db->prunedBelowSeq() > baseWatermark);
+    QVERIFY(m_db->prunedBelowSeq() < freshSeq);
+
+    // 新事件仍可拉取
+    const auto after = m_db->getSyncEvents(user1->id, freshSeq - 1, 10);
+    QCOMPARE(after.size(), 1);
+    QCOMPARE(after.first().seq, freshSeq);
+
+    // 再次清理无过期事件：返回 0，水位线不回退
+    const qint64 watermark = m_db->prunedBelowSeq();
+    QCOMPARE(m_db->pruneSyncEvents(30), 0);
+    QCOMPARE(m_db->prunedBelowSeq(), watermark);
+}
+
+// M9: 已读游标事件写入已读者自身事件流，供其其他设备同步
+void TestDatabaseManager::readCursorEventRoundTrips()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    QVERIFY(user1.has_value());
+
+    const qint64 seq = m_db->appendSyncEvent(
+        user1->id, "read_cursor", "{\"conversationId\":7,\"readMessageId\":42}");
+    QVERIFY(seq > 0);
+
+    const auto events = m_db->getSyncEvents(user1->id, seq - 1, 10);
+    QCOMPARE(events.size(), 1);
+    QCOMPARE(events.first().eventType, QString("read_cursor"));
+    QVERIFY(events.first().payload.contains("\"readMessageId\":42"));
 }
 
 // 用户管理
@@ -828,10 +885,10 @@ void TestDatabaseManager::groupMigrationAddsNameAndRoleColumns()
     QCOMPARE(check.value(1).toLongLong(), 1LL);
     QCOMPARE(check.value(2).toLongLong(), 1LL);
 
-    // 版本号推进到 7
+    // 版本号推进到最新（V7 群迁移之后还有 M9 的 V8）
     QVERIFY(check.exec("SELECT MAX(version) FROM schema_version"));
     QVERIFY(check.next());
-    QCOMPARE(check.value(0).toInt(), 7);
+    QCOMPARE(check.value(0).toInt(), 8);
 }
 
 void TestDatabaseManager::createGroupInsertsOwnerAndMembers()

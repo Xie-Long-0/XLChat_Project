@@ -30,7 +30,7 @@
 | M7a | 明文群聊 | 已完成 | 2026-08-21 | 群管理五接口（建群/邀请/退群自动转让/踢人层级保护/群信息）、群消息 fan-out + sync_events 兜底、系统消息与群变更通知、按人数回执聚合、客户端群聊 UI（2026-08-22 热修复联调崩溃：QML 会话列表差分更新、移除 add 动画、LocalStore 连接自愈） |
 | M7b | 群聊端到端加密（Sender Keys） | 已完成 | 2026-09-02 | 每发送方每群独立 chain key + Ed25519 签名，HKDF ratchet 派生消息密钥，AES-256-GCM 加密；sender-key 经 M6 pairwise E2EE 分发；`fetch_group_keys`（类型 71/72）；服务端群 envelope fail-closed 校验；DoS 上限防护（`MaxRatchetSteps=2000`/`MaxMessageIteration=1e8`）；双客户端联调通过 |
 | M8 | 媒体、文件与对象存储 | 未开始 | — | 见第 4.1 节 |
-| M9 | 多端同步与离线一致性 | 未开始 | — | 范围已按现状收缩，见第 4.2 节 |
+| M9 | 多端同步与离线一致性 | 核心一致性已完成 | 2026-09-04 | 已读状态多端同步（`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算）+ `sync_events` 保留清理（30 天/每小时，落后设备 `needsFullSync` 全量回退）；特性栈（置顶/免打扰/编辑/删除）按建议单独立项，见第 4.2 节 |
 | M10 | 搜索、通知与体验完善 | 未开始 | — | 见第 4.3 节 |
 | M11 | 稳定性、可观测性与运维 | 未开始 | — | 登录限流已在 M2 落地，密钥拉取连接级限流已在 M6/M7b 落地；**M11 前置两项（发消息/搜索限流 + 结构化日志）已于 2026-09-03 提前落地**，其余见第 4.4 节 |
 
@@ -114,8 +114,6 @@
 | P2 | 功能 | 大群单条 `sender_key_distribution` 超 16384 字符上限 | 2026-09-02 P1 修复审查 | 成员设备数约 >60 时首次分发/healing 分发消息超限被服务端拒（`InvalidRequest`）；需分片分发或提高上限（与 P3 大群拉取模式相关） |
 | P2 | 安全 | 群 Sender-Key “先落盘后分发”，分发永久失败留解密窗口 | 2026-09-02 P1 修复审查 | 轮换后新 key 在分发 ACK 前即启用；瞬时失败已延迟重试，确定性失败（如超大群）下本端以新 keyId 加密而他人未收到 → 群消息不可解；建议改为 ACK 后启用/pending 提交 |
 | P3 | 工程 | 群成员变更 healing 的 O(N²) 重分发与预密钥消耗 | 2026-09-02 P1 修复审查 | 一次成员变更触发全员各自轮换+重分发；已加同群去重与单发槽位节流，但大群跨成员风暴仍需聚合策略（如群主统一分发或延迟合并） |
-| P2 | 工程 | `sync_events` 无保留清理机制 | M9 盘点 | 事件表无限增长；清理需保证落后设备可回退全量拉取（`sync_messages`/`get_conversations`）不破坏历史 |
-| P2 | 功能 | 已读状态多端同步缺失 | M9 盘点 | receipt 聚合事件只写发送方事件流；已读者自身其他设备无事件源，未读数/已读态不同步 |
 | P2 | 工程 | 端到端 TLS 集成测试缺失 | M5.5 遗留 | `tests/e2e/TestGroupRepro` 为手动工具（不纳入 CTest，需手动启动服务端），无自动化 TLS 双端集成测试 |
 | P2 | 安全 | nonce 去重为单服务器内存态 | M5.5 | 服务端重启清空；多服务器部署需持久化/共享存储 |
 | P2 | 安全 | TOFU 无带外验证；无密钥备份/设备间迁移 | M6 | 首次通信无法抵抗服务端中间人；更换设备/清数据后历史消息不可恢复（产品已决策接受） |
@@ -152,13 +150,13 @@
   - 消息/联系人/回执/群变更统一 `sync_event` 抽象（M5.5/M7a）。
   - 客户端启动后先增量同步再进入实时（M6.5：`openLocalStore` 缓存先行展示 + `syncEvents(cursor)` 增量拉取 + hasMore 自动续拉）。
 - **剩余任务**：
-  - 已读状态多端同步：成员在设备 A 已读后，其设备 B 实时同步（现状缺口：`ack_message(read)` 仅向发送方推送/写事件；方案方向：向已读者自身 `sync_events` 追加 `read_cursor` 类事件，客户端 ingest 后更新本地未读角标与消息状态）。
-  - `sync_events` 保留清理：保留期/容量策略 + 落后于清理点的设备回退全量拉取，不破坏历史（对应欠账 P2）。
+  - ✅ **已读状态多端同步（2026-09-04 完成）**：`ack_message(read)` 时服务端除更新读游标外，向已读者自身 `sync_events` 追加 `read_cursor` 事件并经 `ReadCursorNotification` 实时推送给其所有在线设备；客户端 `markConversationRead` 按“剩余未读对方消息数”重算未读角标、把 `readMessageId` 及之前的对方消息标记已读（状态只前进）。
+  - ✅ **`sync_events` 保留清理（2026-09-04 完成）**：`migrateToV8` 引入 `sync_meta` 水位线表，`Server` 以独立维护连接每小时按 30 天保留期 `pruneSyncEvents`；落后于清理水位的设备（`0 < afterSeq < prunedBelowSeq`）由 `processSyncEventsRequest` 返回 `needsFullSync` + `fullSyncSeq`，客户端重置游标并 `getConversations` 全量回退（历史消息经 `sync_messages` 从 messages 表补齐，不受事件清理影响）。
   - 冲突处理及配套特性：消息编辑/删除、会话置顶/免打扰——均为全新特性栈，**建议单独立项分批实施**（先置顶/免打扰，后编辑/删除），编辑/删除需纳入 `sync_events` 事件类型与幂等语义设计。
 - **验收标准**：
-  - 设备 A 已读消息后，同账号设备 B 同步为已读（未读角标与消息状态一致）。
-  - 离线 24 小时后上线只增量同步缺失事件；清理事件后的落后设备可回退全量拉取且不丢历史。
-  - 服务端可清理过期 `sync_events` 而不破坏 `sync_messages` 历史拉取。
+  - ✅ 设备 A 已读消息后，同账号设备 B 同步为已读（未读角标与消息状态一致）。
+  - ✅ 离线 24 小时后上线只增量同步缺失事件；清理事件后的落后设备可回退全量拉取且不丢历史。
+  - ✅ 服务端可清理过期 `sync_events` 而不破坏 `sync_messages` 历史拉取。
   - （特性栈立项后）编辑/删除/置顶/静音在多端间一致。
 
 ### 4.3 M10：搜索、通知与体验完善（4-6 周）
@@ -198,7 +196,7 @@
 下一步候选按"安全欠账优先、横切能力其次、特性栈分批"排序；**具体下一任务待讨论确定**（原第 1 项 `validateSession()` 回查 DB + 逐包验 token、原第 4 项 M7b healing 已于 2026-09-02 P1 修复完成）：
 
 1. **M11 前置两项：发消息/搜索限流 + 结构化日志** ✅ **已完成（2026-09-03）**：连接级 `RateWindow` 限流（send_message 30/10s、search_users 20/60s、fetch_keys 迁移，新增 `RateLimited` 1003）+ `StructuredLogger` 结构化审计日志；新增 RateWindow/StructuredLogger 共 4 个单测，ctest 通过（TestLocalStore 沙箱 DPAPI 偶发除外）。**下一候选为第 2 项。**
-2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理**（收掉 M9 三条基础验收）。
+2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理** ✅ **已完成（2026-09-04）**：`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算；`migrateToV8` 水位线 + `pruneSyncEvents`（30 天/每小时）+ `needsFullSync` 全量回退；新增 3 个回归用例，`ctest` 6/6。**下一候选为第 3 项。**
 3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期**（P1 修复配套收尾，见欠账清单 P2）。
 4. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
 5. **M8 媒体文件**。
@@ -290,3 +288,4 @@ XYChat_Project/
 | 2026-09-02 | 安全修复 + M7b 入库 + 文档重构 | DoS 上限（`MaxRatchetSteps`/`MaxMessageIteration`）与服务端群 envelope fail-closed 落地（`TestGroupE2eeCrypto` 扩至 20 用例）；群聊横幅改为"已启用端到端加密"；M7b 连同修复提交（`c806d90`）；周度审查确认欠账清单；ROADMAP 完全重构（本版本），`validateSession()` 等 P1 修复见下一行 |
 | 2026-09-02 | P1 欠账修复（3 项） | ① `validateSession()` 逐请求回查 `sessions` 表 + 过期 fail-closed（`token_renew` 豁免过期门）；② 逐包验 token（客户端已认证请求经 `addReplayProtection` 携带 `token`，服务端逐包比对哈希；新增客户端 `MessageType::Error` 处理清理在途槽位）；③ 群成员变更 Sender-Key healing（`member_added/removed/left` 触发本端轮换+重分发，离线经 `sync_events` 补偿，含同群去重/队列/瞬时失败延迟重试）。新增回归用例 `sessionByIdReflectsDeletionAndExpiry`、`senderKeyRotationRevokesRemovedMember`；`ctest` 6/6 通过；审查发现的大群分发上限/先落盘后分发/会话过期重登 UX/O(N²) 重分发登记为新欠账（P2/P3） |
 | 2026-09-03 | M11 前置两项完成 | 发消息/搜索限流 + 结构化日志落地。① 限流：新增通用错误码 `RateLimited (1003)`（`LoginRateLimited` 收窄为仅登录）；`RateWindow`（`Chat-Server/core`，header-only）连接级固定窗口限流器替换 fetch_keys/fetch_group_keys 内联窗口并新增 `send_message`（30/10s，私聊/群聊同一入口）与 `search_users`（20/60s）限流；客户端 send 瞬时失败退避重刷（单发护栏防定时器堆叠）、fetch_group_keys healing 瞬时分类兼容新旧限流码。② 结构化日志：`StructuredLogger`（`CommonModule/security`）单行 JSON，统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段 + LogSanitizer 脱敏；`sendResponse` 中央审计日志（成功 info/失败 warning，含耗时）+ 鉴权/会话/重放/envelope/限流安全事件带 `reason`；移除登录/注册明文 username/IP 日志；Server 连接生命周期结构化。新增 4 单测（RateWindow×2/StructuredLogger×2），`ctest` 5/6 绿（TestLocalStore 沙箱 DPAPI 偶发 fail-closed，单独运行通过）；CodeReview 子代理审查并修复 3 项（客户端限流重试/登出日志 userId 归因/服务器自发响应陈旧 type）。对应第 3 节两项 P2 欠账销账 |
+| 2026-09-04 | M9 核心一致性完成 | 已读状态多端同步 + `sync_events` 保留清理（收掉 M9 三条基础验收）。① 已读多端同步：新增 `ReadCursorNotification (80)` 推送 + 已读者自身 `read_cursor` 事件，客户端 `markConversationRead` 按剩余未读重算角标、对方消息状态只前进；② 清理：`migrateToV8`（`sync_meta` 水位线）+ `pruneSyncEvents`（30 天/每小时，Server 独立维护连接）+ 落后设备 `needsFullSync`/`fullSyncSeq` 全量回退（历史经 `sync_messages` 从 messages 表补齐）。新增回归用例 `pruneSyncEventsPrunesExpiredAndAdvancesWatermark`/`readCursorEventRoundTrips`/`markConversationReadRecomputesUnreadAndOnlyAdvances`，`groupMigration` 版本断言更新至 V8；`ctest` 6/6；CodeReview 无 P0，修复 P1（`fullSyncSeq=0` 用 `qMax(maxSeq, prunedBelow)` 保证游标自愈）与 P2（未读角标改重算避免误清更新未读）。对应第 3 节 `sync_events` 清理与已读多端同步两项 P2 欠账销账；特性栈（置顶/免打扰/编辑/删除）仍按建议单独立项 |

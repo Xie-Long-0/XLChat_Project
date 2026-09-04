@@ -69,6 +69,8 @@ enum class MessageType : quint16
     // M7b - 群聊端到端加密
     FetchGroupKeysRequest = 71,
     FetchGroupKeysResponse = 72,
+    // M9 - 多端同步与离线一致性
+    ReadCursorNotification = 80, // 服务端推送：已读者自身读游标更新（同账号多端已读同步）
 };
 
 enum class ErrorCode : int

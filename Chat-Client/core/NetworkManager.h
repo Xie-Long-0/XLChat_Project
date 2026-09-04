@@ -98,6 +98,8 @@ signals:
     // M5.5
     void messageStatusChanged(qint64 messageId, const QString &status);
     void eventsSynced(const QJsonArray &events, qint64 lastSeq, bool hasMore);
+    // M9: 已读游标前进（多端已读同步）——QML 据此刷新当前会话消息已读态
+    void readCursorAdvanced(qint64 conversationId, qint64 readMessageId);
     // M6: 对方身份公钥指纹变化（TOFU 告警，不阻塞发送）
     void peerIdentityChanged(qint64 peerUserId);
     // M7a: 群组操作结果与推送
@@ -141,6 +143,9 @@ private:
     // M5.5
     void handleMessageStatusUpdate(const XYChat::Protocol::Packet &packet);
     void handleSyncEventsResponse(const XYChat::Protocol::Packet &packet);
+    // M9: 已读游标多端同步
+    void handleReadCursorNotification(const XYChat::Protocol::Packet &packet);
+    void applyReadCursor(qint64 conversationId, qint64 readMessageId);
     // M7a: 群组响应与推送
     void handleCreateGroupResponse(const XYChat::Protocol::Packet &packet);
     void handleInviteGroupMembersResponse(const XYChat::Protocol::Packet &packet);

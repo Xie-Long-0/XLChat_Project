@@ -498,6 +498,56 @@ private slots:
         store.closeAndDestroy();
     }
 
+    // M9: 已读游标应用——未读角标按剩余未读重算（非无条件清零）、状态只前进、排除自己消息
+    void markConversationReadRecomputesUnreadAndOnlyAdvances()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        const qint64 selfId = 1;
+        const qint64 convId = 5;
+
+        QJsonObject conv;
+        conv["conversationId"] = convId;
+        conv["peerUserId"] = 2;
+        conv["peerUsername"] = "bob";
+        conv["lastMessage"] = "m2";
+        conv["lastMessageAt"] = "2026-08-21T00:00:00Z";
+        conv["unreadCount"] = 2;
+        QVERIFY(store.upsertConversation(conv));
+
+        // 对方消息 M1(10)、M2(20)；自己消息 M3(15)
+        QVERIFY(store.upsertMessage(makeMessage(10, convId, "m1", 2, "bob", "delivered")));
+        QVERIFY(store.upsertMessage(makeMessage(15, convId, "mine", selfId, "alice", "sent")));
+        QVERIFY(store.upsertMessage(makeMessage(20, convId, "m2", 2, "bob", "delivered")));
+
+        // 推进到 10：M1 已读，M2(>10) 仍未读，自己的 M3 不受影响
+        QVERIFY(store.markConversationRead(convId, 10, selfId));
+        QCOMPARE(store.loadConversations().at(0).toObject().value("unreadCount").toInt(), 1);
+
+        const QJsonArray msgs = store.loadMessages(convId);
+        QCOMPARE(msgs.size(), 3);
+        for (const QJsonValue &v : msgs) {
+            const QJsonObject m = v.toObject();
+            const qint64 id = m.value("messageId").toVariant().toLongLong();
+            const QString st = m.value("status").toString();
+            if (id == 10) {
+                QCOMPARE(st, QString("read"));
+            } else if (id == 20) {
+                QCOMPARE(st, QString("delivered"));
+            } else if (id == 15) {
+                QCOMPARE(st, QString("sent"));
+            }
+        }
+
+        // 继续推进到 20：M2 也已读，未读清零
+        QVERIFY(store.markConversationRead(convId, 20, selfId));
+        QCOMPARE(store.loadConversations().at(0).toObject().value("unreadCount").toInt(), 0);
+
+        store.closeAndDestroy();
+    }
+
     // 回执状态只前进不回退
     void statusOnlyMovesForward()
     {

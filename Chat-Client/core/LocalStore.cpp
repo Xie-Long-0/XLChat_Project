@@ -644,6 +644,36 @@ bool LocalStore::updateMessageStatus(qint64 messageId, const QString &status)
     return query.exec();
 }
 
+bool LocalStore::markConversationRead(qint64 conversationId, qint64 readMessageId,
+                                      qint64 selfUserId)
+{
+    if (!ensureUsableDb() || conversationId <= 0 || readMessageId <= 0) {
+        return false;
+    }
+    // readMessageId 及之前的对方消息标记已读（状态只前进，不回退已 read 的）
+    QSqlQuery msg(m_db);
+    msg.prepare(
+        "UPDATE messages SET status = 'read', status_rank = 3 "
+        "WHERE conversation_id = ? AND message_id <= ? AND sender_id != ? AND status_rank < 3");
+    msg.addBindValue(conversationId);
+    msg.addBindValue(readMessageId);
+    msg.addBindValue(selfUserId);
+    msg.exec();
+    // 未读角标按“readMessageId 之后仍未读的对方消息数”重算（而非无条件清零），
+    // 避免把比 readMessageId 更新的未读消息角标一并清掉
+    QSqlQuery conv(m_db);
+    conv.prepare(
+        "UPDATE conversations SET unread_count = ("
+        "  SELECT COUNT(*) FROM messages"
+        "  WHERE conversation_id = ? AND sender_id != ? AND message_id > ?)"
+        " WHERE conversation_id = ?");
+    conv.addBindValue(conversationId);
+    conv.addBindValue(selfUserId);
+    conv.addBindValue(readMessageId);
+    conv.addBindValue(conversationId);
+    return conv.exec();
+}
+
 // 会话缓存
 
 bool LocalStore::upsertConversation(const QJsonObject &conv)

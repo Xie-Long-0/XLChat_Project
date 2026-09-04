@@ -76,6 +76,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `70` | `GroupChangedNotification` | 群变更通知（服务端推送，M7a：成员变更/系统消息） |
 | `71` | `FetchGroupKeysRequest` | 群 E2EE 密钥包拉取请求（M7b：一次性返回全群成员密钥包） |
 | `72` | `FetchGroupKeysResponse` | 群 E2EE 密钥包拉取响应（M7b） |
+| `80` | `ReadCursorNotification` | 已读游标推送（服务端推送，M9：已读者自身多端已读同步） |
 
 ### 注册请求
 
@@ -263,7 +264,7 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - 设备信任为 TOFU，无安全码/二维码带外验证；密钥备份与设备间迁移未实现（更换设备/清除应用数据后无法解密历史消息，但同一设备登出重登不受影响）。
 - 预密钥超时回收阈值为 10 分钟；发送方在认领后 10 分钟内仍可正常消费。
 - 客户端解密缓存与本地持久化 outbox 均已实现（M6.5：`LocalStore` 加密落库，重启后自动重发且幂等不重复）。
-- 会话删除/消息撤回尚未实现，`sync_events` 暂无对应事件类型，且无保留清理机制（M9 规划）。
+- 会话删除/消息撤回尚未实现，`sync_events` 暂无对应事件类型（M9 特性栈规划）；`sync_events` 保留清理已于 2026-09-04 落地（30 天保留 + 落后设备全量回退）。
 
 ## M5 新增：传输层加密
 
@@ -307,8 +308,8 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 - `TestPacketCodec::parsesManyConsecutiveSmallPackets` 覆盖连续 1000 个小包解析。
 - `TestPacketCodec::waitsForSplitLargePacket` 覆盖单个大包拆成多次到达后的解析。
 - `TestEncryptionManager` 覆盖 PBKDF2 哈希、验证、token 生成；M6 新增：X25519 密钥对生成/重建、ECDH 双向一致性、HKDF 确定性、AES-GCM 加解密往返、篡改密文/IV/错误密钥必须失败、公钥指纹、envelope 编解码往返与非法输入拒绝、完整发送方/接收方密钥协商流程。
-- `TestDatabaseManager` 覆盖迁移（V1-V7，含 M7a 群组数据层）、用户注册、session 管理（含按 ID 查询 token 哈希）、登录审计、设备管理、联系人、会话、消息；M5.5 新增：会话成员/消息访问授权、`clientMessageId` 幂等去重、回执聚合、读游标单调前进、`sync_events` 游标；M6 新增：身份密钥 upsert、预密钥上传/计数、每设备一次性认领与耗尽、claimed 校验与消费、删除设备清除密钥材料、身份变更废弃旧预密钥；M7a 新增：群组创建/成员管理/角色白名单/按用户去重回执计数等 8 个用例（共 41 个）。
-- `TestLocalStore` 覆盖本地加密缓存：磁盘字节级密文校验、持久化 outbox 幂等、登出语义、群字段与群 outbox、sender-key 持久化（M7b）。
+- `TestDatabaseManager` 覆盖迁移（V1-V8，含 M7a 群组数据层与 M9 `sync_meta`）、用户注册、session 管理（含按 ID 查询 token 哈希）、登录审计、设备管理、联系人、会话、消息；M5.5 新增：会话成员/消息访问授权、`clientMessageId` 幂等去重、回执聚合、读游标单调前进、`sync_events` 游标；M6 新增：身份密钥 upsert、预密钥上传/计数、每设备一次性认领与耗尽、claimed 校验与消费、删除设备清除密钥材料、身份变更废弃旧预密钥；M7a 新增：群组创建/成员管理/角色白名单/按用户去重回执计数等 8 个用例；M9 新增：`sync_events` 保留清理（过期删除 + 水位线前进 + 新事件保留）与 `read_cursor` 事件往返（共 43 个）。
+- `TestLocalStore` 覆盖本地加密缓存：磁盘字节级密文校验、持久化 outbox 幂等、登出语义、群字段与群 outbox、sender-key 持久化（M7b）、`markConversationRead` 未读重算与状态只前进（M9）。
 - `TestGroupE2eeCrypto`（M7b）20 个用例：Sender-Key 原语、chain ratchet、篡改/回滚/错误签名拒绝、DoS 上限（超限 iteration 拒绝）、分发与群消息 envelope 编解码、fail-closed 校验。
 - `TestSecurity` 覆盖日志脱敏、安全内存清零、TLS 证书生成与加载；M5.5 新增：nonce 首次接受/重复拒绝/空值拒绝/TTL 过期。
 - 客户端登录响应按 `requestId` 匹配，不处理不属于当前登录请求的响应。
@@ -393,7 +394,7 @@ M5.5 行为：
 - 先授权再更新：请求者必须是消息所属会话的成员，否则返回 `PermissionDenied (3006)`。
 - `status` 仅接受 `delivered` / `read`。
 - 回执写入 `message_receipts(message_id, user_id, device_id, delivered_at, read_at)`，按接收者/设备维度记录（参考 WhatsApp per-recipient 回执模型）；多设备各自回执互不覆盖。
-- 服务端根据回执聚合更新 `messages.status` 展示值，并向发送方推送 `MessageStatusUpdate`，同时写入发送方 `sync_events`。
+- 服务端根据回执聚合更新 `messages.status` 展示值，并向发送方推送 `MessageStatusUpdate`，同时写入发送方 `sync_events`；M9 起 `status=read` 时额外向已读者自身写入 `read_cursor` 事件并经 `ReadCursorNotification` 推送给其所有在线设备，实现同账号多端已读同步。
 
 M7a 聚合语义：展示状态按**接收用户人数**聚合（接收者 = 会话成员中除发送方外的全体，私聊为 1 人）：全员送达才达 `delivered`，全员已读才达 `read`；同一用户多设备回执按用户去重（`receiptUserCount`），不会提前达成。`MessageStatusUpdate` 与发送方 `receipt` 事件额外携带 `deliveredCount`/`readCount`（群消息送达/已读计数）。
 
@@ -414,11 +415,12 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 // 请求
 { "type": "sync_events", "afterSeq": 0, "limit": 200 }
 // 响应 data
-{ "events": [{ "seq": 1, "type": "message", "payload": { ... }, "createdAt": "..." }], "lastSeq": 1, "hasMore": false }
+{ "events": [{ "seq": 1, "type": "message", "payload": { ... }, "createdAt": "..." }], "lastSeq": 1, "hasMore": false, "needsFullSync": false }
 ```
 
 - 事件流按账号维度严格递增（`seq`），客户端保存 `lastSeq` 游标做增量拉取（参考 Telegram 差分同步模型）。
-- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）。
+- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）、`read_cursor`（M9：已读者自身读游标，payload `{conversationId, readMessageId}`，供其其他设备同步未读角标与消息已读态）。
+- M9 保留清理：服务端按 30 天保留期每小时清理过期 `sync_events`（`sync_meta` 表记录清理水位线 `pruned_below_seq`）；设备游标落后于水位线（`0 < afterSeq < prunedBelowSeq`）时响应 `needsFullSync=true` + `fullSyncSeq`，客户端重置游标并全量重拉会话（`get_conversations`）与消息（`sync_messages` 从 messages 表补齐，不受事件清理影响）。
 - 实时推送（`NewMessageNotification`/`MessageStatusUpdate`）仅作为通知，离线或丢推送时由 `sync_events` 兜底补齐。
 
 ### M6 新增：端到端加密

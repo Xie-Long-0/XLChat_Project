@@ -7,8 +7,10 @@
 #include <QSet>
 
 #include "NonceCache.h"
+#include "database/DatabaseManager.h"
 
 class RequestHandler;
+class QTimer;
 
 class ConnectionServer : public QTcpServer
 {
@@ -69,4 +71,10 @@ private:
     QHash<qint64, RequestHandler *> m_sessionHandlers;
     // handler -> userId (for cleanup)
     QHash<RequestHandler *, qint64> m_handlerUsers;
+
+    // M9: sync_events 保留清理——独立维护连接 + 定时器（全局单例，非 per-connection）
+    DatabaseManager m_maintenanceDb;
+    QTimer *m_pruneTimer = nullptr;
+    static constexpr int SyncEventRetentionDays = 30;       // 事件保留期（天）
+    static constexpr int PruneIntervalMs = 60 * 60 * 1000;  // 清理周期（每小时）
 };

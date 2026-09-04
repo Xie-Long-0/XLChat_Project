@@ -3,6 +3,8 @@
 #include "TlsHelper.h"
 #include "StructuredLogger.h"
 
+#include <QTimer>
+
 using XYChat::Security::StructuredLogger;
 using XYChat::Security::LogLevel;
 
@@ -14,6 +16,7 @@ void ConnectionServer::incomingConnection(qintptr socketDescriptor)
 Server::Server(QObject *parent)
     : QObject(parent)
     , tcpServer(new ConnectionServer(this))
+    , m_maintenanceDb("server_maintenance")
 {
     connect(tcpServer, &ConnectionServer::socketAccepted, this, &Server::onSocketAccepted);
 }
@@ -55,6 +58,18 @@ bool Server::start(quint16 port, bool allowPlaintext)
     }
     if (!m_tlsEnabled && allowPlaintext) {
         qWarning() << "[Server] Starting in PLAINTEXT development mode. Do not use in production.";
+    }
+
+    // M9: 初始化维护连接并启动 sync_events 定时清理（启动即清理一次 + 每小时）
+    if (m_maintenanceDb.initialize()) {
+        m_maintenanceDb.pruneSyncEvents(SyncEventRetentionDays);
+        m_pruneTimer = new QTimer(this);
+        connect(m_pruneTimer, &QTimer::timeout, this, [this]() {
+            m_maintenanceDb.pruneSyncEvents(SyncEventRetentionDays);
+        });
+        m_pruneTimer->start(PruneIntervalMs);
+    } else {
+        qWarning() << "[Server] Maintenance DB init failed; sync_events pruning disabled";
     }
 
     if (tcpServer->listen(QHostAddress::Any, port)) {

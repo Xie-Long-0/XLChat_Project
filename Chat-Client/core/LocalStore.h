@@ -62,6 +62,9 @@ public:
     // 按 messageId 升序返回该会话最近 limit 条消息（字段同服务端响应）
     QJsonArray loadMessages(qint64 conversationId, int limit = 100) const;
     bool updateMessageStatus(qint64 messageId, const QString &status);
+    // M9: 已读游标多端同步——清零该会话未读角标，并把 readMessageId 及之前的
+    // 对方消息（sender_id != selfUserId）标记为已读（status_rank 只前进）
+    bool markConversationRead(qint64 conversationId, qint64 readMessageId, qint64 selfUserId);
 
     // 会话缓存（lastMessage 预览加密存储）
     bool upsertConversation(const QJsonObject &conv);
