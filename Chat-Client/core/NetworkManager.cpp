@@ -478,6 +478,19 @@ void NetworkManager::handlePacket(const Packet &packet)
     case MessageType::GroupChangedNotification:
         handleGroupChangedNotification(packet);
         break;
+    // M9 特性栈：会话偏好与消息编辑/删除
+    case MessageType::SetConversationPrefsResponse:
+        handleSetConversationPrefsResponse(packet);
+        break;
+    case MessageType::ConversationPrefsNotification:
+        handleConversationPrefsNotification(packet);
+        break;
+    case MessageType::EditMessageResponse:
+        handleEditMessageResponse(packet);
+        break;
+    case MessageType::DeleteMessageResponse:
+        handleDeleteMessageResponse(packet);
+        break;
     case MessageType::Ping: {
         Packet pong;
         pong.messageType = MessageType::Pong;
@@ -1148,6 +1161,12 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
     const int code = response.value("code").toInt();
     if (code != static_cast<int>(ErrorCode::Ok)) {
         const QString message = response.value("message").toString("Key bundle unavailable");
+        // M9 特性栈：在途私聊编辑拉取密钥包失败——直接上报编辑失败并清理
+        if (m_pendingEditMessageId != 0 && m_pendingEditPeerUserId == target) {
+            emit messageEditFailed(message);
+            clearPendingEdit();
+            return;
+        }
         if (code == static_cast<int>(ErrorCode::CannotSendToSelf)) {
             // 确定性失败：移除该用户的待发项（含持久化 outbox）并上报
             for (int i = m_outbox.size() - 1; i >= 0; --i) {
@@ -1183,6 +1202,21 @@ void NetworkManager::handleFetchKeysResponse(const Packet &packet)
     if (bundles.isEmpty()) {
         emit messageSendFailed("Empty key bundle");
         flushOutbox();
+        return;
+    }
+
+    // M9 特性栈：在途私聊编辑——优先用本轮密钥包加密编辑正文并提交，
+    // 而非走 outbox 发送链路
+    if (m_pendingEditMessageId != 0 && m_pendingEditPeerUserId == target
+        && !m_pendingEditContent.isEmpty()) {
+        const QString envelope = encryptForUser(target, bundles, m_pendingEditContent);
+        if (envelope.isEmpty()) {
+            emit messageEditFailed("Failed to encrypt edited message");
+            clearPendingEdit();
+            return;
+        }
+        sendEditMessageRequest(m_pendingEditMessageId, m_pendingEditConversationId,
+                               envelope, "text");
         return;
     }
 
@@ -2469,6 +2503,36 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
                     healConvs.insert(convId);
                 }
             }
+        } else if (type == "conversation_prefs") {
+            // M9 特性栈：离线期间的会话偏好变更补偿（本人其他设备设置）
+            applyConversationPrefs(payload.value("conversationId").toVariant().toLongLong(),
+                                   payload.value("pinned").toBool(),
+                                   payload.value("muted").toBool());
+        } else if (type == "message_edited") {
+            // M9 特性栈：离线期间的消息编辑补偿——先失效旧解密缓存再解密新正文，
+            // 更新本地缓存并通知 UI
+            const qint64 msgId = payload.value("messageId").toVariant().toLongLong();
+            const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
+            const QString editedAt = payload.value("editedAt").toString();
+            m_decryptCache.remove(msgId);
+            if (m_localStore.isOpen()) {
+                m_localStore.clearDecryptedContent(msgId);
+            }
+            QJsonObject msgObj = payload;
+            decryptMessageObject(msgObj);
+            const QString plaintext = msgObj.value("content").toString();
+            if (m_localStore.isOpen()) {
+                m_localStore.updateMessageContent(msgId, plaintext, editedAt);
+            }
+            emit messageEdited(convId, msgId, plaintext, editedAt);
+        } else if (type == "message_deleted") {
+            // M9 特性栈：离线期间的消息删除补偿
+            const qint64 msgId = payload.value("messageId").toVariant().toLongLong();
+            const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
+            if (m_localStore.isOpen()) {
+                m_localStore.markMessageDeleted(msgId);
+            }
+            emit messageDeleted(convId, msgId);
         }
         // contact_added 等事件忽略：联系人列表按需从服务端拉取
     }
@@ -2735,6 +2799,246 @@ void NetworkManager::handleGroupChangedNotification(const Packet &packet)
     }
 
     emit groupChanged(payload);
+}
+
+// ── M9 特性栈：会话偏好（置顶/免打扰） ──
+void NetworkManager::setConversationPrefs(qint64 conversationId, bool pinned, bool muted)
+{
+    if (m_state != ConnectionState::Authenticated || conversationId <= 0) {
+        return;
+    }
+
+    QJsonObject json;
+    json["type"] = "set_conversation_prefs";
+    json["conversationId"] = conversationId;
+    json["pinned"] = pinned;
+    json["muted"] = muted;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::SetConversationPrefsRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingSetPrefsRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::handleSetConversationPrefsResponse(const Packet &packet)
+{
+    if (packet.requestId != m_pendingSetPrefsRequestId) return;
+    m_pendingSetPrefsRequestId = 0;
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    if (response.value("code").toInt() != static_cast<int>(ErrorCode::Ok)) {
+        qWarning() << "[NetMgr] set_conversation_prefs failed:"
+                   << response.value("message").toString();
+        return;
+    }
+
+    const QJsonObject data = response.value("data").toObject();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    const bool pinned = data.value("pinned").toBool();
+    const bool muted = data.value("muted").toBool();
+    applyConversationPrefs(conversationId, pinned, muted);
+}
+
+// 实时推送：本人其他设备设置了偏好（多端同步）
+void NetworkManager::handleConversationPrefsNotification(const Packet &packet)
+{
+    const QJsonObject payload = QJsonDocument::fromJson(packet.payload).object();
+    const qint64 conversationId = payload.value("conversationId").toVariant().toLongLong();
+    const bool pinned = payload.value("pinned").toBool();
+    const bool muted = payload.value("muted").toBool();
+    applyConversationPrefs(conversationId, pinned, muted);
+}
+
+// 本地缓存更新 + 通知 UI（响应与推送、sync_events 事件共用）
+void NetworkManager::applyConversationPrefs(qint64 conversationId, bool pinned, bool muted)
+{
+    if (conversationId <= 0) {
+        return;
+    }
+    if (m_localStore.isOpen()) {
+        m_localStore.setConversationPrefs(conversationId, pinned, muted);
+        emit conversationsResult(m_localStore.loadConversations());
+    }
+    emit conversationPrefsChanged(conversationId, pinned, muted);
+}
+
+// ── M9 特性栈：消息编辑/删除 ──
+void NetworkManager::editMessage(qint64 conversationId, qint64 peerUserId,
+                                 qint64 messageId, const QString &newContent)
+{
+    if (m_state != ConnectionState::Authenticated || messageId <= 0) {
+        return;
+    }
+    const QString trimmed = newContent.trimmed();
+    if (trimmed.isEmpty()) {
+        emit messageEditFailed("Edited content is empty");
+        return;
+    }
+
+    // 记录在途编辑上下文（响应匹配与本地乐观更新用）
+    m_pendingEditMessageId = messageId;
+    m_pendingEditConversationId = conversationId;
+    m_pendingEditPeerUserId = peerUserId;
+    m_pendingEditContent = newContent;
+
+    if (conversationId > 0 && peerUserId == 0) {
+        // 群聊：同步用 Sender-Key 重新加密后直接提交
+        const QString envelope = encryptGroupMessage(conversationId, newContent);
+        if (envelope.isEmpty()) {
+            emit messageEditFailed("Failed to encrypt edited group message");
+            clearPendingEdit();
+            return;
+        }
+        sendEditMessageRequest(messageId, conversationId, envelope, "e2ee_group");
+    } else if (peerUserId > 0) {
+        // 私聊：拉取对方密钥包后加密（响应回调中提交）
+        sendFetchKeysRequest(peerUserId);
+    } else {
+        emit messageEditFailed("Invalid conversation for edit");
+        clearPendingEdit();
+    }
+}
+
+void NetworkManager::sendEditMessageRequest(qint64 messageId, qint64 conversationId,
+                                            const QString &content, const QString &contentType)
+{
+    QJsonObject json;
+    json["type"] = "edit_message";
+    json["messageId"] = messageId;
+    json["content"] = content;
+    json["contentType"] = contentType;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::EditMessageRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingEditMessageRequestId = packet.requestId;
+    sendPacket(packet);
+    Q_UNUSED(conversationId);
+}
+
+void NetworkManager::deleteMessage(qint64 messageId)
+{
+    if (m_state != ConnectionState::Authenticated || messageId <= 0) {
+        return;
+    }
+
+    QJsonObject json;
+    json["type"] = "delete_message";
+    json["messageId"] = messageId;
+    addReplayProtection(json);
+
+    Packet packet;
+    packet.messageType = MessageType::DeleteMessageRequest;
+    packet.requestId = nextRequestId();
+    packet.payload = QJsonDocument(json).toJson(QJsonDocument::Compact);
+    m_pendingDeleteMessageRequestId = packet.requestId;
+    sendPacket(packet);
+}
+
+void NetworkManager::handleEditMessageResponse(const Packet &packet)
+{
+    // 两种形态：① 本端编辑请求的响应（requestId 匹配）；② 会话其他成员编辑的实时推送（requestId=0）
+    if (packet.requestId != 0 && packet.requestId != m_pendingEditMessageRequestId) {
+        return;
+    }
+    const bool isOwnResponse = (packet.requestId != 0);
+    if (isOwnResponse) {
+        m_pendingEditMessageRequestId = 0;
+    }
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
+
+    if (isOwnResponse && code != static_cast<int>(ErrorCode::Ok)) {
+        emit messageEditFailed(response.value("message").toString("Failed to edit message"));
+        clearPendingEdit();
+        return;
+    }
+
+    // 响应 data 与推送 payload 字段一致（messageId/conversationId/content/contentType/editedAt）
+    const QJsonObject data = isOwnResponse ? response.value("data").toObject() : response;
+    const qint64 messageId = data.value("messageId").toVariant().toLongLong();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+    const QString editedAt = data.value("editedAt").toString();
+
+    if (isOwnResponse) {
+        // 本端编辑成功：用本地新明文更新缓存（服务端只回传重新加密的密文，
+        // 本地需以明文落库供展示；群聊密文需解密，此处直接以乐观明文回填）。
+        // 先失效旧解密缓存，避免后续同步/重载命中编辑前明文
+        const QString plaintext = m_pendingEditContent;
+        m_decryptCache.remove(messageId);
+        if (m_localStore.isOpen()) {
+            m_localStore.clearDecryptedContent(messageId);
+            if (!plaintext.isEmpty()) {
+                m_localStore.updateMessageContent(messageId, plaintext, editedAt);
+                m_localStore.saveDecryptedContent(messageId, plaintext);
+            }
+        }
+        clearPendingEdit();
+        emit messageEdited(conversationId, messageId, plaintext, editedAt);
+        return;
+    }
+
+    // 其他成员编辑推送：先失效旧解密缓存（防止命中编辑前明文），再解密新 content
+    m_decryptCache.remove(messageId);
+    if (m_localStore.isOpen()) {
+        m_localStore.clearDecryptedContent(messageId);
+    }
+    QJsonObject msgObj = data;
+    msgObj["senderId"] = 0; // 不关键；仅需 content 可解密
+    decryptMessageObject(msgObj);
+    const QString plaintext = msgObj.value("content").toString();
+    if (m_localStore.isOpen()) {
+        if (msgObj.value("undecryptable").toBool()) {
+            // 无法解密（缺密钥）时仅标记编辑状态，正文保留占位
+            m_localStore.updateMessageContent(messageId, QString(), editedAt);
+        } else {
+            m_localStore.updateMessageContent(messageId, plaintext, editedAt);
+        }
+    }
+    emit messageEdited(conversationId, messageId, plaintext, editedAt);
+}
+
+void NetworkManager::handleDeleteMessageResponse(const Packet &packet)
+{
+    // 同编辑：requestId 匹配为本端响应，requestId=0 为其他成员删除推送
+    if (packet.requestId != 0 && packet.requestId != m_pendingDeleteMessageRequestId) {
+        return;
+    }
+    const bool isOwnResponse = (packet.requestId != 0);
+    if (isOwnResponse) {
+        m_pendingDeleteMessageRequestId = 0;
+    }
+
+    const QJsonObject response = QJsonDocument::fromJson(packet.payload).object();
+    const int code = response.value("code").toInt(static_cast<int>(ErrorCode::Ok));
+
+    if (isOwnResponse && code != static_cast<int>(ErrorCode::Ok)) {
+        emit messageDeleteFailed(response.value("message").toString("Failed to delete message"));
+        return;
+    }
+
+    const QJsonObject data = isOwnResponse ? response.value("data").toObject() : response;
+    const qint64 messageId = data.value("messageId").toVariant().toLongLong();
+    const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+
+    if (m_localStore.isOpen()) {
+        m_localStore.markMessageDeleted(messageId);
+    }
+    emit messageDeleted(conversationId, messageId);
+}
+
+void NetworkManager::clearPendingEdit()
+{
+    m_pendingEditMessageId = 0;
+    m_pendingEditConversationId = 0;
+    m_pendingEditPeerUserId = 0;
+    m_pendingEditContent.clear();
 }
 
 // M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）

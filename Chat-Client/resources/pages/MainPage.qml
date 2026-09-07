@@ -23,6 +23,10 @@ Rectangle {
     signal kickGroupMemberRequested(int conversationId, int userId)
     signal getGroupInfoRequested(int conversationId)
     signal sendGroupMessageRequested(int conversationId, string content)
+    // M9 特性栈：会话偏好与消息编辑/删除
+    signal setConversationPrefsRequested(int conversationId, bool pinned, bool muted)
+    signal editMessageRequested(int conversationId, int peerUserId, int messageId, string content)
+    signal deleteMessageRequested(int messageId)
 
     property int myUserId: 0
     property string myUsername: ""
@@ -83,6 +87,11 @@ Rectangle {
                 onCreateGroupClicked: {
                     loadContactsRequested()
                     createGroupDialog.open()
+                }
+
+                // M9 特性栈：会话偏好（置顶/免打扰）
+                onConversationPrefsRequested: function(conversationId, pinned, muted) {
+                    mainPage.setConversationPrefsRequested(conversationId, pinned, muted)
                 }
             }
 
@@ -208,6 +217,15 @@ Rectangle {
                 if (mainPage.currentConversationId > 0) {
                     mainPage.getGroupInfoRequested(mainPage.currentConversationId)
                 }
+            }
+
+            // M9 特性栈：消息右键菜单（编辑/删除）
+            onEditRequested: function(messageId, content) {
+                editDialog.openFor(messageId, content)
+            }
+            onDeleteRequested: function(messageId) {
+                confirmDeleteDialog.messageId = messageId
+                confirmDeleteDialog.open()
             }
         }
     }
@@ -923,6 +941,201 @@ Rectangle {
         }
     }
 
+    // M9 特性栈：编辑消息对话框（预填原文，保存后提交重新加密）
+    Dialog {
+        id: editDialog
+        title: "编辑消息"
+        modal: true
+        anchors.centerIn: parent
+        width: 400
+        padding: Theme.spacingLarge
+
+        property int messageId: 0
+
+        background: Rectangle {
+            radius: Theme.radiusLarge
+            color: Theme.windowBackground
+            border.width: 1
+            border.color: Theme.borderColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.spacingMedium
+
+            TextField {
+                id: editField
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.inputHeight
+                placeholderText: "输入新内容..."
+                font.pixelSize: Theme.fontSizeMedium
+                color: Theme.textPrimary
+                placeholderTextColor: Theme.inputPlaceholderColor
+                selectByMouse: true
+                background: Rectangle {
+                    radius: Theme.radiusSmall
+                    color: Theme.inputBackground
+                    border.width: editField.activeFocus ? 2 : 1
+                    border.color: editField.activeFocus ? Theme.inputFocusBorderColor : Theme.inputBorderColor
+                }
+            }
+
+            Label {
+                id: editStatus
+                text: ""
+                font.pixelSize: Theme.fontSizeSmall
+                color: Theme.textSecondary
+                visible: text !== ""
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    text: "取消"
+                    flat: true
+                    font.pixelSize: Theme.fontSizeMedium
+                    contentItem: Label {
+                        text: parent.text
+                        font: parent.font
+                        color: Theme.textSecondary
+                    }
+                    background: null
+                    onClicked: editDialog.close()
+                }
+
+                Button {
+                    id: editConfirmBtn
+                    text: "保存"
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.DemiBold
+                    background: Rectangle {
+                        radius: Theme.radiusSmall
+                        color: editConfirmBtn.pressed ? Theme.loginButtonPressed
+                             : (editConfirmBtn.hovered ? Theme.loginButtonHover : Theme.primaryColor)
+                    }
+                    contentItem: Label {
+                        text: parent.text
+                        font: parent.font
+                        color: Theme.textOnPrimary
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                    onClicked: editDialog.doEdit()
+                }
+            }
+        }
+
+        function openFor(messageId, content) {
+            editDialog.messageId = messageId
+            editField.text = content
+            editStatus.text = ""
+            open()
+        }
+
+        function doEdit() {
+            var text = editField.text.trim()
+            if (text.length === 0) {
+                editStatus.text = "内容不能为空"
+                return
+            }
+            if (editDialog.messageId <= 0) {
+                editStatus.text = "消息 ID 无效"
+                return
+            }
+            // 私聊 peerUserId 为当前会话对方；群聊为 0（走 Sender-Key 重加密）
+            var peer = mainPage.currentConversationType === "group"
+                ? 0 : mainPage.currentPeerUserId
+            mainPage.editMessageRequested(mainPage.currentConversationId, peer,
+                                          editDialog.messageId, text)
+            close()
+        }
+
+        onClosed: {
+            editField.text = ""
+            editDialog.messageId = 0
+            editStatus.text = ""
+        }
+    }
+
+    // M9 特性栈：删除确认对话框
+    Dialog {
+        id: confirmDeleteDialog
+        title: "删除消息"
+        modal: true
+        anchors.centerIn: parent
+        width: 320
+        padding: Theme.spacingLarge
+
+        property int messageId: 0
+
+        background: Rectangle {
+            radius: Theme.radiusLarge
+            color: Theme.windowBackground
+            border.width: 1
+            border.color: Theme.borderColor
+        }
+
+        contentItem: ColumnLayout {
+            spacing: Theme.spacingLarge
+
+            Label {
+                Layout.fillWidth: true
+                text: "删除后所有会话成员都将看到“消息已删除”，此操作不可撤销。是否继续？"
+                font.pixelSize: Theme.fontSizeMedium
+                color: Theme.textPrimary
+                wrapMode: Text.Wrap
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: Theme.spacingSmall
+
+                Item { Layout.fillWidth: true }
+
+                Button {
+                    text: "取消"
+                    flat: true
+                    font.pixelSize: Theme.fontSizeMedium
+                    contentItem: Label {
+                        text: parent.text
+                        font: parent.font
+                        color: Theme.textSecondary
+                    }
+                    background: null
+                    onClicked: confirmDeleteDialog.close()
+                }
+
+                Button {
+                    id: deleteConfirmBtn
+                    text: "删除"
+                    font.pixelSize: Theme.fontSizeMedium
+                    font.weight: Font.DemiBold
+                    background: Rectangle {
+                        radius: Theme.radiusSmall
+                        color: deleteConfirmBtn.pressed ? Theme.loginErrorColor
+                             : (deleteConfirmBtn.hovered ? Theme.unreadBadgeMutedColor : Theme.unreadBadgeColor)
+                    }
+                    contentItem: Label {
+                        text: parent.text
+                        font: parent.font
+                        color: Theme.textOnPrimary
+                        horizontalAlignment: Text.AlignHCenter
+                    }
+                    onClicked: {
+                        mainPage.deleteMessageRequested(confirmDeleteDialog.messageId)
+                        confirmDeleteDialog.close()
+                    }
+                }
+            }
+        }
+
+        onClosed: {
+            confirmDeleteDialog.messageId = 0
+        }
+    }
+
     // ── 会话操作 ──
     // 打开一个既有会话
     function openConversation(conv) {
@@ -1116,5 +1329,26 @@ Rectangle {
             convList.selectedIndex = -1
         }
         loadConversationsRequested()
+    }
+
+    // M9 特性栈：会话偏好推送回填（服务端 conversation_prefs 通知）
+    function applyConversationPrefs(conversationId, pinned, muted) {
+        convList.applyPrefs(conversationId, pinned, muted)
+    }
+
+    // M9 特性栈：消息编辑结果回填（本端响应或其他成员推送）
+    function applyMessageEdited(conversationId, messageId, content, editedAt) {
+        // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+        if (conversationId == currentConversationId) {
+            chatView.updateMessageContent(messageId, content)
+        }
+    }
+
+    // M9 特性栈：消息删除结果回填（本端响应或其他成员推送）
+    function applyMessageDeleted(conversationId, messageId) {
+        // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
+        if (conversationId == currentConversationId) {
+            chatView.markMessageDeleted(messageId)
+        }
     }
 }

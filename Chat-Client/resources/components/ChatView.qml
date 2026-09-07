@@ -20,6 +20,9 @@ Rectangle {
     signal sendMessage(string content)
     signal backClicked()
     signal groupInfoRequested()
+    // M9 特性栈：消息右键菜单操作（转发到 MainPage）
+    signal editRequested(int messageId, string content)
+    signal deleteRequested(int messageId)
 
     // 顶部标题栏
     Rectangle {
@@ -262,6 +265,12 @@ Rectangle {
                 time: model.displayTime
                 status: model.status || ""
                 undecryptable: model.undecryptable === true
+                // M9 特性栈：编辑/删除状态与右键菜单
+                messageId: model.messageId
+                edited: model.edited === true
+                deleted: model.deleted === true
+                onEditRequested: chatView.editRequested(model.messageId, model.content)
+                onDeleteRequested: chatView.deleteRequested(model.messageId)
             }
         }
 
@@ -446,7 +455,10 @@ Rectangle {
             status: msg.status || "",
             isMine: (msg.senderId == chatView.myUserId),
             // M6: 无法解密的端到端加密消息显示占位样式
-            undecryptable: msg.undecryptable === true
+            undecryptable: msg.undecryptable === true,
+            // M9 特性栈：编辑/删除状态
+            edited: msg.edited === true,
+            deleted: msg.deleted === true
         }
     }
 
@@ -509,6 +521,31 @@ Rectangle {
             // 使用 == 兼容 C++ qint64 经 JSON 传递到 QML 后可能为 string/number 的情况
             if (!item.isDivider && item.messageId == messageId) {
                 msgModel.setProperty(i, "status", status)
+                return
+            }
+        }
+    }
+
+    // M9 特性栈：编辑消息后更新气泡内容并标记“已编辑”
+    function updateMessageContent(messageId, content) {
+        for (var i = 0; i < msgModel.count; i++) {
+            var item = msgModel.get(i)
+            if (!item.isDivider && item.messageId == messageId) {
+                msgModel.setProperty(i, "content", content)
+                msgModel.setProperty(i, "undecryptable", false)
+                msgModel.setProperty(i, "edited", true)
+                return
+            }
+        }
+    }
+
+    // M9 特性栈：删除消息后本地置灰占位
+    function markMessageDeleted(messageId) {
+        for (var i = 0; i < msgModel.count; i++) {
+            var item = msgModel.get(i)
+            if (!item.isDivider && item.messageId == messageId) {
+                msgModel.setProperty(i, "content", "")
+                msgModel.setProperty(i, "deleted", true)
                 return
             }
         }

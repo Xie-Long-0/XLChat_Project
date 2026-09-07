@@ -325,6 +325,20 @@ void RequestHandler::processPacket(const Packet &packet)
         processFetchGroupKeysRequest(packet, json);
         return;
     }
+    // M9 特性栈：会话置顶/免打扰与消息编辑/删除
+    if (packet.messageType == MessageType::SetConversationPrefsRequest
+        || type == "set_conversation_prefs") {
+        processSetConversationPrefsRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::EditMessageRequest || type == "edit_message") {
+        processEditMessageRequest(packet, json);
+        return;
+    }
+    if (packet.messageType == MessageType::DeleteMessageRequest || type == "delete_message") {
+        processDeleteMessageRequest(packet, json);
+        return;
+    }
 
     sendResponse(packet.requestId, MessageType::Error, ErrorCode::InvalidRequest,
                  QString("Unknown request type: %1").arg(type));
@@ -724,6 +738,9 @@ void RequestHandler::processGetConversationsRequest(const Packet &packet)
         obj["lastMessageId"] = c.lastMessageId;
         obj["lastMessageAt"] = c.lastMessageAt;
         obj["unreadCount"] = c.unreadCount;
+        // M9 特性栈：会话偏好（置顶/免打扰）
+        obj["pinned"] = c.pinned;
+        obj["muted"] = c.muted;
         // M7a: 群会话额外携带群名与成员数
         if (c.type == "group") {
             obj["name"] = c.name;
@@ -1058,6 +1075,12 @@ void RequestHandler::processSyncMessagesRequest(const Packet &packet, const QJso
         obj["contentType"] = m.contentType;
         obj["status"] = m.status;
         obj["createdAt"] = m.createdAt;
+        // M9 特性栈：编辑/删除标记（离线重登经 sync_messages 重建编辑/删除状态）
+        obj["deleted"] = m.deleted;
+        if (!m.editedAt.isEmpty()) {
+            obj["edited"] = true;
+            obj["editedAt"] = m.editedAt;
+        }
         msgArray.append(obj);
     }
 
@@ -1922,6 +1945,245 @@ void RequestHandler::processSendGroupMessage(const Packet &packet, const QJsonOb
     data["status"] = "sent";
     sendResponse(packet.requestId, MessageType::SendMessageResponse, ErrorCode::Ok,
                  "Message sent", data);
+}
+
+// M9 特性栈：设置会话偏好（置顶/免打扰）。
+// 仅会话成员可设置；偏好为本人维度（多端共享同一偏好），写入成员行后
+// 向本人所有在线设备实时推送 ConversationPrefsNotification 并写 sync_events 兜底。
+void RequestHandler::processSetConversationPrefsRequest(const Packet &packet,
+                                                        const QJsonObject &request)
+{
+    const qint64 conversationId = request.value("conversationId").toVariant().toLongLong();
+    if (conversationId <= 0) {
+        sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse,
+                     ErrorCode::InvalidRequest, "Invalid conversationId");
+        return;
+    }
+
+    // pinned/muted 接受布尔或 0/1，其余取值视为非法
+    const QJsonValue pinnedVal = request.value("pinned");
+    const QJsonValue mutedVal = request.value("muted");
+    const bool hasPinned = pinnedVal.isBool() || pinnedVal.isDouble();
+    const bool hasMuted = mutedVal.isBool() || mutedVal.isDouble();
+    if (!hasPinned || !hasMuted) {
+        sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse,
+                     ErrorCode::InvalidRequest, "pinned and muted must be boolean");
+        return;
+    }
+    const bool pinned = pinnedVal.toBool();
+    const bool muted = mutedVal.toBool();
+
+    // 先授权：仅会话成员可设置偏好
+    if (!m_db->isConversationMember(conversationId, m_authenticatedUserId)) {
+        sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse,
+                     ErrorCode::PermissionDenied, "Not a member of this conversation");
+        return;
+    }
+
+    if (!m_db->setConversationPrefs(conversationId, m_authenticatedUserId, pinned, muted)) {
+        sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse,
+                     ErrorCode::InternalError, "Failed to update conversation preferences");
+        return;
+    }
+
+    // 多端同步：向本人所有设备推送偏好变更，并写 sync_events 兜底离线设备
+    QJsonObject payload;
+    payload["conversationId"] = conversationId;
+    payload["pinned"] = pinned;
+    payload["muted"] = muted;
+    const QByteArray payloadJson = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+
+    m_db->appendSyncEvent(m_authenticatedUserId, "conversation_prefs",
+                          QString::fromUtf8(payloadJson));
+
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::ConversationPrefsNotification;
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = payloadJson;
+    emit messageForUser(m_authenticatedUserId, PacketCodec::encode(notifyPacket));
+
+    sendResponse(packet.requestId, MessageType::SetConversationPrefsResponse, ErrorCode::Ok,
+                 "OK", payload);
+}
+
+// M9 特性栈：编辑消息（仅发送者可编辑；正文为重新加密后的 E2EE envelope/群密文）。
+// 编辑后向会话全体成员推送 message_edited 事件（sync_events + 实时推送）。
+void RequestHandler::processEditMessageRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 messageId = request.value("messageId").toVariant().toLongLong();
+    const QString content = request.value("content").toString();
+    const QString contentType = request.value("contentType").toString();
+
+    if (messageId <= 0) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::InvalidRequest, "Invalid messageId");
+        return;
+    }
+    if (content.isEmpty() || contentType.isEmpty()) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::InvalidRequest, "content and contentType are required");
+        return;
+    }
+
+    auto msgOpt = m_db->getMessage(messageId);
+    if (!msgOpt.has_value()) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::MessageNotFound, "Message not found");
+        return;
+    }
+
+    // 仅发送者可编辑自己的消息
+    if (msgOpt->senderId != m_authenticatedUserId) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::PermissionDenied, "Only the sender can edit this message");
+        return;
+    }
+    // 已删除消息不可编辑
+    if (msgOpt->deleted) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::MessageNotFound, "Message has been deleted");
+        return;
+    }
+
+    // 正文长度与类型合法性：类型必须与消息所属会话形态一致（系统消息不可编辑）
+    if (msgOpt->contentType == "system") {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::PermissionDenied, "System messages cannot be edited");
+        return;
+    }
+    if (content.size() > MaxGroupMessageLength) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::InvalidRequest, "Message content too long");
+        return;
+    }
+
+    // 编辑正文的 contentType 必须保持原形态（私聊 text/envelope，群 e2ee_group），
+    // 拒绝借编辑切换形态注入非法内容
+    if (contentType != msgOpt->contentType) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::InvalidRequest, "contentType must match the original message");
+        return;
+    }
+
+    // fail-closed 校验：编辑后的正文仍必须是合法密文（服务端只见密文），
+    // 与 send_message 的 envelope 强校验保持一致
+    if (contentType == "e2ee_group") {
+        GroupE2eeCrypto::EncryptedMessage probe;
+        QString senderDeviceId;
+        if (!GroupE2eeCrypto::decodeGroupMessage(content, probe, &senderDeviceId)
+            || senderDeviceId != m_currentDeviceId) {
+            StructuredLogger::event(LogLevel::Warning, "envelope.rejected")
+                .requestId(packet.requestId).userId(m_authenticatedUserId)
+                .field("reason", "invalid_group_e2ee_edit")
+                .field("messageId", messageId).write();
+            sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                         ErrorCode::E2eeInvalidEnvelope,
+                         "Edited group e2ee content is not a valid envelope");
+            return;
+        }
+    } else if (contentType == "text") {
+        // 私聊正文为 pairwise E2EE envelope；存量明文形态亦允许（fail-closed 只针对
+        // 明显非法的结构，与 send_message 的 decodeEnvelope 强校验一致）
+        bool envelopeOk = false;
+        XYChat::Security::E2eeCrypto::decodeEnvelope(content, &envelopeOk);
+        if (!envelopeOk) {
+            sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                         ErrorCode::E2eeInvalidEnvelope,
+                         "Edited content must be a valid E2EE envelope");
+            return;
+        }
+    }
+
+    if (!m_db->editMessage(messageId, content, contentType)) {
+        sendResponse(packet.requestId, MessageType::EditMessageResponse,
+                     ErrorCode::InternalError, "Failed to edit message");
+        return;
+    }
+
+    const QString editedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    // 向会话全体成员推送编辑事件（sync_events 兜底 + 实时推送）
+    QJsonObject ev;
+    ev["messageId"] = messageId;
+    ev["conversationId"] = msgOpt->conversationId;
+    ev["content"] = content;
+    ev["contentType"] = contentType;
+    ev["editedAt"] = editedAt;
+    const QByteArray evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
+
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::EditMessageResponse; // 复用：接收方按 messageType 识别编辑事件
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = evJson;
+    const QByteArray encoded = PacketCodec::encode(notifyPacket);
+
+    for (qint64 memberId : m_db->getConversationMemberIds(msgOpt->conversationId)) {
+        m_db->appendSyncEvent(memberId, "message_edited", QString::fromUtf8(evJson));
+        if (memberId != m_authenticatedUserId) {
+            emit messageForUser(memberId, encoded);
+        }
+    }
+
+    sendResponse(packet.requestId, MessageType::EditMessageResponse, ErrorCode::Ok,
+                 "OK", ev);
+}
+
+// M9 特性栈：删除消息（仅发送者可删；软删除留墓碑）。删除后向会话全体成员
+// 推送 message_deleted 事件（sync_events + 实时推送）。
+void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJsonObject &request)
+{
+    const qint64 messageId = request.value("messageId").toVariant().toLongLong();
+    if (messageId <= 0) {
+        sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
+                     ErrorCode::InvalidRequest, "Invalid messageId");
+        return;
+    }
+
+    auto msgOpt = m_db->getMessage(messageId);
+    if (!msgOpt.has_value()) {
+        sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
+                     ErrorCode::MessageNotFound, "Message not found");
+        return;
+    }
+
+    // 仅发送者可删除自己的消息（系统消息不可删）
+    if (msgOpt->senderId != m_authenticatedUserId) {
+        sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
+                     ErrorCode::PermissionDenied, "Only the sender can delete this message");
+        return;
+    }
+    if (msgOpt->contentType == "system") {
+        sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
+                     ErrorCode::PermissionDenied, "System messages cannot be deleted");
+        return;
+    }
+
+    // 幂等：已删除消息重复删除仍返回成功（软删除语义）
+    m_db->deleteMessage(messageId);
+
+    const QString deletedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+
+    QJsonObject ev;
+    ev["messageId"] = messageId;
+    ev["conversationId"] = msgOpt->conversationId;
+    ev["deletedAt"] = deletedAt;
+    const QByteArray evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
+
+    Packet notifyPacket;
+    notifyPacket.messageType = MessageType::DeleteMessageResponse; // 复用：接收方按 messageType 识别删除事件
+    notifyPacket.requestId = 0;
+    notifyPacket.payload = evJson;
+    const QByteArray encoded = PacketCodec::encode(notifyPacket);
+
+    for (qint64 memberId : m_db->getConversationMemberIds(msgOpt->conversationId)) {
+        m_db->appendSyncEvent(memberId, "message_deleted", QString::fromUtf8(evJson));
+        if (memberId != m_authenticatedUserId) {
+            emit messageForUser(memberId, encoded);
+        }
+    }
+
+    sendResponse(packet.requestId, MessageType::DeleteMessageResponse, ErrorCode::Ok,
+                 "OK", ev);
 }
 
 // Session 验证（P1 安全加固 2026-09-02）

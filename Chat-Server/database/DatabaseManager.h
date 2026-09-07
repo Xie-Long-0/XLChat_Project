@@ -56,6 +56,9 @@ struct ConversationInfo
     // M7a: 群聊会话信息（private 会话 name 为空、memberCount 为 0）
     QString name;
     int memberCount = 0;
+    // M9 特性栈：会话偏好（按成员×会话维度，服务端权威；客户端缓存）
+    bool pinned = false;
+    bool muted = false;
 };
 
 struct MessageInfo
@@ -69,6 +72,9 @@ struct MessageInfo
     QString status;      // "sending", "sent", "delivered", "read", "failed"
     QString createdAt;
     QString clientMessageId; // M5.5: 客户端幂等键
+    // M9 特性栈：消息编辑/删除（软删除留墓碑，正文清空）
+    QString editedAt;   // 非空表示已编辑（编辑时间）
+    bool deleted = false;
 };
 
 // M5.5: 账号级同步事件
@@ -177,6 +183,9 @@ public:
     bool updateMessageStatus(qint64 messageId, const QString &status);
     bool updateMessagesReadStatus(qint64 conversationId, qint64 readerId);
     int getUnreadCount(qint64 conversationId, qint64 userId);
+    // M9 特性栈：消息编辑（覆盖正文并标记编辑时间；仅发送者调用，调用方已授权）与删除（软删除留墓碑）
+    bool editMessage(qint64 messageId, const QString &content, const QString &contentType);
+    bool deleteMessage(qint64 messageId);
 
     // M5.5: 消息回执（per-recipient，替代全局状态聚合）
     bool recordMessageReceipt(qint64 messageId, qint64 userId,
@@ -226,8 +235,17 @@ public:
     bool setGroupName(qint64 conversationId, const QString &name);
     // M7a: 群成员 ID 列表（按入群顺序，供消息 fan-out 与群变更通知）
     QList<qint64> getGroupMemberIds(qint64 conversationId);
+    // M9 特性栈：会话成员 ID 列表（私聊/群聊通用，供编辑/删除 fan-out）
+    QList<qint64> getConversationMemberIds(qint64 conversationId);
     // M7a: 会话成员数（排除指定用户，供回执聚合计算接收者总数）
     int memberCountExcluding(qint64 conversationId, qint64 excludeUserId);
+
+    // M9 特性栈：会话偏好（置顶/免打扰，按成员×会话维度）
+    bool setConversationPrefs(qint64 conversationId, qint64 userId,
+                              bool pinned, bool muted);
+    // 读取成员会话偏好（非成员返回默认 false/false）
+    std::optional<std::pair<bool, bool>> getConversationPrefs(qint64 conversationId,
+                                                              qint64 userId);
 
     // M7a: 群组规模约束（供数据层与业务层统一引用）
     static constexpr int MaxGroupMembers = 200;  // 单群成员上限
@@ -250,6 +268,7 @@ private:
     bool migrateToV6();
     bool migrateToV7();
     bool migrateToV8();
+    bool migrateToV9();
 
     // M7a: 插入单个会话成员（供 createGroup/addGroupMembers 复用）
     bool insertMember(qint64 conversationId, qint64 userId, const QString &role);

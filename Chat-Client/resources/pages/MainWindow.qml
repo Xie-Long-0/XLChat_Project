@@ -119,6 +119,19 @@ Window {
                     mainPage.trackOutgoingMessage(clientMessageId, content)
                 }
             }
+
+            // M9 特性栈：会话偏好与消息编辑/删除
+            onSetConversationPrefsRequested: function(conversationId, pinned, muted) {
+                networkManager.setConversationPrefs(conversationId, pinned, muted)
+            }
+
+            onEditMessageRequested: function(conversationId, peerUserId, messageId, content) {
+                networkManager.editMessage(conversationId, peerUserId, messageId, content)
+            }
+
+            onDeleteMessageRequested: function(messageId) {
+                networkManager.deleteMessage(messageId)
+            }
         }
     }
 
@@ -224,6 +237,29 @@ Window {
                 && target === mainWindow.myUserId) {
                 mainPage.closeGroupIfCurrent(payload.conversationId || 0)
             }
+        }
+
+        // M9 特性栈：会话偏好推送（本人其他设备设置后同步）
+        function onConversationPrefsChanged(conversationId, pinned, muted) {
+            mainPage.applyConversationPrefs(conversationId, pinned, muted)
+        }
+
+        // M9 特性栈：消息编辑结果（本端响应或其他成员推送）
+        function onMessageEdited(conversationId, messageId, content, editedAt) {
+            mainPage.applyMessageEdited(conversationId, messageId, content, editedAt)
+        }
+
+        // M9 特性栈：消息删除结果（本端响应或其他成员推送）
+        function onMessageDeleted(conversationId, messageId) {
+            mainPage.applyMessageDeleted(conversationId, messageId)
+        }
+
+        function onMessageEditFailed(error) {
+            console.log("Edit message failed:", error)
+        }
+
+        function onMessageDeleteFailed(error) {
+            console.log("Delete message failed:", error)
         }
     }
 

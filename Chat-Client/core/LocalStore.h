@@ -62,6 +62,11 @@ public:
     // 按 messageId 升序返回该会话最近 limit 条消息（字段同服务端响应）
     QJsonArray loadMessages(qint64 conversationId, int limit = 100) const;
     bool updateMessageStatus(qint64 messageId, const QString &status);
+    // M9 特性栈：消息编辑（覆盖正文并标记编辑）与删除（软删除清空正文）。
+    // editedAt 非空时写入服务端编辑时间（本端编辑用当前时间，同步回填用服务端时间）
+    bool updateMessageContent(qint64 messageId, const QString &plaintext,
+                              const QString &editedAt);
+    bool markMessageDeleted(qint64 messageId);
     // M9: 已读游标多端同步——清零该会话未读角标，并把 readMessageId 及之前的
     // 对方消息（sender_id != selfUserId）标记为已读（status_rank 只前进）
     bool markConversationRead(qint64 conversationId, qint64 readMessageId, qint64 selfUserId);
@@ -72,10 +77,14 @@ public:
     // 仅更新已存在的会话行（避免事件流缺字段时产生幻影会话）
     bool bumpConversationPreview(qint64 conversationId, const QString &preview,
                                  bool incrementUnread);
+    // M9 特性栈：更新会话偏好（置顶/免打扰），仅更新已存在会话行（服务端权威）
+    bool setConversationPrefs(qint64 conversationId, bool pinned, bool muted);
 
     // 解密缓存（messageId -> 明文，归口替代 M6 KeyStorage .cache）
     QString loadDecryptedContent(qint64 messageId) const;
     bool saveDecryptedContent(qint64 messageId, const QString &plaintext);
+    // M9 特性栈：清除某消息的解密缓存（编辑后新密文解密前需先失效旧明文缓存）
+    bool clearDecryptedContent(qint64 messageId);
     // 一次性导入并删除 M6 遗留的 KeyStorage 解密缓存文件，返回导入条数
     int importLegacyDecryptCache(const QString &username, const QString &deviceId);
 

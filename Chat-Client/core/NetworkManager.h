@@ -68,6 +68,14 @@ public:
     // M7a: 发送群消息（明文，返回幂等键供乐观消息跟踪）
     Q_INVOKABLE QString sendGroupMessage(qint64 conversationId, const QString &content);
 
+    // M9 特性栈：会话偏好（置顶/免打扰）与消息编辑/删除
+    Q_INVOKABLE void setConversationPrefs(qint64 conversationId, bool pinned, bool muted);
+    // 编辑消息：私聊（peerUserId>0）走 pairwise E2EE 重新加密，群聊（peerUserId=0）
+    // 走 Sender-Key 重新加密
+    Q_INVOKABLE void editMessage(qint64 conversationId, qint64 peerUserId,
+                                 qint64 messageId, const QString &newContent);
+    Q_INVOKABLE void deleteMessage(qint64 messageId);
+
     // 状态查询
     ConnectionState state() const { return m_state; }
     QString sessionToken() const { return m_sessionToken; }
@@ -112,6 +120,13 @@ signals:
     void groupInfoResult(const QJsonObject &info);
     void groupRequestFailed(const QString &error);
     void groupChanged(const QJsonObject &payload);
+    // M9 特性栈：会话偏好与消息编辑/删除
+    void conversationPrefsChanged(qint64 conversationId, bool pinned, bool muted);
+    void messageEdited(qint64 conversationId, qint64 messageId,
+                       const QString &content, const QString &editedAt);
+    void messageDeleted(qint64 conversationId, qint64 messageId);
+    void messageEditFailed(const QString &error);
+    void messageDeleteFailed(const QString &error);
 
 private slots:
     void onConnected();
@@ -159,6 +174,16 @@ private:
     void handleKickGroupMemberResponse(const XYChat::Protocol::Packet &packet);
     void handleGetGroupInfoResponse(const XYChat::Protocol::Packet &packet);
     void handleGroupChangedNotification(const XYChat::Protocol::Packet &packet);
+    // M9 特性栈：会话偏好与消息编辑/删除
+    void handleSetConversationPrefsResponse(const XYChat::Protocol::Packet &packet);
+    void handleConversationPrefsNotification(const XYChat::Protocol::Packet &packet);
+    void handleEditMessageResponse(const XYChat::Protocol::Packet &packet);
+    void handleDeleteMessageResponse(const XYChat::Protocol::Packet &packet);
+    // M9 特性栈：会话偏好本地应用（响应/推送/事件共用）
+    void applyConversationPrefs(qint64 conversationId, bool pinned, bool muted);
+    void sendEditMessageRequest(qint64 messageId, qint64 conversationId,
+                                const QString &content, const QString &contentType);
+    void clearPendingEdit();
     // M7a: 群系统消息摘要（contentType=system 的结构化正文转可读文本）
     static QString systemMessageSummary(const QString &content);
     void sendPacket(const XYChat::Protocol::Packet &packet);
@@ -260,6 +285,15 @@ private:
     QSet<QString> m_pendingGroupDistributions; // clientMessageId 集合：等待 ACK 的分发消息
     QHash<qint64, XYChat::Security::GroupE2eeCrypto::SenderKey> m_groupSenderKeys; // 内存缓存
     QSet<qint64> m_healQueue; // P1-3: 待轮换重分发的群（单发槽位占用时排队）
+
+    // M9 特性栈：会话偏好与消息编辑/删除
+    quint64 m_pendingSetPrefsRequestId = 0;
+    quint64 m_pendingEditMessageRequestId = 0;
+    qint64 m_pendingEditMessageId = 0;      // 在途编辑目标消息（响应匹配与本地更新用）
+    qint64 m_pendingEditConversationId = 0;
+    qint64 m_pendingEditPeerUserId = 0;     // 私聊编辑的目标用户（群聊为 0）
+    QString m_pendingEditContent;           // 待编辑的新明文（加密前的）
+    quint64 m_pendingDeleteMessageRequestId = 0;
 
     // M5.5: 发送幂等与离线 outbox
     struct OutboxItem

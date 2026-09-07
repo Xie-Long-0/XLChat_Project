@@ -15,6 +15,14 @@ Item {
     property string status: ""
     // M6: 端到端加密消息无法解密（无对应预密钥/新设备无历史密钥）
     property bool undecryptable: false
+    // M9 特性栈：消息编辑/删除状态（仅自己消息可编辑/删除）
+    property int messageId: 0
+    property bool edited: false
+    property bool deleted: false
+
+    // M9 特性栈：右键菜单操作（由 ChatView 转发到 MainPage）
+    signal editRequested()
+    signal deleteRequested()
 
     // 气泡内容区可用宽度上限
     readonly property int maxContentWidth: Theme.messageMaxWidth - Theme.spacingMedium * 2
@@ -61,11 +69,13 @@ Item {
                 Label {
                     id: contentLabel
                     width: Math.min(implicitWidth, messageBubble.maxContentWidth)
-                    text: undecryptable ? "⚠ 无法解密此消息" : content
+                    text: deleted ? "此消息已删除"
+                                  : (undecryptable ? "⚠ 无法解密此消息" : content)
                     wrapMode: Text.Wrap
                     font.pixelSize: Theme.fontSizeMedium
-                    font.italic: undecryptable
-                    color: undecryptable ? Theme.textTertiary : Theme.textPrimary
+                    font.italic: undecryptable || deleted
+                    color: deleted ? Theme.textTertiary
+                                   : (undecryptable ? Theme.textTertiary : Theme.textPrimary)
                     textFormat: Text.PlainText
                 }
 
@@ -82,9 +92,18 @@ Item {
                         color: Theme.textTertiary
                     }
 
+                    // M9: “已编辑”标记（删除后不展示）
+                    Label {
+                        visible: edited && !deleted
+                        text: "已编辑"
+                        font.pixelSize: Theme.fontSizeSmall - 1
+                        font.italic: true
+                        color: Theme.textTertiary
+                    }
+
                     // 消息状态图标（仅自己的消息）
                     Label {
-                        visible: isMine && status !== ""
+                        visible: isMine && status !== "" && !deleted
                         text: {
                             switch (status) {
                                 case "sending": return "⏳"
@@ -98,6 +117,29 @@ Item {
                         font.pixelSize: Theme.fontSizeSmall - 1
                         color: status === "read" ? Theme.primaryColor : Theme.textTertiary
                     }
+                }
+            }
+
+            // M9: 右键菜单（仅自己的、未删除的消息可编辑/删除）
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton && isMine && !deleted) {
+                        contextMenu.popup()
+                    }
+                }
+            }
+
+            Menu {
+                id: contextMenu
+                MenuItem {
+                    text: "编辑"
+                    onTriggered: messageBubble.editRequested()
+                }
+                MenuItem {
+                    text: "删除"
+                    onTriggered: messageBubble.deleteRequested()
                 }
             }
         }

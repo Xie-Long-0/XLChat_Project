@@ -13,6 +13,8 @@ Rectangle {
     signal refreshClicked()
     // M7a: 打开建群对话框
     signal createGroupClicked()
+    // M9 特性栈：右键菜单设置会话偏好（置顶/免打扰）
+    signal conversationPrefsRequested(int conversationId, bool pinned, bool muted)
 
     // M4.5: 当前选中会话索引（修复原先错误的判断条件）
     property int selectedIndex: -1
@@ -187,7 +189,29 @@ Rectangle {
                 anchors.fill: parent
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: conversationList.conversationClicked(index)
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton) {
+                        convContextMenu.popup()
+                    } else {
+                        conversationList.conversationClicked(index)
+                    }
+                }
+            }
+
+            // M9 特性栈：会话右键菜单（置顶/免打扰）
+            Menu {
+                id: convContextMenu
+                MenuItem {
+                    text: model.pinned === true ? "取消置顶" : "置顶会话"
+                    onTriggered: conversationList.conversationPrefsRequested(
+                        model.conversationId, model.pinned !== true, model.muted === true)
+                }
+                MenuItem {
+                    text: model.muted === true ? "取消免打扰" : "开启免打扰"
+                    onTriggered: conversationList.conversationPrefsRequested(
+                        model.conversationId, model.pinned === true, model.muted !== true)
+                }
             }
 
             // 底部分隔线
@@ -260,12 +284,32 @@ Rectangle {
                                  : Theme.textTertiary
                         }
 
+                        // M9 特性栈：免打扰标识
+                        Label {
+                            visible: model.muted === true
+                            text: "🔕"
+                            font.pixelSize: Theme.fontSizeSmall - 1
+                            color: delegateItem.isSelected
+                                 ? Theme.selectedConversationSecondaryColor
+                                 : Theme.textTertiary
+                        }
+
                         Label {
                             text: model.lastMessageTime || ""
                             font.pixelSize: Theme.fontSizeSmall - 1
                             color: delegateItem.isSelected
                                  ? Theme.selectedConversationSecondaryColor
                                  : (model.unreadCount > 0 ? Theme.primaryColor : Theme.textTertiary)
+                        }
+
+                        // M9 特性栈：置顶标识
+                        Label {
+                            visible: model.pinned === true
+                            text: "📌"
+                            font.pixelSize: Theme.fontSizeSmall - 1
+                            color: delegateItem.isSelected
+                                 ? Theme.selectedConversationSecondaryColor
+                                 : Theme.primaryColor
                         }
                     }
 
@@ -372,7 +416,10 @@ Rectangle {
                                               : (conv.peerUsername || ""),
                 lastMessage: conv.lastMessage || "",
                 lastMessageTime: formatConvTime(conv.lastMessageAt || ""),
-                unreadCount: conv.unreadCount || 0
+                unreadCount: conv.unreadCount || 0,
+                // M9 特性栈：会话偏好（置顶/免打扰）
+                pinned: conv.pinned === true,
+                muted: conv.muted === true
             }
             var pos = findIndexByConversationId(convId)
             if (pos >= 0) {
@@ -451,5 +498,43 @@ Rectangle {
     function reset() {
         convModel.clear()
         selectedIndex = -1
+    }
+
+    // M9 特性栈：本地应用会话偏好（服务端推送 conversation_prefs 后回填），
+    // 置顶变更时按 pinned DESC 稳定重排（置顶在前，保持各自相对顺序）
+    function applyPrefs(conversationId, pinned, muted) {
+        var idx = findIndexByConversationId(conversationId)
+        if (idx < 0) {
+            return
+        }
+        convModel.setProperty(idx, "pinned", pinned === true)
+        convModel.setProperty(idx, "muted", muted === true)
+        reorderByPinned()
+    }
+
+    // 稳定分区：置顶会话在前、未置顶在后，各自保持原有相对顺序（单步 move 升序移动）
+    function reorderByPinned() {
+        var order = []
+        // 先收集置顶
+        for (var i = 0; i < convModel.count; i++) {
+            if (convModel.get(i).pinned === true) {
+                order.push(normalizeConversationId(convModel.get(i).conversationId))
+            }
+        }
+        // 再收集未置顶
+        for (var j = 0; j < convModel.count; j++) {
+            if (convModel.get(j).pinned !== true) {
+                order.push(normalizeConversationId(convModel.get(j).conversationId))
+            }
+        }
+        for (var k = 0; k < order.length; k++) {
+            var cur = normalizeConversationId(convModel.get(k).conversationId)
+            if (cur !== order[k]) {
+                var target = findIndexByConversationId(order[k])
+                if (target > k) {
+                    convModel.move(target, k, 1)
+                }
+            }
+        }
     }
 }

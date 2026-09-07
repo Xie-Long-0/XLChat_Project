@@ -71,6 +71,15 @@ enum class MessageType : quint16
     FetchGroupKeysResponse = 72,
     // M9 - 多端同步与离线一致性
     ReadCursorNotification = 80, // 服务端推送：已读者自身读游标更新（同账号多端已读同步）
+    // M9 特性栈：会话置顶/免打扰
+    SetConversationPrefsRequest = 81,
+    SetConversationPrefsResponse = 82,
+    ConversationPrefsNotification = 83, // 服务端推送：本人会话偏好变更（多端同步）
+    // M9 特性栈：消息编辑/删除
+    EditMessageRequest = 84,
+    EditMessageResponse = 85,
+    DeleteMessageRequest = 86,
+    DeleteMessageResponse = 87,
 };
 
 enum class ErrorCode : int

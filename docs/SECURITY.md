@@ -1,6 +1,6 @@
 # XYChat 安全文档
 
-## 当前安全状态（M7b 完成后，2026-09-02 对齐）
+## 当前安全状态（M9 特性栈完成后，2026-09-05 对齐）
 
 ### 端到端加密（M6）
 
@@ -41,6 +41,14 @@
 - **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。
 - **成员变更 healing（2026-09-02 P1 修复）**：`member_added/removed/left` 群变更通知（及离线期间的 `sync_events` 补偿）触发本端 sender key 轮换（`generateSenderKey` 生成新 `keyId`）并向现任成员重分发；新成员因此获得当前密钥、被移除成员因密钥轮换失去后续消息的解密能力（后向安全）。轮换去重（同群在途/已排队不重复触发）、单发槽位队列化、瞬时失败（限流/超时）延迟重试；退群时清除本端该群 sender key（内存 wipe + `removeSenderKeysForGroup`）。
 - **遗留限制**：大群（成员设备数约 >60）单条 `sender_key_distribution` 可能超 16384 字符上限致分发失败；轮换采用“先落盘后分发”，分发永久失败时存在群解密不可用窗口；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。上述均登记为 ROADMAP 欠账（P2/P3）。
+
+### 消息编辑与删除安全（M9）
+
+- **仅发送者可操作**：编辑/删除均校验 `messages.sender_id == 当前用户`，否则 `PermissionDenied`；系统消息（`contentType=system`）不可编辑/删除；已删除消息不可再编辑。
+- **编辑 fail-closed 密文校验**：编辑正文必须与原消息 `contentType` 一致（私聊 `text`、群 `e2ee_group`），拒绝借编辑切换形态注入非法内容；`e2ee_group` 须通过 `GroupE2eeCrypto::decodeGroupMessage` 且 `senderDeviceId` 为当前设备、`text` 须通过 `E2eeCrypto::decodeEnvelope`——服务端只见密文，明文注入一律 `E2eeInvalidEnvelope`，与 `send_message` 的 envelope 强校验保持一致。
+- **软删除留墓碑**：删除后 `messages.deleted=1` 且正文清空，messageId/发送者/时间保留供客户端渲染“已删除”占位；删除幂等（重复删除返回成功）。不物理删除消息行，审计可追溯。
+- **解密缓存一致性（客户端）**：编辑/删除事件与响应处理时，先失效该 messageId 的旧解密缓存（内存 `m_decryptCache` + LocalStore `clearDecryptedContent`）再解密新密文或标记删除，避免编辑后仍显示编辑前明文；本端编辑以乐观明文落库并覆盖解密缓存。
+- **多端与离线一致性**：`conversation_prefs`/`message_edited`/`message_deleted` 事件经 `sync_events` 与实时推送双通道投递，离线设备上线经 `ingestSyncEvents` 补偿；编辑正文仍为密文传输，服务端不接触明文。
 
 ### 会话与认证加固（2026-09-02）
 
@@ -106,7 +114,7 @@
 
 ### 数据库安全
 
-- 数据库使用版本化迁移机制（`schema_version` 表，当前 V7），禁止隐式 schema 变更；V7（M7a）仅新增 `conversations.name` 与 `conversation_members.role` 两列，存量数据不受影响。
+- 数据库使用版本化迁移机制（`schema_version` 表，当前 V9），禁止隐式 schema 变更；V7（M7a）仅新增 `conversations.name` 与 `conversation_members.role` 两列，V9（M9 特性栈）新增 `conversation_members.pinned/muted` 与 `messages.edited_at/deleted`，存量数据不受影响。
 - 每个线程使用独立数据库连接名，避免多线程竞争；写并发启用 5 秒 busy timeout。
 - 表结构：`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`、`conversation_members`、`messages`、`message_receipts`、`sync_events`；M6 新增 `device_identity_keys`（仅存身份公钥）、`prekeys`（仅存预密钥公钥，服务端不接触任何私钥）。
 - Session 表存储 token 哈希而非明文。

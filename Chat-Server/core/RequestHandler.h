@@ -86,6 +86,10 @@ private:
     void processGetGroupInfoRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
     // M7b: 拉取群内所有成员的 E2EE 密钥包（供 Sender Key 分发）
     void processFetchGroupKeysRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    // M9 特性栈：会话置顶/免打扰与消息编辑/删除
+    void processSetConversationPrefsRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processEditMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
+    void processDeleteMessageRequest(const XYChat::Protocol::Packet &packet, const QJsonObject &request);
 
     // M7a: 群消息发送（明文入库 + fan-out，与私聊 E2EE 路径分流）
     void processSendGroupMessage(const XYChat::Protocol::Packet &packet, const QJsonObject &request,

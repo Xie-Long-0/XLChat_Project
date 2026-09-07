@@ -277,7 +277,9 @@ bool LocalStore::ensureSchema()
                        "status_rank INTEGER NOT NULL DEFAULT 0,"
                        "undecryptable INTEGER NOT NULL DEFAULT 0,"
                        "client_message_id TEXT NOT NULL DEFAULT '',"
-                       "created_at TEXT NOT NULL DEFAULT '')",
+                       "created_at TEXT NOT NULL DEFAULT '',"
+                       "edited_at TEXT NOT NULL DEFAULT '',"
+                       "deleted INTEGER NOT NULL DEFAULT 0)",
         "CREATE INDEX IF NOT EXISTS idx_messages_conv "
                        "ON messages(conversation_id, message_id)",
         "CREATE TABLE IF NOT EXISTS conversations ("
@@ -290,7 +292,9 @@ bool LocalStore::ensureSchema()
                        "last_message_at TEXT NOT NULL DEFAULT '',"
                        "unread_count INTEGER NOT NULL DEFAULT 0,"
                        "name TEXT NOT NULL DEFAULT '',"
-                       "member_count INTEGER NOT NULL DEFAULT 0)",
+                       "member_count INTEGER NOT NULL DEFAULT 0,"
+                       "pinned INTEGER NOT NULL DEFAULT 0,"
+                       "muted INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS outbox ("
                        "client_message_id TEXT PRIMARY KEY,"
                        "to_user_id INTEGER NOT NULL,"
@@ -339,6 +343,19 @@ bool LocalStore::ensureSchema()
         qWarning() << "[LocalStore] Add conversations.member_count failed:" << query.lastError().text();
         return false;
     }
+    // M9 特性栈：会话偏好列（置顶/免打扰）
+    if (!hasColumn("conversations", "pinned")
+        && !query.exec("ALTER TABLE conversations "
+                       "ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add conversations.pinned failed:" << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("conversations", "muted")
+        && !query.exec("ALTER TABLE conversations "
+                       "ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add conversations.muted failed:" << query.lastError().text();
+        return false;
+    }
     if (!hasColumn("outbox", "conversation_id")
         && !query.exec("ALTER TABLE outbox "
                        "ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 0")) {
@@ -350,6 +367,19 @@ bool LocalStore::ensureSchema()
                        "ADD COLUMN private_signing_key_enc TEXT NOT NULL DEFAULT ''")) {
         qWarning() << "[LocalStore] Add sender_keys.private_signing_key_enc failed:"
                    << query.lastError().text();
+        return false;
+    }
+    // M9 特性栈：消息编辑/删除列
+    if (!hasColumn("messages", "edited_at")
+        && !query.exec("ALTER TABLE messages "
+                       "ADD COLUMN edited_at TEXT NOT NULL DEFAULT ''")) {
+        qWarning() << "[LocalStore] Add messages.edited_at failed:" << query.lastError().text();
+        return false;
+    }
+    if (!hasColumn("messages", "deleted")
+        && !query.exec("ALTER TABLE messages "
+                       "ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")) {
+        qWarning() << "[LocalStore] Add messages.deleted failed:" << query.lastError().text();
         return false;
     }
 
@@ -594,7 +624,7 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
     QSqlQuery query(m_db);
     query.prepare(
         "SELECT message_id, conversation_id, sender_id, sender_username, content_enc,"
-        " content_type, status, created_at"
+        " content_type, status, created_at, edited_at, deleted"
         " FROM messages WHERE conversation_id = ? ORDER BY message_id DESC LIMIT ?");
     query.addBindValue(conversationId);
     query.addBindValue(limit);
@@ -610,10 +640,14 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
         msg["conversationId"] = query.value(1).toLongLong();
         msg["senderId"] = query.value(2).toLongLong();
         msg["senderUsername"] = query.value(3).toString();
+        const bool deleted = query.value(9).toInt() != 0;
         // 密文解密失败（密钥不匹配/条目缺失）时标记 undecryptable，
         // 与实时接收路径的消息形状保持一致
         const QString content = decryptText(query.value(4).toString());
-        if (!content.isEmpty()) {
+        if (deleted) {
+            msg["content"] = QString();
+            msg["deleted"] = true;
+        } else if (!content.isEmpty()) {
             msg["content"] = content;
         } else {
             msg["content"] = QString();
@@ -622,6 +656,11 @@ QJsonArray LocalStore::loadMessages(qint64 conversationId, int limit) const
         msg["contentType"] = query.value(5).toString();
         msg["status"] = query.value(6).toString();
         msg["createdAt"] = query.value(7).toString();
+        const QString editedAt = query.value(8).toString();
+        if (!editedAt.isEmpty()) {
+            msg["edited"] = true;
+            msg["editedAt"] = editedAt;
+        }
         rows.append(msg);
     }
     for (int i = rows.size() - 1; i >= 0; --i) {
@@ -640,6 +679,43 @@ bool LocalStore::updateMessageStatus(qint64 messageId, const QString &status)
         "UPDATE messages SET status = ?, status_rank = ? WHERE message_id = ?");
     query.addBindValue(status);
     query.addBindValue(statusRank(status));
+    query.addBindValue(messageId);
+    return query.exec();
+}
+
+// M9 特性栈：编辑消息——覆盖本地缓存的明文正文（加密落库）并标记编辑时间。
+// editedAt 非空时写入编辑时间（本端编辑传当前时间，同步回填传服务端时间）
+bool LocalStore::updateMessageContent(qint64 messageId, const QString &plaintext,
+                                      const QString &editedAt)
+{
+    if (!ensureUsableDb() || messageId <= 0) {
+        return false;
+    }
+    const QString enc = plaintext.isEmpty() ? QString() : encryptText(plaintext);
+    if (enc.isEmpty() && !plaintext.isEmpty()) {
+        qWarning() << "[LocalStore] Refusing to cache edited message without encryption";
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "UPDATE messages SET content_enc = ?, undecryptable = 0,"
+        "  edited_at = ? WHERE message_id = ?");
+    query.addBindValue(enc.isEmpty() ? QString("") : enc);
+    query.addBindValue(editedAt);
+    query.addBindValue(messageId);
+    return query.exec();
+}
+
+// M9 特性栈：删除消息——本地软删除（清空正文、置 deleted=1）
+bool LocalStore::markMessageDeleted(qint64 messageId)
+{
+    if (!ensureUsableDb() || messageId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "UPDATE messages SET content_enc = '', undecryptable = 0,"
+        "  deleted = 1 WHERE message_id = ?");
     query.addBindValue(messageId);
     return query.exec();
 }
@@ -700,8 +776,8 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
     query.prepare(
         "INSERT INTO conversations(conversation_id, type, peer_user_id, peer_username,"
         " last_message_enc, last_message_id, last_message_at, unread_count,"
-        " name, member_count)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " name, member_count, pinned, muted)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT(conversation_id) DO UPDATE SET"
         " type = excluded.type,"
         " peer_user_id = excluded.peer_user_id,"
@@ -711,7 +787,9 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
         " last_message_at = excluded.last_message_at,"
         " unread_count = excluded.unread_count,"
         " name = excluded.name,"
-        " member_count = excluded.member_count");
+        " member_count = excluded.member_count,"
+        " pinned = excluded.pinned,"
+        " muted = excluded.muted");
     query.addBindValue(conversationId);
     query.addBindValue(text(conv, "type", "private"));
     query.addBindValue(conv.value("peerUserId").toVariant().toLongLong());
@@ -723,6 +801,9 @@ bool LocalStore::upsertConversation(const QJsonObject &conv)
     // M7a: 群会话字段（private 会话为空/0）
     query.addBindValue(text(conv, "name"));
     query.addBindValue(conv.value("memberCount").toInt());
+    // M9 特性栈：会话偏好（服务端权威；缺省 false）
+    query.addBindValue(conv.value("pinned").toBool() ? 1 : 0);
+    query.addBindValue(conv.value("muted").toBool() ? 1 : 0);
     if (!query.exec()) {
         qWarning() << "[LocalStore] upsertConversation failed:" << query.lastError().text();
         return false;
@@ -739,8 +820,8 @@ QJsonArray LocalStore::loadConversations() const
     QSqlQuery query(m_db);
     query.prepare(
         "SELECT conversation_id, type, peer_user_id, peer_username, last_message_enc,"
-        " last_message_id, last_message_at, unread_count, name, member_count"
-        " FROM conversations ORDER BY last_message_at DESC, conversation_id DESC");
+        " last_message_id, last_message_at, unread_count, name, member_count, pinned, muted"
+        " FROM conversations ORDER BY pinned DESC, last_message_at DESC, conversation_id DESC");
     if (!query.exec()) {
         return result;
     }
@@ -756,9 +837,26 @@ QJsonArray LocalStore::loadConversations() const
         conv["unreadCount"] = query.value(7).toInt();
         conv["name"] = query.value(8).toString();
         conv["memberCount"] = query.value(9).toInt();
+        conv["pinned"] = query.value(10).toInt() != 0;
+        conv["muted"] = query.value(11).toInt() != 0;
         result.append(conv);
     }
     return result;
+}
+
+// M9 特性栈：更新会话偏好（置顶/免打扰），仅更新已存在会话行（服务端权威）
+bool LocalStore::setConversationPrefs(qint64 conversationId, bool pinned, bool muted)
+{
+    if (!ensureUsableDb() || conversationId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "UPDATE conversations SET pinned = ?, muted = ? WHERE conversation_id = ?");
+    query.addBindValue(pinned ? 1 : 0);
+    query.addBindValue(muted ? 1 : 0);
+    query.addBindValue(conversationId);
+    return query.exec();
 }
 
 bool LocalStore::bumpConversationPreview(qint64 conversationId, const QString &preview,
@@ -815,6 +913,18 @@ bool LocalStore::saveDecryptedContent(qint64 messageId, const QString &plaintext
         "INSERT OR REPLACE INTO decrypt_cache(message_id, content_enc) VALUES (?, ?)");
     query.addBindValue(messageId);
     query.addBindValue(enc);
+    return query.exec();
+}
+
+// M9 特性栈：清除某消息的解密缓存（编辑后新密文解密前需先失效旧明文缓存）
+bool LocalStore::clearDecryptedContent(qint64 messageId)
+{
+    if (!ensureUsableDb() || messageId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("DELETE FROM decrypt_cache WHERE message_id = ?");
+    query.addBindValue(messageId);
     return query.exec();
 }
 

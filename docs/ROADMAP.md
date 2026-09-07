@@ -30,7 +30,7 @@
 | M7a | 明文群聊 | 已完成 | 2026-08-21 | 群管理五接口（建群/邀请/退群自动转让/踢人层级保护/群信息）、群消息 fan-out + sync_events 兜底、系统消息与群变更通知、按人数回执聚合、客户端群聊 UI（2026-08-22 热修复联调崩溃：QML 会话列表差分更新、移除 add 动画、LocalStore 连接自愈） |
 | M7b | 群聊端到端加密（Sender Keys） | 已完成 | 2026-09-02 | 每发送方每群独立 chain key + Ed25519 签名，HKDF ratchet 派生消息密钥，AES-256-GCM 加密；sender-key 经 M6 pairwise E2EE 分发；`fetch_group_keys`（类型 71/72）；服务端群 envelope fail-closed 校验；DoS 上限防护（`MaxRatchetSteps=2000`/`MaxMessageIteration=1e8`）；双客户端联调通过 |
 | M8 | 媒体、文件与对象存储 | 未开始 | — | 见第 4.1 节 |
-| M9 | 多端同步与离线一致性 | 核心一致性已完成 | 2026-09-04 | 已读状态多端同步（`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算）+ `sync_events` 保留清理（30 天/每小时，落后设备 `needsFullSync` 全量回退）；特性栈（置顶/免打扰/编辑/删除）按建议单独立项，见第 4.2 节 |
+| M9 | 多端同步与离线一致性 | 核心一致性 + 特性栈已完成 | 2026-09-05 | 已读状态多端同步（`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算）+ `sync_events` 保留清理（30 天/每小时，落后设备 `needsFullSync` 全量回退）（2026-09-04）；特性栈（2026-09-05）：会话置顶/免打扰 + 消息编辑/删除（软删除留墓碑），协议类型 81-87 + V9 迁移 + `conversation_prefs`/`message_edited`/`message_deleted` 三类 sync_events 事件 |
 | M10 | 搜索、通知与体验完善 | 未开始 | — | 见第 4.3 节 |
 | M11 | 稳定性、可观测性与运维 | 未开始 | — | 登录限流已在 M2 落地，密钥拉取连接级限流已在 M6/M7b 落地；**M11 前置两项（发消息/搜索限流 + 结构化日志）已于 2026-09-03 提前落地**，其余见第 4.4 节 |
 
@@ -42,7 +42,7 @@
 | 一对一聊天 | E2EE（envelope 密文，服务端 fail-closed）、`clientMessageId` 幂等、乐观发送 UI、per-recipient 回执（delivered/read）、消息状态实时推送、离线 outbox（加密持久化，跨重启重发） |
 | 群聊 | 建群/邀请/退群（群主自动转让）/踢人（角色层级保护）/群信息；群 E2EE（Sender Keys，服务端只见密文）；**成员变更 Sender-Key healing**（2026-09-02 P1 修复：`member_added/removed/left` 触发本端轮换+重分发，新成员获密钥、被移除成员失后续解密能力，离线经 `sync_events` 补偿）；系统消息（成员变更胶囊渲染）；小群直推 fan-out + sync_events 兜底；按接收用户人数聚合的送达/已读计数。**未实现**：大群拉取模式、改群名接口（数据层已就绪） |
 | 本地存储 | `LocalStore`（SQLite，按账号+设备隔离）：消息/会话预览/outbox/解密缓存 AES-256-GCM 加密落库，存储密钥 DPAPI 保护；M7b 起含 `sender_keys` 表；登出清用户可见数据、保留密钥材料 |
-| 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）。**未实现**：已读状态向已读者自身其他设备同步、服务端事件保留清理、编辑/删除/置顶/静音 |
+| 多端同步 | 账号级 `sync_events` 事件流（message/receipt/contact_added/group_changed/conversation_prefs/message_edited/message_deleted/read_cursor）+ 设备本地游标，登录后缓存先行 + 增量拉取（hasMore 自动续拉）；已读状态、会话偏好、消息编辑/删除均多端一致（实时推送 + sync_events 兜底）。**未实现**：会话整表删除（无对应接口/事件） |
 | 传输安全 | TLS 1.2+ fail-closed（服务端无证书拒启、客户端无 CA 拒连，开发明文需显式开关）；重放保护（timestamp ±300s + nonce 全局 TTL 600s 去重）；日志脱敏（LogSanitizer）；结构化日志（StructuredLogger 单行 JSON，M11 前置）；发消息/搜索/密钥拉取连接级限流（RateWindow，M11 前置） |
 | 客户端 UI | QML/Qt Quick + QWindowKit 无边框双窗口（登录/主窗口独立）；Telegram 风格主题（亮/暗切换持久化）；群聊三对话框（建群/群信息/邀请）；群 E2EE 状态横幅 |
 
@@ -117,7 +117,6 @@
 | P2 | 安全 | nonce 去重为单服务器内存态 | M5.5 | 服务端重启清空；多服务器部署需持久化/共享存储 |
 | P2 | 安全 | TOFU 无带外验证；无密钥备份/设备间迁移 | M6 | 首次通信无法抵抗服务端中间人；更换设备/清数据后历史消息不可恢复（产品已决策接受） |
 | P2 | 安全 | 非 Windows 平台私钥/存储密钥明文回退 | M6/M6.5 | DPAPI 仅 Windows；Linux/macOS 部署需接平台密钥环（libsecret/Keychain） |
-| P3 | 功能 | 消息编辑/删除/撤回、会话置顶/免打扰 | M9 规划 | 全新特性栈（协议 + 迁移 + 服务端 + 客户端 + UI），需单独立项 |
 | P3 | 功能 | 大群拉取/游标模式；改群名接口 | M7a 遗留 | 当前仅小群直推；`setGroupName` 数据层就绪、接口层未开放 |
 | P3 | 功能 | 桌面通知；简化图片消息 | M6.5 提前项（未实施） | 分别归属 M10/M8 完整实现 |
 | P3 | 工程 | `GroupE2eeCrypto.cpp` 使用 `QStringLiteral`，违反项目代码风格约定 | 2026-09-02 文档重构盘点 | 风格不一致（项目约定禁用该宏）；随下次触碰该文件的代码任务顺手修正 |
@@ -151,12 +150,12 @@
 - **剩余任务**：
   - ✅ **已读状态多端同步（2026-09-04 完成）**：`ack_message(read)` 时服务端除更新读游标外，向已读者自身 `sync_events` 追加 `read_cursor` 事件并经 `ReadCursorNotification` 实时推送给其所有在线设备；客户端 `markConversationRead` 按“剩余未读对方消息数”重算未读角标、把 `readMessageId` 及之前的对方消息标记已读（状态只前进）。
   - ✅ **`sync_events` 保留清理（2026-09-04 完成）**：`migrateToV8` 引入 `sync_meta` 水位线表，`Server` 以独立维护连接每小时按 30 天保留期 `pruneSyncEvents`；落后于清理水位的设备（`0 < afterSeq < prunedBelowSeq`）由 `processSyncEventsRequest` 返回 `needsFullSync` + `fullSyncSeq`，客户端重置游标并 `getConversations` 全量回退（历史消息经 `sync_messages` 从 messages 表补齐，不受事件清理影响）。
-  - 冲突处理及配套特性：消息编辑/删除、会话置顶/免打扰——均为全新特性栈，**建议单独立项分批实施**（先置顶/免打扰，后编辑/删除），编辑/删除需纳入 `sync_events` 事件类型与幂等语义设计。
+  - ✅ **特性栈：置顶/免打扰 → 编辑/删除（2026-09-05 完成）**：会话偏好（置顶/免打扰，按成员×会话维度，多端共享）经 `SetConversationPrefs`（类型 81/82）+ `ConversationPrefsNotification`（83）推送与 `conversation_prefs` 事件同步；消息编辑/删除（类型 84-87）仅发送者可操作，编辑正文须保持原 contentType 并经服务端 fail-closed 密文校验（私聊 pairwise envelope、群 e2ee_group，拒绝明文注入），删除为软删除留墓碑（幂等），经 `message_edited`/`message_deleted` 事件实现多端与离线一致；数据库 V9 迁移（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）。
 - **验收标准**：
   - ✅ 设备 A 已读消息后，同账号设备 B 同步为已读（未读角标与消息状态一致）。
   - ✅ 离线 24 小时后上线只增量同步缺失事件；清理事件后的落后设备可回退全量拉取且不丢历史。
   - ✅ 服务端可清理过期 `sync_events` 而不破坏 `sync_messages` 历史拉取。
-  - （特性栈立项后）编辑/删除/置顶/静音在多端间一致。
+  - ✅ 编辑/删除/置顶/静音在多端间一致（实时推送 + sync_events 兜底）。
 
 ### 4.3 M10：搜索、通知与体验完善（4-6 周）
 
@@ -197,7 +196,7 @@
 1. **M11 前置两项：发消息/搜索限流 + 结构化日志** ✅ **已完成（2026-09-03）**：连接级 `RateWindow` 限流（send_message 30/10s、search_users 20/60s、fetch_keys 迁移，新增 `RateLimited` 1003）+ `StructuredLogger` 结构化审计日志；新增 RateWindow/StructuredLogger 共 4 个单测，ctest 通过（TestLocalStore 沙箱 DPAPI 偶发除外）。**下一候选为第 2 项。**
 2. **M9 核心一致性：已读状态多端同步 + `sync_events` 保留清理** ✅ **已完成（2026-09-04）**：`read_cursor` 事件 + `ReadCursorNotification` 推送 + `markConversationRead` 未读重算；`migrateToV8` 水位线 + `pruneSyncEvents`（30 天/每小时）+ `needsFullSync` 全量回退；新增 3 个回归用例，`ctest` 6/6。**下一候选为第 3 项。**
 3. **会话失效客户端重登 UX + `renewToken()` 接入定时续期** ✅ **已完成（2026-09-04）**：登录/续期响应解析 `expiresAt`，过期前 1 天自动 `renewToken`（续期响应 60 秒看门狗兜底、瞬时失败 5 分钟退避重试），续期时先擦除旧 token；服务端回 `SessionInvalid/SessionExpired`（含业务请求与续期响应两路径）时客户端安全清零并 `sessionExpired` 信号回登录页提示重新登录；断线重连重登后自动重新调度。对应欠账清单 P2 已销账。**下一候选为第 4 项。**
-4. **M9 特性栈：置顶/免打扰 → 编辑/删除**（单独立项，分批实施）。
+4. **M9 特性栈：置顶/免打扰 → 编辑/删除** ✅ **已完成（2026-09-05）**：协议类型 81-87 + V9 迁移 + 服务端三处理器 + 客户端全链路 + QML 右键菜单（会话置顶/免打扰、消息编辑/删除）与"已编辑/已删除"展示；新增 5 个单测，`ctest` 6/6。**下一候选为第 5 项。**
 5. **M8 媒体文件**。
 6. **M10 搜索/通知/体验**。
 
@@ -207,7 +206,7 @@
 XYChat_Project/
   3rdparty/               # 预编译依赖：QWindowKit、OpenSSL、zlib（include/lib/bin/src）
   CommonModule/           # 客户端/服务端共享模块
-    protocol/             # Packet/PacketCodec（消息类型 1-72，错误码 1000-9002）
+    protocol/             # Packet/PacketCodec（消息类型 1-87，错误码 1000-9002）
     encryption/           # EncryptionManager/E2eeCrypto(M6)/GroupE2eeCrypto(M7b)
     security/             # LogSanitizer/SecureMemory/TlsHelper
   Chat-Client/
@@ -223,7 +222,7 @@ XYChat_Project/
     main.cpp
   Chat-Server/
     core/                 # Server/RequestHandler/NonceCache
-    database/             # DatabaseManager 与迁移（当前 V7）
+    database/             # DatabaseManager 与迁移（当前 V9）
     main.cpp
   docs/                   # ARCHITECTURE/PROTOCOL/ROADMAP/SECURITY
   tests/
@@ -235,8 +234,8 @@ XYChat_Project/
 
 ## 7. 数据库演进
 
-- **服务端**（SQLite，版本化迁移，当前 V7）：`schema_version`、`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`（V7 增 `name`）、`conversation_members`（V7 增 `role`）、`messages`、`message_receipts`、`sync_events`、`device_identity_keys`（M6，仅公钥）、`prekeys`（M6，仅公钥）。中长期若需多人并发/多实例部署，迁移 PostgreSQL/MySQL，并尽早抽象 Repository/DAO。
-- **客户端 LocalStore**（SQLite，按账号+设备隔离，正文加密落库）：`schema_meta`、`messages`、`conversations`（含群名/成员数）、`outbox`（含 `conversation_id`）、`decrypt_cache`、`meta`（同步游标）、`sender_keys`（M7b：chain key/Ed25519 签名密钥对/迭代数，登出保留）。
+- **服务端**（SQLite，版本化迁移，当前 V9）：`schema_version`、`users`、`devices`、`sessions`、`login_audit`、`contacts`、`conversations`（V7 增 `name`）、`conversation_members`（V7 增 `role`、V9 增 `pinned`/`muted`）、`messages`（V9 增 `edited_at`/`deleted`）、`message_receipts`、`sync_events`、`device_identity_keys`（M6，仅公钥）、`prekeys`（M6，仅公钥）、`sync_meta`（V8，清理水位线）。中长期若需多人并发/多实例部署，迁移 PostgreSQL/MySQL，并尽早抽象 Repository/DAO。
+- **客户端 LocalStore**（SQLite，按账号+设备隔离，正文加密落库）：`schema_meta`、`messages`（M9 增 `edited_at`/`deleted`）、`conversations`（含群名/成员数、M9 增 `pinned`/`muted`，置顶会话按 pinned DESC 排序）、`outbox`（含 `conversation_id`）、`decrypt_cache`、`meta`（同步游标）、`sender_keys`（M7b：chain key/Ed25519 签名密钥对/迭代数，登出保留）。
 
 ## 8. 安全注意事项
 
@@ -289,3 +288,4 @@ XYChat_Project/
 | 2026-09-03 | M11 前置两项完成 | 发消息/搜索限流 + 结构化日志落地。① 限流：新增通用错误码 `RateLimited (1003)`（`LoginRateLimited` 收窄为仅登录）；`RateWindow`（`Chat-Server/core`，header-only）连接级固定窗口限流器替换 fetch_keys/fetch_group_keys 内联窗口并新增 `send_message`（30/10s，私聊/群聊同一入口）与 `search_users`（20/60s）限流；客户端 send 瞬时失败退避重刷（单发护栏防定时器堆叠）、fetch_group_keys healing 瞬时分类兼容新旧限流码。② 结构化日志：`StructuredLogger`（`CommonModule/security`）单行 JSON，统一 ts/level/event/requestId/userId/deviceId/code/durationMs/ip 字段 + LogSanitizer 脱敏；`sendResponse` 中央审计日志（成功 info/失败 warning，含耗时）+ 鉴权/会话/重放/envelope/限流安全事件带 `reason`；移除登录/注册明文 username/IP 日志；Server 连接生命周期结构化。新增 4 单测（RateWindow×2/StructuredLogger×2），`ctest` 5/6 绿（TestLocalStore 沙箱 DPAPI 偶发 fail-closed，单独运行通过）；CodeReview 子代理审查并修复 3 项（客户端限流重试/登出日志 userId 归因/服务器自发响应陈旧 type）。对应第 3 节两项 P2 欠账销账 |
 | 2026-09-04 | M9 核心一致性完成 | 已读状态多端同步 + `sync_events` 保留清理（收掉 M9 三条基础验收）。① 已读多端同步：新增 `ReadCursorNotification (80)` 推送 + 已读者自身 `read_cursor` 事件，客户端 `markConversationRead` 按剩余未读重算角标、对方消息状态只前进；② 清理：`migrateToV8`（`sync_meta` 水位线）+ `pruneSyncEvents`（30 天/每小时，Server 独立维护连接）+ 落后设备 `needsFullSync`/`fullSyncSeq` 全量回退（历史经 `sync_messages` 从 messages 表补齐）。新增回归用例 `pruneSyncEventsPrunesExpiredAndAdvancesWatermark`/`readCursorEventRoundTrips`/`markConversationReadRecomputesUnreadAndOnlyAdvances`，`groupMigration` 版本断言更新至 V8；`ctest` 6/6；CodeReview 无 P0，修复 P1（`fullSyncSeq=0` 用 `qMax(maxSeq, prunedBelow)` 保证游标自愈）与 P2（未读角标改重算避免误清更新未读）。对应第 3 节 `sync_events` 清理与已读多端同步两项 P2 欠账销账；特性栈（置顶/免打扰/编辑/删除）仍按建议单独立项 |
 | 2026-09-04 | 会话续期与失效重登完成 | 客户端接入 `expiresAt`：登录/续期响应解析过期时间，过期前 1 天自动 `renewToken`（续期响应 60 秒看门狗兜底 + 瞬时失败 5 分钟退避重试），续期换代先 `SecureMemory::wipe` 旧 token；服务端 `SessionInvalid/SessionExpired`（业务请求经 `MessageType::Error`、续期经 `TokenRenewResponse` 两路径）触发客户端安全清零 + `sessionExpired` 信号回登录页提示重新登录；断线重连重登后自动重新调度续期；`parseExpiresAt` 校正 Qt 对无时区 ISO 串按本地解析的偏移。对应第 3 节 P2 欠账销账；构建 41/41 目标通过，`ctest` 5/6（TestLocalStore 为已知沙箱 DPAPI 偶发，与本次改动无关） |
+| 2026-09-05 | M9 特性栈完成 | 会话置顶/免打扰 + 消息编辑/删除（软删除留墓碑）。协议类型 81-87（SetConversationPrefs/ConversationPrefsNotification/EditMessage/DeleteMessage）；V9 迁移（`conversation_members.pinned/muted`、`messages.edited_at/deleted`）；服务端三处理器（偏好仅成员可设、编辑/删除仅发送者可操作、编辑正文保持原 contentType 并经 fail-closed 密文校验拒绝明文注入）；客户端全链路（请求/响应/推送/sync_events/本地缓存，编辑解密前先失效旧解密缓存防命中编辑前明文）+ QML 右键菜单与"已编辑/已删除"展示；新增 `conversation_prefs`/`message_edited`/`message_deleted` 三类 sync_events 事件。新增 5 个单测（V9 列/偏好 set-get-回填/编辑/删除软删幂等，`groupMigration` 版本断言更新至 V9 并补 messages 表 fixture），`ctest` 6/6（TestLocalStore 沙箱 DPAPI 偶发单独运行通过）。对应第 3 节 P3 特性栈欠账销账 |

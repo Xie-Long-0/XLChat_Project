@@ -79,6 +79,13 @@ private slots:
     void groupMemberIdsAndCounts();
     void groupMessageReceiptCounts();
 
+    // M9 特性栈：置顶/免打扰与消息编辑/删除
+    void v9ColumnsExist();
+    void setAndGetConversationPrefs();
+    void prefsBackfillInConversationsList();
+    void editMessageUpdatesContentAndTimestamp();
+    void deleteMessageSoftDeletesIdempotently();
+
 private:
     DatabaseManager *m_db = nullptr;
     QString m_connectionName;
@@ -855,6 +862,18 @@ void TestDatabaseManager::groupMigrationAddsNameAndRoleColumns()
             "  joined_at TEXT NOT NULL DEFAULT (datetime('now')),"
             "  last_read_message_id INTEGER DEFAULT 0,"
             "  UNIQUE(conversation_id, user_id))"));
+        // V6 旧库已有 messages 表（V1 创建）；V9 迁移需对其 ALTER 加列
+        QVERIFY(lq.exec(
+            "CREATE TABLE messages ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  conversation_id INTEGER NOT NULL,"
+            "  sender_id INTEGER NOT NULL,"
+            "  content TEXT NOT NULL,"
+            "  content_type TEXT NOT NULL DEFAULT 'text',"
+            "  status TEXT NOT NULL DEFAULT 'sent',"
+            "  created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+            "  client_message_id TEXT,"
+            "  sender_device_id TEXT)"));
         QVERIFY(lq.exec("INSERT INTO conversations (type) VALUES ('private')"));
         QVERIFY(lq.exec("INSERT INTO conversation_members (conversation_id, user_id) VALUES (1, 1)"));
     }
@@ -885,10 +904,27 @@ void TestDatabaseManager::groupMigrationAddsNameAndRoleColumns()
     QCOMPARE(check.value(1).toLongLong(), 1LL);
     QCOMPARE(check.value(2).toLongLong(), 1LL);
 
-    // 版本号推进到最新（V7 群迁移之后还有 M9 的 V8）
+    // V9 迁移补齐置顶/免打扰与编辑/删除列
+    QVERIFY(check.exec("PRAGMA table_info(conversation_members)"));
+    QStringList v9MemberCols;
+    while (check.next()) {
+        v9MemberCols << check.value(1).toString();
+    }
+    QVERIFY(v9MemberCols.contains("pinned"));
+    QVERIFY(v9MemberCols.contains("muted"));
+
+    QVERIFY(check.exec("PRAGMA table_info(messages)"));
+    QStringList v9MsgCols;
+    while (check.next()) {
+        v9MsgCols << check.value(1).toString();
+    }
+    QVERIFY(v9MsgCols.contains("edited_at"));
+    QVERIFY(v9MsgCols.contains("deleted"));
+
+    // 版本号推进到最新（V7 群迁移之后还有 V8 同步事件、V9 置顶/免打扰与编辑/删除）
     QVERIFY(check.exec("SELECT MAX(version) FROM schema_version"));
     QVERIFY(check.next());
-    QCOMPARE(check.value(0).toInt(), 8);
+    QCOMPARE(check.value(0).toInt(), 9);
 }
 
 void TestDatabaseManager::createGroupInsertsOwnerAndMembers()
@@ -1096,6 +1132,161 @@ void TestDatabaseManager::groupMessageReceiptCounts()
     QVERIFY(sysMsg.has_value());
     QCOMPARE(sysMsg->contentType, QString("system"));
     QCOMPARE(sysMsg->conversationId, convId);
+}
+
+// M9 特性栈：置顶/免打扰与消息编辑/删除
+
+void TestDatabaseManager::v9ColumnsExist()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    QVERIFY(q.exec("PRAGMA table_info(conversation_members)"));
+    QStringList memberCols;
+    while (q.next()) {
+        memberCols << q.value(1).toString();
+    }
+    QVERIFY(memberCols.contains("pinned"));
+    QVERIFY(memberCols.contains("muted"));
+
+    QVERIFY(q.exec("PRAGMA table_info(messages)"));
+    QStringList msgCols;
+    while (q.next()) {
+        msgCols << q.value(1).toString();
+    }
+    QVERIFY(msgCols.contains("edited_at"));
+    QVERIFY(msgCols.contains("deleted"));
+}
+
+void TestDatabaseManager::setAndGetConversationPrefs()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    auto outsider = m_db->getUserByUsername("outsider");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+    QVERIFY(outsider.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    QVERIFY(convId > 0);
+
+    // 默认未置顶/未免打扰
+    auto initial = m_db->getConversationPrefs(convId, user1->id);
+    QVERIFY(initial.has_value());
+    QVERIFY(!initial->first);
+    QVERIFY(!initial->second);
+
+    // 置顶 + 免打扰
+    QVERIFY(m_db->setConversationPrefs(convId, user1->id, true, true));
+    auto updated = m_db->getConversationPrefs(convId, user1->id);
+    QVERIFY(updated.has_value());
+    QVERIFY(updated->first);
+    QVERIFY(updated->second);
+
+    // 偏好按成员隔离：user2 不受 user1 设置影响
+    auto other = m_db->getConversationPrefs(convId, user2->id);
+    QVERIFY(other.has_value());
+    QVERIFY(!other->first);
+    QVERIFY(!other->second);
+
+    // 非成员设置不产生行，读取返回默认值
+    QVERIFY(!m_db->setConversationPrefs(convId, outsider->id, true, false));
+    auto outsiderPrefs = m_db->getConversationPrefs(convId, outsider->id);
+    QVERIFY(outsiderPrefs.has_value());
+    QVERIFY(!outsiderPrefs->first);
+    QVERIFY(!outsiderPrefs->second);
+}
+
+void TestDatabaseManager::prefsBackfillInConversationsList()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    QVERIFY(user1.has_value());
+
+    // 取 user1 的第一个私聊会话
+    auto convs = m_db->getConversationsForUser(user1->id);
+    QVERIFY(!convs.isEmpty());
+    const qint64 convId = convs.first().id;
+
+    QVERIFY(m_db->setConversationPrefs(convId, user1->id, true, false));
+
+    bool found = false;
+    const auto updated = m_db->getConversationsForUser(user1->id);
+    for (const auto &ci : updated) {
+        if (ci.id == convId) {
+            found = true;
+            QVERIFY(ci.pinned);
+            QVERIFY(!ci.muted);
+        }
+    }
+    QVERIFY(found);
+}
+
+void TestDatabaseManager::editMessageUpdatesContentAndTimestamp()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 msgId = m_db->sendMessage(convId, user1->id, "original content");
+    QVERIFY(msgId > 0);
+
+    // 编辑前：无编辑时间、未删除
+    auto before = m_db->getMessage(msgId);
+    QVERIFY(before.has_value());
+    QVERIFY(before->editedAt.isEmpty());
+    QVERIFY(!before->deleted);
+
+    // 编辑正文（保持 content 类型），编辑时间被记录
+    QVERIFY(m_db->editMessage(msgId, "edited content", "text"));
+    auto after = m_db->getMessage(msgId);
+    QVERIFY(after.has_value());
+    QCOMPARE(after->content, QString("edited content"));
+    QVERIFY(!after->editedAt.isEmpty());
+    QVERIFY(!after->deleted);
+
+    // getMessages / syncMessages 回填 editedAt/deleted 字段
+    const auto msgs = m_db->getMessages(convId);
+    bool found = false;
+    for (const auto &m : msgs) {
+        if (m.id == msgId) {
+            found = true;
+            QCOMPARE(m.content, QString("edited content"));
+            QVERIFY(!m.editedAt.isEmpty());
+            QVERIFY(!m.deleted);
+        }
+    }
+    QVERIFY(found);
+}
+
+void TestDatabaseManager::deleteMessageSoftDeletesIdempotently()
+{
+    auto user1 = m_db->getUserByUsername("testuser");
+    auto user2 = m_db->getUserByUsername("user2");
+    QVERIFY(user1.has_value());
+    QVERIFY(user2.has_value());
+
+    const qint64 convId = m_db->getOrCreatePrivateConversation(user1->id, user2->id);
+    const qint64 msgId = m_db->sendMessage(convId, user1->id, "delete me");
+    QVERIFY(msgId > 0);
+
+    // 软删除：正文清空、deleted 置 1，墓碑保留 messageId/发送者/时间
+    QVERIFY(m_db->deleteMessage(msgId));
+    auto deleted = m_db->getMessage(msgId);
+    QVERIFY(deleted.has_value());
+    QVERIFY(deleted->deleted);
+    QVERIFY(deleted->content.isEmpty());
+    QCOMPARE(deleted->id, msgId);
+    QCOMPARE(deleted->senderId, user1->id);
+
+    // 幂等：重复删除仍返回成功
+    QVERIFY(m_db->deleteMessage(msgId));
+
+    // 已删除消息不可再编辑（业务层校验，数据层删除后 edited 状态不变）
+    auto stillDeleted = m_db->getMessage(msgId);
+    QVERIFY(stillDeleted.has_value());
+    QVERIFY(stillDeleted->deleted);
 }
 
 QTEST_MAIN(TestDatabaseManager)

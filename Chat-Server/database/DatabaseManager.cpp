@@ -118,6 +118,9 @@ bool DatabaseManager::runMigrations()
     if (currentVersion < 8) {
         if (!migrateToV8()) return false;
     }
+    if (currentVersion < 9) {
+        if (!migrateToV9()) return false;
+    }
 
     return true;
 }
@@ -579,6 +582,94 @@ bool DatabaseManager::migrateToV8()
     return true;
 }
 
+// V9（M9 特性栈）：会话偏好（置顶/免打扰）+ 消息编辑/删除列
+bool DatabaseManager::migrateToV9()
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+
+    qDebug() << "[DB] Migrating to V9...";
+
+    // conversation_members.pinned：该成员是否置顶该会话（0/1）
+    bool hasPinned = false;
+    if (q.exec("PRAGMA table_info(conversation_members)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "pinned") {
+                hasPinned = true;
+                break;
+            }
+        }
+    }
+    if (!hasPinned &&
+        !q.exec("ALTER TABLE conversation_members "
+                "ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")) {
+        qCritical() << "[DB] V9: Failed to add conversation_members.pinned:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    // conversation_members.muted：该成员是否免打扰该会话（0/1）
+    bool hasMuted = false;
+    if (q.exec("PRAGMA table_info(conversation_members)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "muted") {
+                hasMuted = true;
+                break;
+            }
+        }
+    }
+    if (!hasMuted &&
+        !q.exec("ALTER TABLE conversation_members "
+                "ADD COLUMN muted INTEGER NOT NULL DEFAULT 0")) {
+        qCritical() << "[DB] V9: Failed to add conversation_members.muted:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    // messages.edited_at：编辑时间（NULL 表示未编辑）
+    bool hasEditedAt = false;
+    if (q.exec("PRAGMA table_info(messages)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "edited_at") {
+                hasEditedAt = true;
+                break;
+            }
+        }
+    }
+    if (!hasEditedAt &&
+        !q.exec("ALTER TABLE messages ADD COLUMN edited_at TEXT")) {
+        qCritical() << "[DB] V9: Failed to add messages.edited_at:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    // messages.deleted：软删除标记（0/1，删除后正文清空留墓碑）
+    bool hasDeleted = false;
+    if (q.exec("PRAGMA table_info(messages)")) {
+        while (q.next()) {
+            if (q.value(1).toString() == "deleted") {
+                hasDeleted = true;
+                break;
+            }
+        }
+    }
+    if (!hasDeleted &&
+        !q.exec("ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")) {
+        qCritical() << "[DB] V9: Failed to add messages.deleted:"
+                    << q.lastError().text();
+        return false;
+    }
+
+    q.prepare("INSERT INTO schema_version (version) VALUES (9)");
+    if (!q.exec()) {
+        qCritical() << "[DB] V9: Failed to record version:" << q.lastError().text();
+        return false;
+    }
+
+    qDebug() << "[DB] Migration V9 complete";
+    return true;
+}
+
 // 用户管理
 bool DatabaseManager::userExists(const QString &username)
 {
@@ -1028,7 +1119,7 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
     q.prepare(
         "SELECT c.id, c.type, c.created_at, c.updated_at, "
         "  m.id, m.content, m.created_at, m.sender_id, "
-        "  cm.last_read_message_id, c.name "
+        "  cm.last_read_message_id, c.name, cm.pinned, cm.muted "
         "FROM conversation_members cm "
         "JOIN conversations c ON cm.conversation_id = c.id "
         "LEFT JOIN messages m ON m.id = ("
@@ -1049,6 +1140,9 @@ QList<ConversationInfo> DatabaseManager::getConversationsForUser(qint64 userId)
             ci.lastMessageAt = q.value(6).toString();
             // M7a: 群名（private 会话为 NULL，toString 得空串）
             ci.name = q.value(9).toString();
+            // M9 特性栈：会话偏好（置顶/免打扰）
+            ci.pinned = q.value(10).toInt() != 0;
+            ci.muted = q.value(11).toInt() != 0;
 
             // 查询对方用户信息（一对一会话）
             qint64 senderId = q.value(7).toLongLong();
@@ -1250,7 +1344,8 @@ std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
     QSqlQuery q(db);
     q.prepare(
         "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
-        "  m.content, m.content_type, m.status, m.created_at "
+        "  m.content, m.content_type, m.status, m.created_at, "
+        "  m.edited_at, m.deleted "
         "FROM messages m JOIN users u ON m.sender_id = u.id "
         "WHERE m.id = ?");
     q.addBindValue(messageId);
@@ -1264,6 +1359,8 @@ std::optional<MessageInfo> DatabaseManager::getMessage(qint64 messageId)
         mi.contentType = q.value(5).toString();
         mi.status = q.value(6).toString();
         mi.createdAt = q.value(7).toString();
+        mi.editedAt = q.value(8).toString();
+        mi.deleted = q.value(9).toInt() != 0;
         return mi;
     }
     return std::nullopt;
@@ -1278,7 +1375,8 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
     if (beforeId > 0) {
         q.prepare(
             "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
-            "  m.content, m.content_type, m.status, m.created_at "
+            "  m.content, m.content_type, m.status, m.created_at, "
+            "  m.edited_at, m.deleted "
             "FROM messages m JOIN users u ON m.sender_id = u.id "
             "WHERE m.conversation_id = ? AND m.id < ? "
             "ORDER BY m.id DESC LIMIT ?");
@@ -1288,7 +1386,8 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
     } else {
         q.prepare(
             "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
-            "  m.content, m.content_type, m.status, m.created_at "
+            "  m.content, m.content_type, m.status, m.created_at, "
+            "  m.edited_at, m.deleted "
             "FROM messages m JOIN users u ON m.sender_id = u.id "
             "WHERE m.conversation_id = ? "
             "ORDER BY m.id DESC LIMIT ?");
@@ -1307,6 +1406,8 @@ QList<MessageInfo> DatabaseManager::getMessages(qint64 conversationId, qint64 be
             mi.contentType = q.value(5).toString();
             mi.status = q.value(6).toString();
             mi.createdAt = q.value(7).toString();
+            mi.editedAt = q.value(8).toString();
+            mi.deleted = q.value(9).toInt() != 0;
             result.prepend(mi); // 按时间正序排列
         }
     }
@@ -1320,7 +1421,8 @@ QList<MessageInfo> DatabaseManager::syncMessages(qint64 conversationId, qint64 a
     QSqlQuery q(db);
     q.prepare(
         "SELECT m.id, m.conversation_id, m.sender_id, u.username, "
-        "  m.content, m.content_type, m.status, m.created_at "
+        "  m.content, m.content_type, m.status, m.created_at, "
+        "  m.edited_at, m.deleted "
         "FROM messages m JOIN users u ON m.sender_id = u.id "
         "WHERE m.conversation_id = ? AND m.id > ? "
         "ORDER BY m.id ASC LIMIT ?");
@@ -1338,6 +1440,8 @@ QList<MessageInfo> DatabaseManager::syncMessages(qint64 conversationId, qint64 a
             mi.contentType = q.value(5).toString();
             mi.status = q.value(6).toString();
             mi.createdAt = q.value(7).toString();
+            mi.editedAt = q.value(8).toString();
+            mi.deleted = q.value(9).toInt() != 0;
             result.append(mi);
         }
     }
@@ -1352,6 +1456,49 @@ bool DatabaseManager::updateMessageStatus(qint64 messageId, const QString &statu
     q.addBindValue(status);
     q.addBindValue(messageId);
     return q.exec();
+}
+
+// M9 特性栈：编辑消息——覆盖正文并标记编辑时间（调用方已授权仅发送者）；
+// 已删除（软删除）消息不可再编辑
+bool DatabaseManager::editMessage(qint64 messageId, const QString &content,
+                                  const QString &contentType)
+{
+    if (messageId <= 0 || content.isEmpty() || contentType.isEmpty()) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE messages SET content = ?, content_type = ?, "
+        "  edited_at = datetime('now') "
+        "WHERE id = ? AND deleted = 0");
+    q.addBindValue(content);
+    q.addBindValue(contentType);
+    q.addBindValue(messageId);
+    if (!q.exec()) {
+        qWarning() << "[DB] editMessage failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+// M9 特性栈：删除消息——软删除：清空正文留墓碑（deleted=1，content 置空），
+// 保留消息 ID/发送者/时间供客户端渲染“已删除”占位；幂等（重复删除返回 true）
+bool DatabaseManager::deleteMessage(qint64 messageId)
+{
+    if (messageId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare("UPDATE messages SET deleted = 1, content = '' WHERE id = ?");
+    q.addBindValue(messageId);
+    if (!q.exec()) {
+        qWarning() << "[DB] deleteMessage failed:" << q.lastError().text();
+        return false;
+    }
+    // 已删除或不存在（numRowsAffected=0）视为幂等成功，调用方已先确认消息存在
+    return true;
 }
 
 bool DatabaseManager::updateMessagesReadStatus(qint64 conversationId, qint64 readerId)
@@ -2122,4 +2269,64 @@ int DatabaseManager::memberCountExcluding(qint64 conversationId, qint64 excludeU
         return q.value(0).toInt();
     }
     return 0;
+}
+
+QList<qint64> DatabaseManager::getConversationMemberIds(qint64 conversationId)
+{
+    QList<qint64> result;
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT user_id FROM conversation_members "
+        "WHERE conversation_id = ? "
+        "ORDER BY joined_at, user_id");
+    q.addBindValue(conversationId);
+    if (q.exec()) {
+        while (q.next()) {
+            result.append(q.value(0).toLongLong());
+        }
+    }
+    return result;
+}
+
+// M9 特性栈：设置会话偏好（置顶/免打扰），按成员×会话维度；
+// 非成员（无对应行）返回 false，调用方已先做成员授权
+bool DatabaseManager::setConversationPrefs(qint64 conversationId, qint64 userId,
+                                           bool pinned, bool muted)
+{
+    if (conversationId <= 0 || userId <= 0) {
+        return false;
+    }
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE conversation_members SET pinned = ?, muted = ? "
+        "WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(pinned ? 1 : 0);
+    q.addBindValue(muted ? 1 : 0);
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    if (!q.exec()) {
+        qWarning() << "[DB] setConversationPrefs failed:" << q.lastError().text();
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+std::optional<std::pair<bool, bool>> DatabaseManager::getConversationPrefs(qint64 conversationId,
+                                                                           qint64 userId)
+{
+    QSqlDatabase db = QSqlDatabase::database(m_connectionName);
+    QSqlQuery q(db);
+    q.prepare(
+        "SELECT pinned, muted FROM conversation_members "
+        "WHERE conversation_id = ? AND user_id = ?");
+    q.addBindValue(conversationId);
+    q.addBindValue(userId);
+    if (q.exec() && q.next()) {
+        return std::make_pair(q.value(0).toInt() != 0, q.value(1).toInt() != 0);
+    }
+    // 非成员（无 conversation_members 行）返回默认 false/false，
+    // 与文档契约一致（成员存在性由调用方通过 isConversationMember 校验）
+    return std::make_pair(false, false);
 }
