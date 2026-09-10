@@ -265,7 +265,8 @@ GroupE2eeCrypto::EncryptedMessage GroupE2eeCrypto::encryptMessage(SenderKey &key
 QByteArray GroupE2eeCrypto::decryptMessage(QByteArray &chainKey,
                                            int &iteration,
                                            const QByteArray &publicSigningKey,
-                                           const EncryptedMessage &msg)
+                                           const EncryptedMessage &msg,
+                                           QMap<int, QByteArray> *skippedKeys)
 {
     if (!msg.valid
         || msg.iv.size() != GcmIvSize
@@ -277,7 +278,35 @@ QByteArray GroupE2eeCrypto::decryptMessage(QByteArray &chainKey,
         return {};
     }
 
-    // 不允许回退（重放/乱序）
+    // 乱序容忍：先查已跳过的消息密钥缓存。命中时不改动 chainKey/iteration
+    // （该消息属于已被跨越的历史迭代）
+    if (skippedKeys) {
+        auto cached = skippedKeys->find(msg.iteration);
+        if (cached != skippedKeys->end()) {
+            // 先认证后消费：伪造密文/签名不得烧毁合法的跳序密钥（否则一条注入
+            // 消息就能使随后到达的真实乱序消息永久不可解）。失败分支的 wipe 会
+            // 因隐式共享而 detach，只清零本地副本，map 内条目不受影响
+            const QByteArray cachedKey = cached.value();
+            const QByteArray signedPayload = msg.iv + msg.ciphertext;
+            QByteArray plaintext = E2eeCrypto::aesGcmDecrypt(cachedKey, msg.iv, msg.ciphertext);
+            if (plaintext.isEmpty()) {
+                SecureMemory::wipe(const_cast<QByteArray &>(cachedKey));
+                return {};
+            }
+            if (!verify(publicSigningKey, signedPayload, msg.signature)) {
+                SecureMemory::wipe(plaintext);
+                SecureMemory::wipe(const_cast<QByteArray &>(cachedKey));
+                return {};
+            }
+            // 认证成功：一次性消费该条目防重放。先 erase 使 cachedKey 成为唯一持有者，
+            // 再 wipe 才能真正清零底层缓冲（共享状态下 wipe 会 detach 到副本）
+            skippedKeys->erase(cached);
+            SecureMemory::wipe(const_cast<QByteArray &>(cachedKey));
+            return plaintext;
+        }
+    }
+
+    // 不允许回退（重放，或乱序且无缓存可用）
     if (msg.iteration <= iteration) {
         return {};
     }
@@ -287,29 +316,47 @@ QByteArray GroupE2eeCrypto::decryptMessage(QByteArray &chainKey,
         return {};
     }
 
-    // 将本地 chainKey ratchet 到消息迭代次数
+    // 将本地 chainKey ratchet 到消息迭代次数；途中派生的消息密钥先存 pending，
+    // 待解密与验签全部通过后才提交（伪造输入不得污染链状态与密钥缓存）
     QByteArray currentChainKey = chainKey;
     int currentIteration = iteration;
+    QMap<int, QByteArray> pending;
+    auto discard = [&currentChainKey, &pending]() {
+        for (auto it = pending.begin(); it != pending.end(); ++it) {
+            SecureMemory::wipe(it.value());
+        }
+        pending.clear();
+        SecureMemory::wipe(currentChainKey);
+    };
     while (currentIteration < msg.iteration) {
         const QByteArray next = ratchetChainKey(currentChainKey);
         if (next.isEmpty()) {
-            SecureMemory::wipe(currentChainKey);
+            discard();
             return {};
         }
         currentChainKey = next;
         ++currentIteration;
+        // 被跨越的迭代即“在途/乱序”消息的密钥，缓存以供后续低 iteration 消息解密
+        if (currentIteration < msg.iteration && skippedKeys) {
+            const QByteArray skippedKey = deriveMessageKey(currentChainKey, currentIteration);
+            if (skippedKey.isEmpty()) {
+                discard();
+                return {};
+            }
+            pending.insert(currentIteration, skippedKey);
+        }
     }
 
     QByteArray messageKey = deriveMessageKey(currentChainKey, currentIteration);
     if (messageKey.isEmpty()) {
-        SecureMemory::wipe(currentChainKey);
+        discard();
         return {};
     }
 
     QByteArray plaintext = E2eeCrypto::aesGcmDecrypt(messageKey, msg.iv, msg.ciphertext);
     SecureMemory::wipe(messageKey);
     if (plaintext.isEmpty()) {
-        SecureMemory::wipe(currentChainKey);
+        discard();
         return {};
     }
 
@@ -317,7 +364,7 @@ QByteArray GroupE2eeCrypto::decryptMessage(QByteArray &chainKey,
     const QByteArray signedPayload = msg.iv + msg.ciphertext;
     if (!verify(publicSigningKey, signedPayload, msg.signature)) {
         SecureMemory::wipe(plaintext);
-        SecureMemory::wipe(currentChainKey);
+        discard();
         return {};
     }
 
@@ -325,6 +372,18 @@ QByteArray GroupE2eeCrypto::decryptMessage(QByteArray &chainKey,
     SecureMemory::wipe(chainKey);
     chainKey = currentChainKey;
     iteration = currentIteration;
+    if (skippedKeys) {
+        for (auto it = pending.constBegin(); it != pending.constEnd(); ++it) {
+            skippedKeys->insert(it.key(), it.value());
+        }
+        pending.clear();
+        // 容量上限：超出时丢弃 iteration 最小的条目（最旧的在途消息）
+        while (skippedKeys->size() > MaxSkippedMessageKeys) {
+            auto oldest = skippedKeys->begin();
+            SecureMemory::wipe(oldest.value());
+            skippedKeys->erase(oldest);
+        }
+    }
     return plaintext;
 }
 
@@ -348,7 +407,7 @@ QJsonObject GroupE2eeCrypto::encodeDistribution(qint64 groupId,
 
     QJsonObject root;
     root["v"] = DistributionVersion;
-    root["type"] = QStringLiteral("sender_key_distribution");
+    root["type"] = "sender_key_distribution";
     root["groupId"] = groupId;
     root["senderUserId"] = senderUserId;
     root["senderDeviceId"] = senderDeviceId;
@@ -433,7 +492,7 @@ QJsonObject GroupE2eeCrypto::encodeGroupMessage(const EncryptedMessage &msg,
 {
     QJsonObject root;
     root["v"] = GroupMessageVersion;
-    root["type"] = QStringLiteral("group_e2ee");
+    root["type"] = "group_e2ee";
     root["keyId"] = msg.keyId;
     root["iteration"] = msg.iteration;
     root["senderDeviceId"] = senderDeviceId;

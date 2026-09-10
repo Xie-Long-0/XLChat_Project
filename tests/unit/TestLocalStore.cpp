@@ -242,6 +242,78 @@ private slots:
                                     key2.privateSigningKey, 2));
 
         QCOMPARE(store.latestSenderKeyId(200, 8, "deviceB"), key2.keyId);
+
+        // “最新”= 最近一次写入：重新触碰 key1 后应改选 key1。旧实现按 updated_at
+        // 秒级排序并以随机 hex 的 key_id 作并列破口，同一秒内写入两把密钥（轮换
+        // 场景）时结果不确定，本用例约 50% 失败（曾被误归因为沙箱 DPAPI 偶发）
+        QVERIFY(store.saveSenderKey(200, 8, "deviceB", key1.keyId,
+                                    key1.chainKey, key1.publicSigningKey,
+                                    key1.privateSigningKey, 3));
+        QCOMPARE(store.latestSenderKeyId(200, 8, "deviceB"), key1.keyId);
+        store.closeAndDestroy();
+    }
+
+    // M9 修复：历史 message_edited 事件/推送不带 senderId 时，按设备 + keyId 反查
+    // 发送者（群聊解密靠 senderUserId 定位 Sender Key，缺失即永久不可解）
+    void senderUserIdForKeyResolvesWithoutSenderId()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        const auto key = XYChat::Security::GroupE2eeCrypto::generateSenderKey();
+        QVERIFY(store.saveSenderKey(500, 21, "deviceF", key.keyId, key.chainKey,
+                                    key.publicSigningKey, QByteArray(), 4));
+        QCOMPARE(store.senderUserIdForKey(500, "deviceF", key.keyId), qint64(21));
+        // 未知维度不得误匹配
+        QCOMPARE(store.senderUserIdForKey(500, "deviceF", "nosuchkey"), qint64(0));
+        QCOMPARE(store.senderUserIdForKey(501, "deviceF", key.keyId), qint64(0));
+        QCOMPARE(store.senderUserIdForKey(500, "deviceG", key.keyId), qint64(0));
+        store.closeAndDestroy();
+    }
+
+    // M9 修复：跳序消息密钥缓存的加密持久化（乱序投递与群消息编辑重加密依赖），
+    // 属 E2EE 密钥材料：磁盘上必须是密文，且退群时随 sender_keys 一并清理
+    void skippedMessageKeysPersistAcrossReopen()
+    {
+        const QString user = uniqueUser();
+        LocalStore store;
+        QVERIFY(store.open(user, DeviceId));
+
+        QMap<int, QByteArray> keys;
+        keys.insert(3, QByteArray(32, '\x11'));
+        keys.insert(7, QByteArray(32, '\x22'));
+        QVERIFY(store.saveSkippedMessageKeys(400, 11, "deviceD", "keyD", keys));
+        store.close();
+
+        // 磁盘上不得出现密钥明文的 base64（与消息正文同一加密落库约束）
+        const QByteArray raw = readRawDb(user);
+        QVERIFY(!raw.isEmpty());
+        QVERIFY(!raw.contains(keys.value(3).toBase64()));
+        QVERIFY(!raw.contains(keys.value(7).toBase64()));
+
+        QVERIFY(store.open(user, DeviceId));
+        const QMap<int, QByteArray> loaded =
+            store.loadSkippedMessageKeys(400, 11, "deviceD", "keyD");
+        QCOMPARE(loaded.size(), 2);
+        QCOMPARE(loaded.value(3), keys.value(3));
+        QCOMPARE(loaded.value(7), keys.value(7));
+
+        // 维度隔离：群/发送者/设备/keyId 任一不同均不得命中
+        QVERIFY(store.loadSkippedMessageKeys(401, 11, "deviceD", "keyD").isEmpty());
+        QVERIFY(store.loadSkippedMessageKeys(400, 12, "deviceD", "keyD").isEmpty());
+        QVERIFY(store.loadSkippedMessageKeys(400, 11, "deviceE", "keyD").isEmpty());
+        QVERIFY(store.loadSkippedMessageKeys(400, 11, "deviceD", "keyX").isEmpty());
+
+        // 空缓存写回即删行（避免陈旧密钥材料残留）
+        QVERIFY(store.saveSkippedMessageKeys(400, 11, "deviceD", "keyD",
+                                             QMap<int, QByteArray>()));
+        QVERIFY(store.loadSkippedMessageKeys(400, 11, "deviceD", "keyD").isEmpty());
+
+        // 退群清理连同跳序缓存一并删除
+        QVERIFY(store.saveSkippedMessageKeys(400, 11, "deviceD", "keyD", keys));
+        QVERIFY(store.removeSenderKeysForGroup(400));
+        QVERIFY(store.loadSkippedMessageKeys(400, 11, "deviceD", "keyD").isEmpty());
         store.closeAndDestroy();
     }
 

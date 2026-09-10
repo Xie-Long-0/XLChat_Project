@@ -37,8 +37,9 @@
 - **消息加密与认证**：AES-256-GCM（随机 12B IV）加密，发送方 Ed25519 私钥签名覆盖 `iv || ciphertext`，接收方验签失败/iteration 回滚/篡改均拒绝解密。
 - **密钥分发**：chain key 复用 M6 pairwise E2EE（X25519 身份/预密钥）逐成员逐设备加密，以 `contentType=sender_key_distribution` 群消息投递；`fetch_group_keys` 仅限群成员且与 `fetch_keys` 共享连接级限流（60s/20 次），防预密钥池耗尽。分发经 `send_message` 入库后消费其引用的预密钥（`claimed→used`，与单聊 `processSendMessage` 一致），否则 `claimed` 预密钥 10 分钟超时回收为 `unused` 被重复 claim，而接收方首次解密已删除本地私钥，致轮换后的新分发永久不可解（2026-09-03 修复）。
 - **DoS 防护**：单次解密 ratchet 跳跃上限 `MaxRatchetSteps = 2000`，envelope `iteration` 绝对上界 `MaxMessageIteration = 1e8`；恶意超大 iteration 在触发任何 HKDF 运算前即被拒绝（2026-09-02 安全审查修复）。
+- **乱序容忍与跳序消息密钥缓存（2026-09-09）**：chain-key ratchet 单向不可逆，而“密文可被事后覆写”的消息编辑会使 `iteration` 与 `message_id` 顺序解耦：被编辑消息获得比其后发送消息更大的 `iteration`，而 `sync_messages` 按 `message_id ASC` 返回，接收端先解到高 `iteration` 后，后到的低 `iteration` 消息会被回滚检查**永久拒绝**（明文不可恢复）。为此 `GroupE2eeCrypto::decryptMessage` 接受可选的跳序消息密钥缓存（Signal skipped-message-keys 语义）：ratchet 跨越迭代时缓存途中派生的消息密钥，使乱序/在途消息仍可解密。安全约束：① 容量上限 `MaxSkippedMessageKeys = 1000`，超限丢弃 `iteration` 最小者（内存与落库均有界）；② 缓存条目**命中即删**（一次性消费），不削弱重放拒绝；③ **fail-closed 提交**——仅当 GCM 解密与 Ed25519 验签全部通过后才提交链状态与新缓存，伪造密文/签名既不推进 `iteration` 也不写入任何派生密钥；④ 命中缓存时不改动 `chainKey`/`iteration`。**前向安全权衡**：缓存保留了尚未接收消息的密钥，在这些消息到达前它们不具备前向安全性（与 Signal 一致的可接受折中）；密钥仅驻内存与本地密文库，经 `LocalStore.sender_key_skipped` 表以存储密钥 AES-256-GCM 加密落库（磁盘无可读密钥），退群随 `sender_keys` 一并清理。
 - **服务端 fail-closed**：`e2ee_group` 与 `sender_key_distribution` 正文入库/fan-out 前强制 decode 校验（含 `senderDeviceId` 非空、条目非空、`groupId` 与会话一致），非法返回 `E2eeInvalidEnvelope (3008)`，无静默放行路径；群系统消息（`contentType=system`）仅含元数据不含用户正文，不加密。
-- **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。
+- **本地存储**：接收方 chain key 与签名密钥对写入 `LocalStore.sender_keys` 表（存储密钥 AES-256-GCM 加密落库，DPAPI 保护）；登出作为 E2EE 密钥材料保留（与解密缓存一致，否则重登后无法解密/签名）。跳序消息密钥缓存写入 `sender_key_skipped` 表（整体密文 blob，与 `sender_keys` 同主键维度），同样属 E2EE 密钥材料：登出保留、退群清理。“最新密钥”按 `rowid DESC` 选取（`INSERT OR REPLACE` 每次写入取得更大 rowid）；旧实现按秒级 `updated_at` 排序并以随机 hex `key_id` 作并列破口，同秒写入两把密钥（轮换场景）时选中哪把完全随机，可能用陈旧密钥加密而接收方无法解密（2026-09-09 修复）。
 - **成员变更 healing（2026-09-02 P1 修复）**：`member_added/removed/left` 群变更通知（及离线期间的 `sync_events` 补偿）触发本端 sender key 轮换（`generateSenderKey` 生成新 `keyId`）并向现任成员重分发；新成员因此获得当前密钥、被移除成员因密钥轮换失去后续消息的解密能力（后向安全）。轮换去重（同群在途/已排队不重复触发）、单发槽位队列化、瞬时失败（限流/超时）延迟重试；退群时清除本端该群 sender key（内存 wipe + `removeSenderKeysForGroup`）。
 - **遗留限制**：大群（成员设备数约 >60）单条 `sender_key_distribution` 可能超 16384 字符上限致分发失败；轮换采用“先落盘后分发”，分发永久失败时存在群解密不可用窗口；群路径服务端仍兼容接受 `contentType=text` 明文（M7a 遗留形态，客户端已不产生，收紧为拒绝属后续选项）。上述均登记为 ROADMAP 欠账（P2/P3）。
 
@@ -46,9 +47,10 @@
 
 - **仅发送者可操作**：编辑/删除均校验 `messages.sender_id == 当前用户`，否则 `PermissionDenied`；系统消息（`contentType=system`）不可编辑/删除；已删除消息不可再编辑。
 - **编辑 fail-closed 密文校验**：编辑正文必须与原消息 `contentType` 一致（私聊 `text`、群 `e2ee_group`），拒绝借编辑切换形态注入非法内容；`e2ee_group` 须通过 `GroupE2eeCrypto::decodeGroupMessage` 且 `senderDeviceId` 为当前设备、`text` 须通过 `E2eeCrypto::decodeEnvelope`——服务端只见密文，明文注入一律 `E2eeInvalidEnvelope`，与 `send_message` 的 envelope 强校验保持一致。
-- **软删除留墓碑**：删除后 `messages.deleted=1` 且正文清空，messageId/发送者/时间保留供客户端渲染“已删除”占位；删除幂等（重复删除返回成功）。不物理删除消息行，审计可追溯。
+- **软删除留墓碑**：删除后 `messages.deleted=1` 且正文清空，messageId/发送者/时间保留供客户端渲染“已删除”占位；删除幂等（重复删除返回成功）。不物理删除消息行，审计可追溯。**写入 fail-closed（2026-09-09）**：`deleteMessage` 真实写入失败时返回 `InternalError` 且不广播事件（旧实现忽略返回值，会在库内状态未变的情况下向全员广播删除，造成服务端与事件流分歧），失败记 `message.delete_failed` 结构化日志。
+- **事件寻址字段完整性（2026-09-09 修复的高危缺陷）**：群聊正文为 `e2ee_group` 密文，接收端必须凭（群, 发送者 userId, 发送者 deviceId, keyId）四元组定位 Sender Key；旧实现的 `message_edited` 事件与推送 payload **不带 `senderId`**（客户端甚至硬置 `senderId = 0`），而 `LocalStore::loadSenderKey` 对 `senderUserId <= 0` 直接 fail-closed → 群消息一旦被编辑，**所有接收端解密失败**；更严重的是解密失败前已执行 `m_decryptCache.remove` + `clearDecryptedContent`，随后以空正文回写 → 接收端**原本可读的正文被清成“无法解密”**。修复：服务端事件/推送补 `senderId`；客户端去除硬编码，并在 `senderId` 缺失时按（群, 设备, keyId）反查发送者（兼容修复前已落库的旧事件；keyId 为签名公钥指纹，全局唯一，同机双用户共用 deviceId 也不会误匹配）。**教训**：新增会改动已有密文的事件时，必须先确认 payload 携带解密所需的全部寻址字段。
 - **解密缓存一致性（客户端）**：编辑/删除事件与响应处理时，先失效该 messageId 的旧解密缓存（内存 `m_decryptCache` + LocalStore `clearDecryptedContent`）再解密新密文或标记删除，避免编辑后仍显示编辑前明文；本端编辑以乐观明文落库并覆盖解密缓存。
-- **多端与离线一致性**：`conversation_prefs`/`message_edited`/`message_deleted` 事件经 `sync_events` 与实时推送双通道投递，离线设备上线经 `ingestSyncEvents` 补偿；编辑正文仍为密文传输，服务端不接触明文。
+- **多端与离线一致性**：`conversation_prefs`/`message_edited`/`message_deleted` 事件经 `sync_events` 与实时推送双通道投递，离线设备上线经 `ingestSyncEvents` 补偿；编辑正文仍为密文传输，服务端不接触明文。**推送覆盖操作者本人（2026-09-09）**：旧实现在服务端按 `memberId != 操作者` 排除整个用户，使操作者名下其他设备得不到实时推送（仅能等下次增量同步），与已读游标/会话偏好的推送策略不一致；现改为推送给全体成员，由客户端按 `originDeviceId` 去重（实时推送与 `sync_events` 补偿两路径均去重），既保障多端实时一致又避免发起设备回显自身操作（群聊下回显会用已推进的 ratchet 状态重试解密并误清正文）。
 
 ### 会话与认证加固（2026-09-02）
 

@@ -209,6 +209,10 @@ private:
     QString decryptIncomingContent(const QString &content, bool *undecryptable);
     // M6: 在接收 JSON 上就地解密 content 字段（含预览占位替换）
     void decryptMessageObject(QJsonObject &msg);
+    // M9: 直接解密“编辑后”的新正文（绕过缓存、不预先清缓存）。成功时同步持久化
+    // 解密缓存并返回 true；失败返回 false（由调用方回退保留既有可读正文）。
+    // 与 decryptMessageObject 的关键区别：后者会命中缓存直接返回旧明文，编辑需强制重解新密文。
+    bool decryptEditContent(const QJsonObject &data, QString &plaintext);
     // M7b: 群聊 E2EE  Sender Key 管理
     bool ensureGroupSenderKey(qint64 conversationId,
                               XYChat::Security::GroupE2eeCrypto::SenderKey &key);

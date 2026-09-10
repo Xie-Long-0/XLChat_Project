@@ -1504,6 +1504,48 @@ void NetworkManager::decryptMessageObject(QJsonObject &msg)
     }
 }
 
+// M9: 直接解密“编辑后”的新正文（绕过缓存、不预先清缓存）。
+// 成功时同步持久化解密缓存并返回 true；失败返回 false。调用方在失败时回退
+// 保留既有可读正文，绝不写空覆盖（否则重登后会把已可读消息破坏成“无法解密”）。
+bool NetworkManager::decryptEditContent(const QJsonObject &data, QString &plaintext)
+{
+    const qint64 messageId = data.value("messageId").toVariant().toLongLong();
+    const QString content = data.value("content").toString();
+
+    if (GroupE2eeCrypto::looksLikeGroupMessage(content)) {
+        // 群编辑正文：Sender-Key 密文，直接解密（内部会持久化缓存与 ratchet 状态）
+        QJsonObject tmp = data;
+        if (decryptGroupMessageObject(tmp)) {
+            plaintext = tmp.value("content").toString();
+            return !plaintext.isEmpty();
+        }
+        return false;
+    }
+
+    if (GroupE2eeCrypto::looksLikeDistribution(content)) {
+        // 分发消息不可编辑，视为失败
+        return false;
+    }
+
+    bool undecryptable = false;
+    plaintext = decryptIncomingContent(content, &undecryptable);
+    if (undecryptable || plaintext.isEmpty()) {
+        return false;
+    }
+    // 1:1 正文：解密成功后同步内存缓存与持久化解密缓存（编辑前的旧明文缓存
+    // 已被新明文覆盖，重登后按持久化缓存恢复）
+    if (messageId > 0) {
+        m_decryptCache.insert(messageId, plaintext);
+        if (m_decryptCache.size() > 2000) {
+            m_decryptCache.clear();
+        }
+        if (!m_localStore.saveDecryptedContent(messageId, plaintext)) {
+            KeyStorage::saveDecryptCache(m_username, m_localDeviceId, m_decryptCache);
+        }
+    }
+    return true;
+}
+
 // M7b: 确保本机在该群有 Sender Key；返回 true 表示 key 已可用
 bool NetworkManager::ensureGroupSenderKey(qint64 conversationId,
                                           GroupE2eeCrypto::SenderKey &key)
@@ -1860,7 +1902,7 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
         return false;
     }
 
-    const qint64 senderUserId = msg.value("senderId").toVariant().toLongLong();
+    qint64 senderUserId = msg.value("senderId").toVariant().toLongLong();
 
     QByteArray chainKey;
     QByteArray publicSigningKey;
@@ -1868,6 +1910,16 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
     int iteration = 0;
     bool loaded = false;
     if (m_localStore.isOpen()) {
+        // M9 修复：历史 message_edited 事件与推送 payload 不带 senderId，而 Sender Key
+        // 以（群, 发送者, 设备, keyId）定位；此处按设备 + keyId 反查，避免群消息
+        // 编辑后接收端因寻址失败而把已可读的正文清成“无法解密”
+        if (senderUserId <= 0) {
+            senderUserId = m_localStore.senderUserIdForKey(convId, senderDeviceId,
+                                                           encrypted.keyId);
+            if (senderUserId > 0) {
+                msg["senderId"] = senderUserId;
+            }
+        }
         loaded = m_localStore.loadSenderKey(convId, senderUserId, senderDeviceId,
                                             encrypted.keyId, chainKey, publicSigningKey,
                                             privateSigningKey, iteration);
@@ -1881,8 +1933,19 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
         return false;
     }
 
+    // M9 修复：载入已跳过的消息密钥缓存。编辑会以更大的 iteration 覆盖旧消息正文，
+    // 使 iteration 与 message_id 顺序解耦；按消息 id 升序补收（sync_messages）时，
+    // 先解到高 iteration 会使后到的低 iteration 消息被回滚检查永久拒绝
+    QMap<int, QByteArray> skippedKeys;
+    if (m_localStore.isOpen()) {
+        skippedKeys = m_localStore.loadSkippedMessageKeys(convId, senderUserId,
+                                                          senderDeviceId, encrypted.keyId);
+    }
+    const bool hadSkippedKeys = !skippedKeys.isEmpty();
+
     const QByteArray plain = GroupE2eeCrypto::decryptMessage(chainKey, iteration,
-                                                             publicSigningKey, encrypted);
+                                                             publicSigningKey, encrypted,
+                                                             &skippedKeys);
     if (plain.isEmpty()) {
         qWarning() << "[NetMgr] Group message decryption failed for group" << convId
                    << "sender" << senderUserId << "keyId" << encrypted.keyId
@@ -1906,6 +1969,11 @@ bool NetworkManager::decryptGroupMessageObject(QJsonObject &msg)
     // 保存 ratchet 后的 chainKey/iteration
     m_localStore.saveSenderKey(convId, senderUserId, senderDeviceId, encrypted.keyId,
                                chainKey, publicSigningKey, QByteArray(), iteration);
+    // 仅在缓存确有变化时落库（新增跳序密钥，或消费/清空了原有缓存）
+    if (m_localStore.isOpen() && (!skippedKeys.isEmpty() || hadSkippedKeys)) {
+        m_localStore.saveSkippedMessageKeys(convId, senderUserId, senderDeviceId,
+                                            encrypted.keyId, skippedKeys);
+    }
     return true;
 }
 
@@ -2073,7 +2141,12 @@ void NetworkManager::handleGetConversationsResponse(const Packet &packet)
         for (QJsonValueRef value : conversations) {
             QJsonObject conv = value.toObject();
             const QString lastMessage = conv.value("lastMessage").toString();
-            if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(lastMessage)) {
+            // 密文预览一律替换为占位：私聊 pairwise envelope + 群 e2ee_group +
+            // sender_key_distribution。群 envelope 是 JSON（type=group_e2ee），
+            // 此前只识别 pairwise envelope，导致群密文 JSON 被当作正文直接展示
+            if (XYChat::Security::E2eeCrypto::looksLikeEnvelope(lastMessage)
+                || GroupE2eeCrypto::looksLikeGroupMessage(lastMessage)
+                || GroupE2eeCrypto::looksLikeDistribution(lastMessage)) {
                 conv["lastMessage"] = "[Encrypted message]";
                 value = conv;
                 continue;
@@ -2509,24 +2582,44 @@ void NetworkManager::ingestSyncEvents(const QJsonArray &events, qint64 lastSeq, 
                                    payload.value("pinned").toBool(),
                                    payload.value("muted").toBool());
         } else if (type == "message_edited") {
-            // M9 特性栈：离线期间的消息编辑补偿——先失效旧解密缓存再解密新正文，
-            // 更新本地缓存并通知 UI
+            // M9 特性栈：离线期间的消息编辑补偿，直接解密新正文并更新本地缓存、
+            // 通知 UI。本设备发起的编辑跳过（已在响应路径处理）。同机多账号下
+            // deviceId 相同，须连同 senderId 一并比对，否则同机接收方会误跳过
+            const qint64 senderId = payload.value("senderId").toVariant().toLongLong();
+            const QString originDeviceId = payload.value("originDeviceId").toString();
+            if (senderId == m_userId && !originDeviceId.isEmpty()
+                && originDeviceId == m_localDeviceId) {
+                continue;
+            }
             const qint64 msgId = payload.value("messageId").toVariant().toLongLong();
             const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
             const QString editedAt = payload.value("editedAt").toString();
-            m_decryptCache.remove(msgId);
-            if (m_localStore.isOpen()) {
-                m_localStore.clearDecryptedContent(msgId);
-            }
-            QJsonObject msgObj = payload;
-            decryptMessageObject(msgObj);
-            const QString plaintext = msgObj.value("content").toString();
-            if (m_localStore.isOpen()) {
+            // 直接解密编辑后的新正文（不预先清缓存，失败路径保留既有可读缓存/正文）
+            QString plaintext;
+            const bool decrypted = decryptEditContent(payload, plaintext);
+            if (decrypted && m_localStore.isOpen()) {
                 m_localStore.updateMessageContent(msgId, plaintext, editedAt);
+                emit messageEdited(convId, msgId, plaintext, editedAt);
+                continue;
             }
-            emit messageEdited(convId, msgId, plaintext, editedAt);
+            if (m_localStore.isOpen()) {
+                // 新正文解不出：离线重放时一次性预密钥已消费 / 群 ratchet 已推进。
+                // 绝不写空覆盖既有可读正文；缓存保留，重登后仍可恢复可读文本
+                const QString existing = m_localStore.loadMessageContent(msgId);
+                if (!existing.isEmpty()) {
+                    m_localStore.markMessageEdited(msgId, editedAt);
+                    emit messageEdited(convId, msgId, existing, editedAt);
+                }
+            }
         } else if (type == "message_deleted") {
-            // M9 特性栈：离线期间的消息删除补偿
+            // M9 特性栈：离线期间的消息删除补偿（本设备发起的删除同样跳过；
+            // 同机多账号下 deviceId 相同，须连同 senderId 一并比对）
+            const qint64 senderId = payload.value("senderId").toVariant().toLongLong();
+            const QString originDeviceId = payload.value("originDeviceId").toString();
+            if (senderId == m_userId && !originDeviceId.isEmpty()
+                && originDeviceId == m_localDeviceId) {
+                continue;
+            }
             const qint64 msgId = payload.value("messageId").toVariant().toLongLong();
             const qint64 convId = payload.value("conversationId").toVariant().toLongLong();
             if (m_localStore.isOpen()) {
@@ -2984,24 +3077,40 @@ void NetworkManager::handleEditMessageResponse(const Packet &packet)
         return;
     }
 
-    // 其他成员编辑推送：先失效旧解密缓存（防止命中编辑前明文），再解密新 content
-    m_decryptCache.remove(messageId);
-    if (m_localStore.isOpen()) {
-        m_localStore.clearDecryptedContent(messageId);
+    // 发起设备不回显自身操作：本端已在上方响应路径完成乐观更新，
+    // 重复处理会在群聊下用已推进的 ratchet 状态重试解密并误清空正文。
+    // 注意：deviceId 为机器级（QSysInfo::machineUniqueId），同机多账号共用；
+    // 必须同时比对 senderId == 本端用户，否则同机的其他账号（接收方）会被误判
+    // 为“本设备”而丢弃编辑事件，永远看不到编辑后的正文
+    const qint64 senderId = data.value("senderId").toVariant().toLongLong();
+    const QString originDeviceId = data.value("originDeviceId").toString();
+    if (senderId == m_userId && !originDeviceId.isEmpty()
+        && originDeviceId == m_localDeviceId) {
+        return;
     }
-    QJsonObject msgObj = data;
-    msgObj["senderId"] = 0; // 不关键；仅需 content 可解密
-    decryptMessageObject(msgObj);
-    const QString plaintext = msgObj.value("content").toString();
+
+    // 其他成员（含本人其他设备）编辑推送：直接解密新 content（不预先清缓存，
+    // 避免新正文解不出时把既有可读明文/缓存一并破坏）。senderId 由服务端随事件
+    // 下发，群聊解密靠它定位 Sender Key（缺失时 decryptGroupMessageObject 会按
+    // 设备 + keyId 反查兼容旧事件）
+    QString plaintext;
+    const bool decrypted = decryptEditContent(data, plaintext);
+    if (decrypted && m_localStore.isOpen()) {
+        m_localStore.updateMessageContent(messageId, plaintext, editedAt);
+        emit messageEdited(conversationId, messageId, plaintext, editedAt);
+        return;
+    }
     if (m_localStore.isOpen()) {
-        if (msgObj.value("undecryptable").toBool()) {
-            // 无法解密（缺密钥）时仅标记编辑状态，正文保留占位
-            m_localStore.updateMessageContent(messageId, QString(), editedAt);
-        } else {
-            m_localStore.updateMessageContent(messageId, plaintext, editedAt);
+        // 新正文解不出：一次性预密钥已消费（私聊）/ 群 ratchet 已推进的离线
+        // 重放场景。绝不写空覆盖既有可读正文；缓存已被 decryptEditContent 保留
+        // （失败路径不清缓存），重登后仍可按持久化缓存/正文恢复可读文本。
+        const QString existing = m_localStore.loadMessageContent(messageId);
+        if (!existing.isEmpty()) {
+            m_localStore.markMessageEdited(messageId, editedAt);
+            emit messageEdited(conversationId, messageId, existing, editedAt);
         }
+        // 本地确无既有正文：保留占位（不写空、不改 undecryptable）
     }
-    emit messageEdited(conversationId, messageId, plaintext, editedAt);
 }
 
 void NetworkManager::handleDeleteMessageResponse(const Packet &packet)
@@ -3026,6 +3135,17 @@ void NetworkManager::handleDeleteMessageResponse(const Packet &packet)
     const QJsonObject data = isOwnResponse ? response.value("data").toObject() : response;
     const qint64 messageId = data.value("messageId").toVariant().toLongLong();
     const qint64 conversationId = data.value("conversationId").toVariant().toLongLong();
+
+    // 发起设备不回显自身操作（本端已在上方响应路径处理）。
+    // 同机多账号下 deviceId 相同，须连同 senderId 一并比对，否则接收方会误跳过
+    if (!isOwnResponse) {
+        const qint64 senderId = data.value("senderId").toVariant().toLongLong();
+        const QString originDeviceId = data.value("originDeviceId").toString();
+        if (senderId == m_userId && !originDeviceId.isEmpty()
+            && originDeviceId == m_localDeviceId) {
+            return;
+        }
+    }
 
     if (m_localStore.isOpen()) {
         m_localStore.markMessageDeleted(messageId);

@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStandardPaths>
@@ -320,6 +321,16 @@ bool LocalStore::ensureSchema()
                        "PRIMARY KEY (group_id, sender_user_id, sender_device_id, key_id))",
         "CREATE INDEX IF NOT EXISTS idx_sender_keys_lookup "
                        "ON sender_keys(group_id, sender_user_id, sender_device_id)",
+        // M9 修复：群 Sender-Key 的“已跳过消息密钥”缓存（整体密文 blob，
+        // 按 sender_keys 同一主键定位），用于乱序投递与编辑重加密场景
+        "CREATE TABLE IF NOT EXISTS sender_key_skipped ("
+                       "group_id INTEGER NOT NULL,"
+                       "sender_user_id INTEGER NOT NULL,"
+                       "sender_device_id TEXT NOT NULL,"
+                       "key_id TEXT NOT NULL,"
+                       "skipped_keys_enc TEXT NOT NULL,"
+                       "updated_at TEXT NOT NULL DEFAULT '',"
+                       "PRIMARY KEY (group_id, sender_user_id, sender_device_id, key_id))",
     };
 
     QSqlQuery query(m_db);
@@ -706,6 +717,20 @@ bool LocalStore::updateMessageContent(qint64 messageId, const QString &plaintext
     return query.exec();
 }
 
+// 仅推进 edited_at，不触碰正文/undecryptable：编辑新正文解不出时回退保留既有
+// 可读正文（一次性预密钥已消费 / 群 ratchet 已推进的离线重放场景）
+bool LocalStore::markMessageEdited(qint64 messageId, const QString &editedAt)
+{
+    if (!ensureUsableDb() || messageId <= 0) {
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare("UPDATE messages SET edited_at = ? WHERE message_id = ?");
+    query.addBindValue(editedAt);
+    query.addBindValue(messageId);
+    return query.exec();
+}
+
 // M9 特性栈：删除消息——本地软删除（清空正文、置 deleted=1）
 bool LocalStore::markMessageDeleted(qint64 messageId)
 {
@@ -831,8 +856,19 @@ QJsonArray LocalStore::loadConversations() const
         conv["type"] = query.value(1).toString();
         conv["peerUserId"] = query.value(2).toLongLong();
         conv["peerUsername"] = query.value(3).toString();
-        conv["lastMessage"] = decryptText(query.value(4).toString());
-        conv["lastMessageId"] = query.value(5).toLongLong();
+        QString lastMsg = decryptText(query.value(4).toString());
+        const qint64 lastMsgId = query.value(5).toLongLong();
+        // 密文预览拦截（读取侧纵深防御）：历史污染或未同步的会话预览若仍是
+        // 私聊/群/分发 envelope，绝不把密文 JSON 当正文展示；优先用持久化解密
+        // 缓存回填真实明文，否则占位
+        if (E2eeCrypto::looksLikeEnvelope(lastMsg)
+            || GroupE2eeCrypto::looksLikeGroupMessage(lastMsg)
+            || GroupE2eeCrypto::looksLikeDistribution(lastMsg)) {
+            const QString cached = loadDecryptedContent(lastMsgId);
+            lastMsg = cached.isEmpty() ? QLatin1String("[Encrypted message]") : cached;
+        }
+        conv["lastMessage"] = lastMsg;
+        conv["lastMessageId"] = lastMsgId;
         conv["lastMessageAt"] = query.value(6).toString();
         conv["unreadCount"] = query.value(7).toInt();
         conv["name"] = query.value(8).toString();
@@ -1010,7 +1046,8 @@ bool LocalStore::saveSenderKey(qint64 groupId, qint64 senderUserId, const QStrin
     query.addBindValue(QString::fromLatin1(publicSigningKey.toBase64()));
     query.addBindValue(privateEnc.isEmpty() ? QString("") : privateEnc);
     query.addBindValue(iteration);
-    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODate));
+    // 毫秒精度：仅供诊断与人工排查（“最新密钥”的选取以 rowid 为准，不依赖本字段）
+    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
     if (!query.exec()) {
         qWarning() << "[LocalStore] saveSenderKey failed:" << query.lastError().text();
         return false;
@@ -1065,10 +1102,13 @@ QString LocalStore::latestSenderKeyId(qint64 groupId, qint64 senderUserId,
         return {};
     }
     QSqlQuery query(m_db);
+    // 以最近一次写入为准：saveSenderKey 为 INSERT OR REPLACE，每次写入获得更大 rowid。
+    // 不按 updated_at 排序：其为秒级精度，同秒并列时旧的 key_id DESC 破口会把
+    // 选择结果交给随机 hex，轮换后可能选中陈旧密钥（已造成单测约 50% 失败）
     query.prepare(
         "SELECT key_id FROM sender_keys "
         "WHERE group_id = ? AND sender_user_id = ? AND sender_device_id = ? "
-        "ORDER BY updated_at DESC, key_id DESC LIMIT 1");
+        "ORDER BY rowid DESC LIMIT 1");
     query.addBindValue(groupId);
     query.addBindValue(senderUserId);
     query.addBindValue(senderDeviceId);
@@ -1078,15 +1118,150 @@ QString LocalStore::latestSenderKeyId(qint64 groupId, qint64 senderUserId,
     return query.value(0).toString();
 }
 
+qint64 LocalStore::senderUserIdForKey(qint64 groupId, const QString &senderDeviceId,
+                                      const QString &keyId) const
+{
+    if (!m_open || groupId <= 0 || senderDeviceId.isEmpty() || keyId.isEmpty()) {
+        return 0;
+    }
+    // keyId = SHA-256(签名公钥) hex 前 32 字符，全局唯一；即使同一台机器上
+    // 收发双方 deviceId 相同，也不会误匹配到其他发送者的密钥
+    QSqlQuery query(m_db);
+    query.prepare(
+        "SELECT sender_user_id FROM sender_keys "
+        "WHERE group_id = ? AND sender_device_id = ? AND key_id = ? "
+        "ORDER BY rowid DESC LIMIT 1");
+    query.addBindValue(groupId);
+    query.addBindValue(senderDeviceId);
+    query.addBindValue(keyId);
+    if (!query.exec() || !query.next()) {
+        return 0;
+    }
+    return query.value(0).toLongLong();
+}
+
 bool LocalStore::removeSenderKeysForGroup(qint64 groupId)
 {
     if (!ensureUsableDb() || groupId <= 0) {
         return false;
     }
+    // 两表尽量在同一事务内清理：退群必须彻底清除密钥材料，不得出现
+    // “sender_keys 已删而跳序密钥缓存遗留”的半清理状态；事务不可用时
+    // 仍按非事务方式尽力清理（清理可达性优先于原子性）
+    const bool useTransaction = m_db.transaction();
+    if (!useTransaction) {
+        qWarning() << "[LocalStore] removeSenderKeysForGroup without transaction:"
+                   << m_db.lastError().text();
+    }
+
     QSqlQuery query(m_db);
     query.prepare("DELETE FROM sender_keys WHERE group_id = ?");
     query.addBindValue(groupId);
-    return query.exec();
+    const bool okKeys = query.exec();
+
+    // 同步清理该群的已跳过消息密钥缓存，避免遗留无用密钥材料
+    QSqlQuery skipped(m_db);
+    skipped.prepare("DELETE FROM sender_key_skipped WHERE group_id = ?");
+    skipped.addBindValue(groupId);
+    const bool okSkipped = skipped.exec();
+
+    if (!okKeys || !okSkipped) {
+        qWarning() << "[LocalStore] removeSenderKeysForGroup failed:"
+                   << (okKeys ? skipped.lastError().text() : query.lastError().text());
+        if (useTransaction) {
+            m_db.rollback();
+        }
+        return false;
+    }
+    return useTransaction ? m_db.commit() : true;
+}
+
+bool LocalStore::saveSkippedMessageKeys(qint64 groupId, qint64 senderUserId,
+                                        const QString &senderDeviceId, const QString &keyId,
+                                        const QMap<int, QByteArray> &keys)
+{
+    if (!ensureUsableDb() || groupId <= 0 || senderUserId <= 0 || senderDeviceId.isEmpty()
+        || keyId.isEmpty()) {
+        return false;
+    }
+    // 空缓存即删行：既避免陈旧密钥残留，也避免无跳序时的无谓写入
+    if (keys.isEmpty()) {
+        QSqlQuery remove(m_db);
+        remove.prepare(
+            "DELETE FROM sender_key_skipped WHERE group_id = ?"
+            " AND sender_user_id = ? AND sender_device_id = ? AND key_id = ?");
+        remove.addBindValue(groupId);
+        remove.addBindValue(senderUserId);
+        remove.addBindValue(senderDeviceId);
+        remove.addBindValue(keyId);
+        return remove.exec();
+    }
+
+    QJsonObject root;
+    for (auto it = keys.constBegin(); it != keys.constEnd(); ++it) {
+        root[QString::number(it.key())] = QString::fromLatin1(it.value().toBase64());
+    }
+    const QString blobEnc = encryptText(QString::fromUtf8(
+        QJsonDocument(root).toJson(QJsonDocument::Compact)));
+    if (blobEnc.isEmpty()) {
+        qWarning() << "[LocalStore] Refusing to save skipped message keys without encryption";
+        return false;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "INSERT OR REPLACE INTO sender_key_skipped"
+        "(group_id, sender_user_id, sender_device_id, key_id, skipped_keys_enc, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)");
+    query.addBindValue(groupId);
+    query.addBindValue(senderUserId);
+    query.addBindValue(senderDeviceId);
+    query.addBindValue(keyId);
+    query.addBindValue(blobEnc);
+    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    if (!query.exec()) {
+        qWarning() << "[LocalStore] saveSkippedMessageKeys failed:" << query.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+QMap<int, QByteArray> LocalStore::loadSkippedMessageKeys(qint64 groupId, qint64 senderUserId,
+                                                         const QString &senderDeviceId,
+                                                         const QString &keyId) const
+{
+    QMap<int, QByteArray> result;
+    if (!m_open || groupId <= 0 || senderUserId <= 0 || senderDeviceId.isEmpty()
+        || keyId.isEmpty()) {
+        return result;
+    }
+    QSqlQuery query(m_db);
+    query.prepare(
+        "SELECT skipped_keys_enc FROM sender_key_skipped WHERE group_id = ?"
+        " AND sender_user_id = ? AND sender_device_id = ? AND key_id = ?");
+    query.addBindValue(groupId);
+    query.addBindValue(senderUserId);
+    query.addBindValue(senderDeviceId);
+    query.addBindValue(keyId);
+    if (!query.exec() || !query.next()) {
+        return result;
+    }
+    // 解密失败则当作无缓存（fail-closed）：宁可不解密，不得使用可疑密钥材料
+    const QString plain = decryptText(query.value(0).toString());
+    if (plain.isEmpty()) {
+        return result;
+    }
+    const QJsonObject root = QJsonDocument::fromJson(plain.toUtf8()).object();
+    for (auto it = root.constBegin(); it != root.constEnd(); ++it) {
+        bool iterationOk = false;
+        const int iteration = it.key().toInt(&iterationOk);
+        const QByteArray key = QByteArray::fromBase64(
+            it.value().toString().toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
+        if (!iterationOk || iteration <= 0 || key.isEmpty()) {
+            continue;
+        }
+        result.insert(iteration, key);
+    }
+    return result;
 }
 
 void LocalStore::healEnvelopeLeaks()

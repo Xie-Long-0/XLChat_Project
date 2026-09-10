@@ -4,6 +4,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QList>
+#include <QMap>
 #include <QString>
 #include <QSqlDatabase>
 
@@ -61,11 +62,16 @@ public:
     bool upsertMessage(const QJsonObject &msg);
     // 按 messageId 升序返回该会话最近 limit 条消息（字段同服务端响应）
     QJsonArray loadMessages(qint64 conversationId, int limit = 100) const;
+    // 读取单条消息的本地解密正文（content_enc 解密；无或 undecryptable 返回空）
+    QString loadMessageContent(qint64 messageId) const;
     bool updateMessageStatus(qint64 messageId, const QString &status);
     // M9 特性栈：消息编辑（覆盖正文并标记编辑）与删除（软删除清空正文）。
     // editedAt 非空时写入服务端编辑时间（本端编辑用当前时间，同步回填用服务端时间）
     bool updateMessageContent(qint64 messageId, const QString &plaintext,
                               const QString &editedAt);
+    // 仅推进 edited_at、不触碰正文：用于编辑新正文解不出时回退保留既有可读正文
+    // （一次性预密钥已消费 / 群 ratchet 已推进的离线重放场景）
+    bool markMessageEdited(qint64 messageId, const QString &editedAt);
     bool markMessageDeleted(qint64 messageId);
     // M9: 已读游标多端同步——清零该会话未读角标，并把 readMessageId 及之前的
     // 对方消息（sender_id != selfUserId）标记为已读（status_rank 只前进）
@@ -101,10 +107,28 @@ public:
                        const QString &keyId, QByteArray &chainKey,
                        QByteArray &publicSigningKey,
                        QByteArray &privateSigningKey, int &iteration) const;
-    // 按 groupId + senderUserId + senderDeviceId 返回最新的 keyId（若无返回空）
+    // 按 groupId + senderUserId + senderDeviceId 返回最新的 keyId（若无返回空）。
+    // “最新”以最近一次写入为准（rowid 降序）：saveSenderKey 用 INSERT OR REPLACE，
+    // 每次写入都会获得更大的 rowid，因此结果确定。旧实现按 updated_at 排序并以
+    // key_id 作并列破口，而 updated_at 为秒级精度、key_id 为随机 hex，导致同一秒内
+    // 写入的两把密钥（轮换场景）选中哪一把完全随机，可能用陈旧密钥加密
     QString latestSenderKeyId(qint64 groupId, qint64 senderUserId,
                               const QString &senderDeviceId) const;
     bool removeSenderKeysForGroup(qint64 groupId);
+    // M9 修复：历史 message_edited 事件/推送 payload 可能不带 senderId，而 Sender Key
+    // 以（群, 发送者, 设备, keyId）定位；按设备 + keyId 反查发送者 userId（无则 0）
+    qint64 senderUserIdForKey(qint64 groupId, const QString &senderDeviceId,
+                              const QString &keyId) const;
+
+    // M9 修复：群 Sender-Key 的“已跳过消息密钥”缓存持久化（密文落库）。
+    // 用于容忍乱序投递与编辑重加密造成的 iteration 与消息 id 顺序解耦；
+    // 属 E2EE 密钥材料，登出时与 sender_keys 一并保留
+    bool saveSkippedMessageKeys(qint64 groupId, qint64 senderUserId,
+                                const QString &senderDeviceId, const QString &keyId,
+                                const QMap<int, QByteArray> &keys);
+    QMap<int, QByteArray> loadSkippedMessageKeys(qint64 groupId, qint64 senderUserId,
+                                                 const QString &senderDeviceId,
+                                                 const QString &keyId) const;
 
     static QString dbFilePath(const QString &username, const QString &deviceId);
 
@@ -125,7 +149,6 @@ private:
     // 解密失败（含格式不符）返回空：宁缺毋滥，绝不回退明文
     QString encryptText(const QString &plaintext) const;
     QString decryptText(const QString &cipher) const;
-    QString loadMessageContent(qint64 messageId) const;
     void closeDatabase();
 
     QSqlDatabase m_db;

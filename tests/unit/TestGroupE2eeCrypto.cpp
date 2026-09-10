@@ -434,6 +434,203 @@ private slots:
             memberChainKey, memberIteration, memberPubKey, encrypted), secret);
         QCOMPARE(memberIteration, 1);
     }
+
+    // 乱序容忍（2026-09-09 修复）：最新一条先到达时，ratchet 跨越的迭代其消息密钥
+    // 被缓存，随后到达的低 iteration 消息仍可解密，且命中缓存不推进链状态
+    void outOfOrderDecryptUsesSkippedMessageKeys()
+    {
+        auto key = GroupE2eeCrypto::generateSenderKey();
+        const QByteArray chainKey0 = key.chainKey;
+        const auto m1 = GroupE2eeCrypto::encryptMessage(key, "one");
+        const auto m2 = GroupE2eeCrypto::encryptMessage(key, "two");
+        const auto m3 = GroupE2eeCrypto::encryptMessage(key, "three");
+
+        QByteArray chainKey = chainKey0;
+        int iteration = 0;
+        QMap<int, QByteArray> skipped;
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m3, &skipped), QByteArray("three"));
+        QCOMPARE(iteration, 3);
+        QCOMPARE(skipped.size(), 2);
+        QVERIFY(skipped.contains(1));
+        QVERIFY(skipped.contains(2));
+
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m1, &skipped), QByteArray("one"));
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m2, &skipped), QByteArray("two"));
+        // 缓存命中不改动链状态，且条目被一次性消费
+        QCOMPARE(iteration, 3);
+        QCOMPARE(chainKey, key.chainKey);
+        QVERIFY(skipped.isEmpty());
+    }
+
+    // 缓存条目消费后不得重放：同一条消息第二次解密仍被拒绝
+    void skippedMessageKeyIsConsumedOnce()
+    {
+        auto key = GroupE2eeCrypto::generateSenderKey();
+        const QByteArray chainKey0 = key.chainKey;
+        const auto m1 = GroupE2eeCrypto::encryptMessage(key, "one");
+        const auto m2 = GroupE2eeCrypto::encryptMessage(key, "two");
+
+        QByteArray chainKey = chainKey0;
+        int iteration = 0;
+        QMap<int, QByteArray> skipped;
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m2, &skipped), QByteArray("two"));
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m1, &skipped), QByteArray("one"));
+        QVERIFY(skipped.isEmpty());
+        // 重放 m1：缓存已空且 iteration(1) <= 链状态(2) → 拒绝
+        QVERIFY(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m1, &skipped).isEmpty());
+        QCOMPARE(iteration, 2);
+    }
+
+    // fail-closed：伪造密文不得污染链状态，也不得把派生的消息密钥写入缓存
+    void forgedMessageDoesNotPopulateSkippedCache()
+    {
+        auto key = GroupE2eeCrypto::generateSenderKey();
+        const QByteArray chainKey0 = key.chainKey;
+        const auto m1 = GroupE2eeCrypto::encryptMessage(key, "one");
+        auto forged = GroupE2eeCrypto::encryptMessage(key, "two");
+        QCOMPARE(forged.iteration, 2);
+        forged.ciphertext[0] ^= 0xFF;
+
+        QByteArray chainKey = chainKey0;
+        int iteration = 0;
+        QMap<int, QByteArray> skipped;
+        QVERIFY(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, forged, &skipped).isEmpty());
+        QCOMPARE(iteration, 0);
+        QCOMPARE(chainKey, chainKey0);
+        QVERIFY(skipped.isEmpty());
+        // 状态未被污染：真实消息仍可正常解密
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m1, &skipped), QByteArray("one"));
+        QCOMPARE(iteration, 1);
+    }
+
+    // 先认证后消费：命中缓存的伪造消息不得烧毁合法跳序密钥，
+    // 否则一条注入消息就能使随后到达的真实乱序消息永久不可解
+    void forgedMessageDoesNotConsumeSkippedKey()
+    {
+        auto key = GroupE2eeCrypto::generateSenderKey();
+        const QByteArray chainKey0 = key.chainKey;
+        const auto m1 = GroupE2eeCrypto::encryptMessage(key, "one");
+        const auto m2 = GroupE2eeCrypto::encryptMessage(key, "two");
+        const auto m3 = GroupE2eeCrypto::encryptMessage(key, "three");
+
+        QByteArray chainKey = chainKey0;
+        int iteration = 0;
+        QMap<int, QByteArray> skipped;
+        // 最新一条先到达：缓存 iteration 1、2 的消息密钥
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m3, &skipped), QByteArray("three"));
+        QCOMPARE(skipped.size(), 2);
+
+        // 伪造密文命中缓存 iteration=1：GCM 认证失败，缓存必须保持完整
+        auto forgedCipher = m1;
+        forgedCipher.ciphertext[0] ^= 0xFF;
+        QVERIFY(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, forgedCipher, &skipped).isEmpty());
+        QCOMPARE(skipped.size(), 2);
+
+        // 伪造签名命中缓存 iteration=2：验签失败，缓存同样不得被消费
+        auto forgedSig = m2;
+        forgedSig.signature[0] ^= 0xFF;
+        QVERIFY(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, forgedSig, &skipped).isEmpty());
+        QCOMPARE(skipped.size(), 2);
+        QCOMPARE(iteration, 3);
+
+        // 两条真实消息随后到达，仍可正常解出
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m1, &skipped), QByteArray("one"));
+        QCOMPARE(GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, m2, &skipped), QByteArray("two"));
+        QVERIFY(skipped.isEmpty());
+    }
+
+    // 缓存容量上限：超出 MaxSkippedMessageKeys 时丢弃 iteration 最小的条目，
+    // 防止恶意大跳跃造成内存与本地落库无界增长
+    void skippedCacheEvictsOldestBeyondLimit()
+    {
+        auto key = GroupE2eeCrypto::generateSenderKey();
+        const QByteArray chainKey0 = key.chainKey;
+
+        const int total = GroupE2eeCrypto::MaxSkippedMessageKeys + 5;
+        QVERIFY(total <= GroupE2eeCrypto::MaxRatchetSteps);
+        GroupE2eeCrypto::EncryptedMessage last;
+        for (int i = 0; i < total; ++i) {
+            last = GroupE2eeCrypto::encryptMessage(key, QByteArray("msg ") + QByteArray::number(i));
+            QVERIFY(last.valid);
+        }
+        QCOMPARE(last.iteration, total);
+
+        QByteArray chainKey = chainKey0;
+        int iteration = 0;
+        QMap<int, QByteArray> skipped;
+        QVERIFY(!GroupE2eeCrypto::decryptMessage(
+            chainKey, iteration, key.publicSigningKey, last, &skipped).isEmpty());
+        QCOMPARE(iteration, total);
+        QCOMPARE(skipped.size(), GroupE2eeCrypto::MaxSkippedMessageKeys);
+        // 保留区间为 [total - Max, total - 1]，最小 iteration 的条目已被丢弃
+        const int lowestKept = total - GroupE2eeCrypto::MaxSkippedMessageKeys;
+        QVERIFY(!skipped.contains(lowestKept - 1));
+        QVERIFY(skipped.contains(lowestKept));
+        QVERIFY(skipped.contains(total - 1));
+    }
+
+    // 回归（2026-09-09 周度审查 R2）：群消息编辑会以更大的 iteration 覆盖旧正文，
+    // 使 iteration 与 message_id 顺序解耦。离线设备按消息 id 升序补收时先解到被
+    // 编辑消息（高 iteration），其后到达的低 iteration 消息若无跳序密钥缓存将被
+    // 回滚检查永久拒绝（chain-key ratchet 单向，明文不可恢复）
+    void groupEditRewriteKeepsLaterMessageDecryptable()
+    {
+        auto key = GroupE2eeCrypto::generateSenderKey();
+        const QByteArray chainKey0 = key.chainKey;
+
+        // 发送 A(id=10) 与 B(id=11)
+        const auto encA = GroupE2eeCrypto::encryptMessage(key, "A original");
+        const auto encB = GroupE2eeCrypto::encryptMessage(key, "B body");
+        QCOMPARE(encA.iteration, 1);
+        QCOMPARE(encB.iteration, 2);
+        // 编辑 A：服务端正文被 iteration=3 的新密文覆盖，而 A 的 message_id 仍小于 B
+        const auto encAEdited = GroupE2eeCrypto::encryptMessage(key, "A edited");
+        QCOMPARE(encAEdited.iteration, 3);
+
+        // 旧行为（不传缓存）：按 id 升序先解 A' 再解 B → B 被永久拒绝
+        {
+            QByteArray chainKey = chainKey0;
+            int iteration = 0;
+            QCOMPARE(GroupE2eeCrypto::decryptMessage(
+                chainKey, iteration, key.publicSigningKey, encAEdited), QByteArray("A edited"));
+            QCOMPARE(iteration, 3);
+            QVERIFY(GroupE2eeCrypto::decryptMessage(
+                chainKey, iteration, key.publicSigningKey, encB).isEmpty());
+        }
+
+        // 修复后（带跳序密钥缓存）：B 与 A 的原始版本均可解出
+        {
+            QByteArray chainKey = chainKey0;
+            int iteration = 0;
+            QMap<int, QByteArray> skipped;
+            QCOMPARE(GroupE2eeCrypto::decryptMessage(
+                chainKey, iteration, key.publicSigningKey, encAEdited, &skipped),
+                QByteArray("A edited"));
+            QCOMPARE(iteration, 3);
+            QCOMPARE(skipped.size(), 2);
+            QCOMPARE(GroupE2eeCrypto::decryptMessage(
+                chainKey, iteration, key.publicSigningKey, encB, &skipped),
+                QByteArray("B body"));
+            QCOMPARE(iteration, 3);
+            QCOMPARE(GroupE2eeCrypto::decryptMessage(
+                chainKey, iteration, key.publicSigningKey, encA, &skipped),
+                QByteArray("A original"));
+            QVERIFY(skipped.isEmpty());
+        }
+    }
 };
 
 QTEST_GUILESS_MAIN(TestGroupE2eeCrypto)

@@ -81,9 +81,9 @@ magic:u32 | version:u16 | messageType:u16 | requestId:u64 | payloadLength:u32 | 
 | `82` | `SetConversationPrefsResponse` | 会话偏好设置响应（M9） |
 | `83` | `ConversationPrefsNotification` | 会话偏好变更通知（服务端推送，M9：本人多端同步） |
 | `84` | `EditMessageRequest` | 消息编辑请求（M9） |
-| `85` | `EditMessageResponse` | 消息编辑响应（M9：本端请求响应，requestId=0 时复用为其他成员编辑实时推送） |
+| `85` | `EditMessageResponse` | 消息编辑响应（M9：本端请求响应，requestId=0 时复用为编辑实时推送；推送覆盖全体成员 **含操作者本人的其他设备**，发起设备按 payload.`senderId`+`originDeviceId` 自行去重） |
 | `86` | `DeleteMessageRequest` | 消息删除请求（M9） |
-| `87` | `DeleteMessageResponse` | 消息删除响应（M9：本端请求响应，requestId=0 时复用为其他成员删除实时推送） |
+| `87` | `DeleteMessageResponse` | 消息删除响应（M9：本端请求响应，requestId=0 时复用为删除实时推送；推送覆盖全体成员 **含操作者本人的其他设备**，发起设备按 payload.`senderId`+`originDeviceId` 自行去重） |
 
 ### 注册请求
 
@@ -426,7 +426,9 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```
 
 - 事件流按账号维度严格递增（`seq`），客户端保存 `lastSeq` 游标做增量拉取（参考 Telegram 差分同步模型）。
-- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）、`read_cursor`（M9：已读者自身读游标，payload `{conversationId, readMessageId}`，供其其他设备同步未读角标与消息已读态）、`conversation_prefs`（M9：会话偏好变更，payload `{conversationId, pinned, muted}`）、`message_edited`（M9：消息编辑，payload 含 `messageId`/`conversationId`/重新加密的 `content`/`contentType`/`editedAt`）、`message_deleted`（M9：消息删除，payload `{messageId, conversationId, deletedAt}`）。
+- 当前事件类型：`message`（新消息，M6 起私聊 payload.content 为 envelope 密文，M7a 群聊为明文；群系统消息 contentType=system）、`contact_added`（联系人变更）、`receipt`（送达/已读回执，M7a 起含 deliveredCount/readCount）、`group_changed`（M7a：群成员变更，payload 同 `GroupChangedNotification`）、`read_cursor`（M9：已读者自身读游标，payload `{conversationId, readMessageId}`，供其其他设备同步未读角标与消息已读态）、`conversation_prefs`（M9：会话偏好变更，payload `{conversationId, pinned, muted}`）、`message_edited`（M9：消息编辑，payload 含 `messageId`/`conversationId`/**`senderId`**/`originDeviceId`/重新加密的 `content`/`contentType`/`editedAt`）、`message_deleted`（M9：消息删除，payload `{messageId, conversationId, senderId, originDeviceId, deletedAt}`）。
+  - **`senderId` 为群聊解密的必需字段**（2026-09-09 补）：`e2ee_group` 密文靠（群, 发送者 userId, 发送者 deviceId, keyId）四元组定位本地 Sender Key，缺 `senderId` 即无法解密；为兼容修复前已落库的旧事件，客户端在 `senderId` 缺失时会按（群, 设备, keyId）反查发送者。
+  - **`originDeviceId`** 为发起该操作的本端设备 ID；实时推送与离线补偿两路径均覆盖操作者本人（保障其名下其他设备实时一致）。接收端须**同时比对 `senderId == 本端 userId` 且 `originDeviceId == 本端 deviceId`** 才忽略，避免发起设备回显自身操作。注意：`deviceId` 为机器级标识（`QSysInfo::machineUniqueId`），同机多账号共享，仅比对 `deviceId` 会把同机其他账号误判为“本设备”而丢事件（2026-09-09 修正）。
 - M9 保留清理：服务端按 30 天保留期每小时清理过期 `sync_events`（`sync_meta` 表记录清理水位线 `pruned_below_seq`）；设备游标落后于水位线（`0 < afterSeq < prunedBelowSeq`）时响应 `needsFullSync=true` + `fullSyncSeq`，客户端重置游标并全量重拉会话（`get_conversations`）与消息（`sync_messages` 从 messages 表补齐，不受事件清理影响）。
 - 实时推送（`NewMessageNotification`/`MessageStatusUpdate`）仅作为通知，离线或丢推送时由 `sync_events` 兜底补齐。
 
@@ -697,27 +699,29 @@ M5.5 行为：先授权再查询 —— 非会话成员返回 `PermissionDenied 
 ```json
 // 请求（content 为重新加密后的密文，contentType 须与原消息一致）
 { "type": "edit_message", "messageId": 42, "content": "<重新加密的 envelope/e2ee_group>", "contentType": "text", "timestamp": ..., "nonce": "..." }
-// 响应 data（同时作为其他成员实时推送的 payload，requestId=0）
-{ "messageId": 42, "conversationId": 9, "content": "<密文>", "contentType": "text", "editedAt": "..." }
+// 响应 data（同时作为实时推送的 payload，requestId=0；推送覆盖全体成员含操作者本人）
+{ "messageId": 42, "conversationId": 9, "senderId": 3, "originDeviceId": "dev-a1", "content": "<密文>", "contentType": "text", "editedAt": "..." }
 ```
 
 - 仅消息发送者可编辑；已删除消息与系统消息（`contentType=system`）不可编辑（`MessageNotFound`/`PermissionDenied`）。
 - `contentType` 必须与原消息一致（私聊 `text`、群 `e2ee_group`），拒绝借编辑切换形态注入非法内容；`content` 长度受 `MaxGroupMessageLength` 上限约束。
 - **fail-closed 密文校验**：`e2ee_group` 经 `GroupE2eeCrypto::decodeGroupMessage` 且 `senderDeviceId` 须为当前设备；`text` 经 `E2eeCrypto::decodeEnvelope` 校验为合法 envelope——服务端只见密文，拒绝明文注入（`E2eeInvalidEnvelope`）。
-- 成功后服务端 `messages.edited_at = datetime('now')`，向会话全体成员写 `message_edited` 事件并实时推送（复用 `EditMessageResponse` messageType，requestId=0 表示他人编辑）。
-- 客户端编辑路径：群聊同步用 Sender-Key 重加密提交；私聊异步 `fetch_keys` 拉取对方密钥包后 `encryptForUser` 重加密提交。解密侧先失效该 messageId 旧解密缓存再解新密文，避免命中编辑前明文。
+- 成功后服务端 `messages.edited_at = datetime('now')`，向会话全体成员写 `message_edited` 事件并实时推送（复用 `EditMessageResponse` messageType，requestId=0）。**事件与推送必须携带 `senderId`**（群聊解密寻址所需，2026-09-09 补）与 `originDeviceId`（连同 `senderId` 供发起设备去重）；推送不再排除操作者本人，以保障其名下其他设备实时一致。
+- 客户端编辑路径：群聊同步用 Sender-Key 重加密提交；私聊异步 `fetch_keys` 拉取对方密钥包后 `encryptForUser` 重加密提交（含发送方自身拷贝，使本人其他设备可解）。解密侧**不预先清缓存**，直接解密新密文（绕过缓存，`decryptEditContent`）；解密成功则覆盖本地明文（`messages.content_enc`）与持久化解密缓存（`decrypt_cache`），失败则保留既有可读明文与缓存、仅推进 `edited_at`。**幂等回退（2026-09-10）**：私聊预密钥一次性、群 ratchet 已推进，离线重放（重登后 `sync_events` 补发 `message_edited`，或实时推送与同步事件重复投递）时新密文无法二次解密；此时**不写空覆盖、不清缓存**既有可读正文，确保重登后仍能像普通消息一样按持久化解密缓存恢复明文，而非显示"无法解密"。
+- **群聊乱序容忍（2026-09-09）**：编辑会消耗一个新的 ratchet 迭代，使被编辑消息的 `iteration` 大于其后发送的消息，而 `sync_messages` 按 `message_id ASC` 返回；接收端为此维护**跳序消息密钥缓存**（skipped message keys，上限 `MaxSkippedMessageKeys=1000`，本地 `sender_key_skipped` 表加密持久化），使先解到高 `iteration` 后仍能解出低 `iteration` 的在途/乱序消息；缓存命中即一次性消费，不推进链状态。
 
 ### 消息删除（delete_message）
 
 ```json
 // 请求
 { "type": "delete_message", "messageId": 42, "timestamp": ..., "nonce": "..." }
-// 响应 data（同时作为其他成员实时推送的 payload，requestId=0）
-{ "messageId": 42, "conversationId": 9, "deletedAt": "..." }
+// 响应 data（同时作为实时推送的 payload，requestId=0；推送覆盖全体成员含操作者本人）
+{ "messageId": 42, "conversationId": 9, "senderId": 3, "originDeviceId": "dev-a1", "deletedAt": "..." }
 ```
 
 - 仅消息发送者可删除；系统消息不可删（`PermissionDenied`）。
 - **软删除留墓碑**：`messages.deleted = 1`、正文清空，保留 messageId/发送者/时间供客户端渲染“已删除”占位；幂等（重复删除返回成功）。
-- 成功后向会话全体成员写 `message_deleted` 事件并实时推送（复用 `DeleteMessageResponse` messageType，requestId=0 表示他人删除）。
+- **写入 fail-closed（2026-09-09）**：`deleteMessage` 真实写入失败时返回 `InternalError` 且**不广播事件**（旧实现忽略返回值，会在库内状态未变的情况下向全员广播删除，造成服务端与事件流分歧）；失败记 `message.delete_failed` 结构化日志。
+- 成功后向会话全体成员写 `message_deleted` 事件并实时推送（复用 `DeleteMessageResponse` messageType，requestId=0）；payload 同样携带 `senderId` 与 `originDeviceId`，推送不排除操作者本人（发起设备按 `senderId`+`originDeviceId` 客户端去重）。
 
 

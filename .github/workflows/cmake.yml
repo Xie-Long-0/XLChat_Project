@@ -1,0 +1,45 @@
+name: CMake
+
+# 交付前机器门禁：configure / build / ctest 全绿才可合并。
+# 该工作流原于 M0 交付，2026-08-03（31622df）被误删，导致其后 5 周内
+# "ctest 6/6" 等验收结论只能靠本地手工运行，2026-09-09 周度审查后重建。
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # 依赖说明：OpenSSL / QWindowKit / zlib 均已随仓库提交在 3rdparty/
+      # （顶层 CMakeLists 已把 3rdparty 加入 CMAKE_PREFIX_PATH），
+      # 因此 CI 只需额外准备 Qt 6.8.3（与本地开发环境一致）
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+
+      - name: Configure
+        run: cmake -S . -B build -DXYCHAT_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # Qt Test 的输出经 ctest 转发后可能为空，失败时补传原始日志便于定位
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-last-test-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

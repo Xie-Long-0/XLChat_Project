@@ -29,11 +29,34 @@ XYChat 是一个基于 Qt 6 / C++20 的即时通讯原型项目，当前包含�
 
 ## 构建
 
-### Windows（MSVC 2022 + Qt 6.8.3）
+### Windows（MSVC + Qt 6.8.3）
+
+推荐使用仓库自带的 `Build.ps1`：它用 vswhere 动态定位最新的、带 C++ 工具集的 Visual Studio，
+调用官方 `Launch-VsDevShell.ps1` 载入 x64 工具链后再执行 CMake 预设，因此无需在
+`CMakeUserPresets.json` 中硬编码 MSVC / Windows SDK 版本号（VS 升级后脚本仍可用）。
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="C:/Qt/6.8.3/msvc2022_64"
-cmake --build build --config Release
+./Build.ps1                             # 仅配置 Qt-Debug
+./Build.ps1 -Build                      # 配置并构建 Qt-Debug
+./Build.ps1 -Preset Qt-Release -Build   # 配置并构建 Qt-Release
+. ./Build.ps1 -EnvOnly                  # 只把 VS 开发环境载入当前 shell，不跑 cmake
+```
+
+预设与输出目录（`CMakePresets.json` / `CMakeUserPresets.json`）：
+
+| 预设 | 生成器 | 构建类型 | 输出目录 |
+| --- | --- | --- | --- |
+| `Qt-Debug` | Ninja | Debug | `out/build/debug` |
+| `Qt-Release` | Ninja | Release | `out/build/release` |
+
+> `CMakeUserPresets.json` 内的 `QTDIR` 为本机 Qt 路径，该文件不入库（见 `.gitignore`），
+> 换机时按本机实际路径调整即可。
+
+也可绕过脚本手动配置（需自行保证 MSVC 环境与 Qt 路径正确）：
+
+```powershell
+cmake -S . -B out/build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="D:/Qt/6.8.3/msvc2022_64"
+cmake --build out/build/release
 ```
 
 ### Linux/macOS（Qt 已安装在自定义路径时）
@@ -45,19 +68,19 @@ cmake --build build -j
 
 如需跳过测试目标，可在配置时传入 `-DXYCHAT_BUILD_TESTS=OFF`。
 
+> 持续集成：`.github/workflows/cmake.yml` 在 windows-latest 上执行 configure / build / ctest
+> 三步（Qt 由 `jurplel/install-qt-action` 安装，OpenSSL/QWindowKit/zlib 已随仓库提交在 `3rdparty/`）。
+
 ## 运行
 
-先启动服务端：
+先启动服务端，再启动客户端（Windows 预设输出路径）：
 
-```bash
-./out/build/release/Chat-Server
+```powershell
+./out/build/release/Chat-Server.exe
+./out/build/release/Chat-Client.exe
 ```
 
-再启动客户端：
-
-```bash
-./out/build/release/Chat-Client
-```
+Linux/macOS 按上面手动配置的 `-B build` 目录运行 `./build/Chat-Server` 与 `./build/Chat-Client`。
 
 > 客户端自 M6.5 起会在系统 AppData 目录下维护按账号+设备隔离的本地加密缓存（消息/会话以 AES-256-GCM 加密落库，未发送消息跨重启保留）；登出时自动清除。详见 `docs/SECURITY.md` 的本地存储安全章节。
 
@@ -65,23 +88,33 @@ cmake --build build -j
 
 配置并构建后运行全部单元测试（CTest 纳入 6 套）：
 
+```powershell
+# Windows 预设（Build.ps1 / Qt-Debug）
+ctest --test-dir out/build/debug --output-on-failure
+```
+
 ```bash
+# Linux/macOS 或手动 -B build 配置时
 ctest --test-dir build --output-on-failure
 ```
+
+> 排查单个套件时建议直接跑测试可执行文件并用 `-o <file>,txt` 落盘：
+> Qt Test 的输出经 ctest 转发后在部分终端下会丢失，容易把断言失败误判为“无输出/崩溃”。
+> 例：`./out/build/debug/TestLocalStore.exe -o out/ls.txt,txt`
 
 | 套件 | 覆盖范围 |
 | --- | --- |
 | `TestPacketCodec` | 帧协议编解码 |
 | `TestEncryptionManager` | PBKDF2 / Token 生成 |
-| `TestDatabaseManager` | 服务端数据层（含群组与 V1-V7 迁移） |
-| `TestSecurity` | TLS 辅助 / 日志脱敏 / NonceCache 重放保护 |
-| `TestLocalStore` | 客户端本地加密缓存与持久化 outbox |
-| `TestGroupE2eeCrypto` | 群 Sender-Key 加密原语（M7b） |
+| `TestDatabaseManager` | 服务端数据层（含群组、V1-V9 迁移、会话偏好与消息编辑/删除） |
+| `TestSecurity` | TLS 辅助 / 日志脱敏 / NonceCache 重放保护 / RateWindow 限流 / StructuredLogger |
+| `TestLocalStore` | 客户端本地加密缓存、持久化 outbox、Sender Key 与跳序消息密钥缓存 |
+| `TestGroupE2eeCrypto` | 群 Sender-Key 加密原语（M7b）、DoS 上限、乱序解密与跳序密钥缓存 |
 
 另有 `tests/e2e/TestGroupRepro`：双客户端群 E2EE 端到端复现工具，**不纳入 CTest**，需先启动 `Chat-Server` 后手动运行：
 
-```bash
-./build/tests/TestGroupRepro
+```powershell
+./out/build/debug/TestGroupRepro.exe
 ```
 
 ## 开发约定

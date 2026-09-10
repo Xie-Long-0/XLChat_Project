@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QJsonObject>
 #include <QList>
+#include <QMap>
 #include <QString>
 
 #include "E2eeCrypto.h"
@@ -28,6 +29,9 @@ public:
     static constexpr int MaxRatchetSteps = 2000;
     // 群消息 envelope 中 iteration 的绝对上界（解码侧纵深防御）
     static constexpr int MaxMessageIteration = 100000000;
+    // 乱序容忍：单个 Sender Key 允许缓存的已跳过消息密钥条数上限。
+    // 超出时丢弃 iteration 最小的条目，防止内存与本地落库无界增长
+    static constexpr int MaxSkippedMessageKeys = 1000;
 
     struct SenderKey
     {
@@ -72,10 +76,20 @@ public:
 
     // 解密群消息（chainKey 为接收方保存的链式密钥，publicSigningKey 为发送方公钥）
     // 成功返回明文；失败返回空；iteration 跳跃超过 MaxRatchetSteps 时拒绝（DoS 防护）
+    //
+    // skippedKeys 为可选的已跳过消息密钥缓存（iteration -> messageKey），用于容忍
+    // 乱序投递：ratchet 前进时把途中派生的消息密钥写入缓存，之后到达的低 iteration
+    // 消息仍可解密。群消息被编辑后会以新的 iteration 覆盖原正文，使 iteration 与
+    // message_id 顺序解耦，按消息 id 升序批量解密（离线补收）时若没有该缓存，
+    // 后到的低 iteration 消息会被回滚检查永久拒绝。
+    // 缓存条目命中后即删除（一次性消费）；条数超过 MaxSkippedMessageKeys 时丢弃
+    // iteration 最小者。仅在解密与验签全部通过后才提交状态与缓存（fail-closed）。
+    // 传入 nullptr 时保持严格的“只前进不回退”语义。
     static QByteArray decryptMessage(QByteArray &chainKey,
                                      int &iteration,
                                      const QByteArray &publicSigningKey,
-                                     const EncryptedMessage &msg);
+                                     const EncryptedMessage &msg,
+                                     QMap<int, QByteArray> *skippedKeys = nullptr);
 
     // 分发消息：将 chainKey 用 pairwise E2EE 加密后发给每个目标设备
     struct DistributionEntry

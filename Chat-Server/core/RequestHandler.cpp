@@ -2102,10 +2102,15 @@ void RequestHandler::processEditMessageRequest(const Packet &packet, const QJson
 
     const QString editedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
 
-    // 向会话全体成员推送编辑事件（sync_events 兜底 + 实时推送）
+    // 向会话全体成员推送编辑事件（sync_events 兜底 + 实时推送）。
+    // senderId 必带：群聊正文为 e2ee_group 密文，接收端需以（群, 发送者, 设备,
+    // keyId）定位 Sender Key 才能解密；缺失会使编辑后的群消息在所有接收端不可解。
+    // originDeviceId 供发起设备去重（不回显自身操作）。
     QJsonObject ev;
     ev["messageId"] = messageId;
     ev["conversationId"] = msgOpt->conversationId;
+    ev["senderId"] = m_authenticatedUserId;
+    ev["originDeviceId"] = m_currentDeviceId;
     ev["content"] = content;
     ev["contentType"] = contentType;
     ev["editedAt"] = editedAt;
@@ -2119,9 +2124,9 @@ void RequestHandler::processEditMessageRequest(const Packet &packet, const QJson
 
     for (qint64 memberId : m_db->getConversationMemberIds(msgOpt->conversationId)) {
         m_db->appendSyncEvent(memberId, "message_edited", QString::fromUtf8(evJson));
-        if (memberId != m_authenticatedUserId) {
-            emit messageForUser(memberId, encoded);
-        }
+        // 推送覆盖操作者本人：其名下其他设备同样需要实时一致（onMessageForUser
+        // 发给该用户全部会话），发起设备由客户端按 originDeviceId 自行忽略
+        emit messageForUser(memberId, encoded);
     }
 
     sendResponse(packet.requestId, MessageType::EditMessageResponse, ErrorCode::Ok,
@@ -2158,14 +2163,24 @@ void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJs
         return;
     }
 
-    // 幂等：已删除消息重复删除仍返回成功（软删除语义）
-    m_db->deleteMessage(messageId);
+    // 幂等：已删除消息重复删除仍返回成功（软删除语义）；但真实写入失败时
+    // 必须 fail-closed：不得在库内状态未变的情况下向全员广播删除事件
+    if (!m_db->deleteMessage(messageId)) {
+        StructuredLogger::event(LogLevel::Warning, "message.delete_failed")
+            .requestId(packet.requestId).userId(m_authenticatedUserId)
+            .field("messageId", messageId).write();
+        sendResponse(packet.requestId, MessageType::DeleteMessageResponse,
+                     ErrorCode::InternalError, "Failed to delete message");
+        return;
+    }
 
     const QString deletedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
 
     QJsonObject ev;
     ev["messageId"] = messageId;
     ev["conversationId"] = msgOpt->conversationId;
+    ev["senderId"] = m_authenticatedUserId;
+    ev["originDeviceId"] = m_currentDeviceId;
     ev["deletedAt"] = deletedAt;
     const QByteArray evJson = QJsonDocument(ev).toJson(QJsonDocument::Compact);
 
@@ -2177,9 +2192,9 @@ void RequestHandler::processDeleteMessageRequest(const Packet &packet, const QJs
 
     for (qint64 memberId : m_db->getConversationMemberIds(msgOpt->conversationId)) {
         m_db->appendSyncEvent(memberId, "message_deleted", QString::fromUtf8(evJson));
-        if (memberId != m_authenticatedUserId) {
-            emit messageForUser(memberId, encoded);
-        }
+        // 推送覆盖操作者本人（其他设备实时一致），发起设备由客户端按
+        // originDeviceId 自行忽略
+        emit messageForUser(memberId, encoded);
     }
 
     sendResponse(packet.requestId, MessageType::DeleteMessageResponse, ErrorCode::Ok,
